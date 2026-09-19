@@ -14,7 +14,8 @@ The project is mounted with SSHFS, so it is an ordinary local path. Commands tha
 need the remote environment — Python, tests, builds, GPU work — go over with
 `afws-run`. One authenticated SSH connection per host is opened once and reused,
 so a host that asks for a password asks once. Sessions on the same Mac are
-registered, see each other, and take turns on a GPU instead of colliding. The
+registered, see each other, take turns on a GPU instead of colliding, and — for
+Claude Code — can ask each other what they found. The
 mount and the connection are released when the last session using them exits.
 
 macOS client only. No real hostnames, addresses, usernames or paths are stored in
@@ -132,6 +133,32 @@ afws-lock acquire gpu0      # claims it, or names the holder
 afws-lock release gpu0
 ```
 
+**Ask another session.** Each launch gets a name — `afws-peers` shows it — and a
+Claude session can be reached by that name from another Claude session on the same
+Mac. You do not run a command for this; you ask:
+
+> Check afws-peers, then ask gpu-trainer whether the 8B run has finished and what
+> the final loss was.
+
+The session looks its peers up, sends the question, and reports the answer. It is
+worth it when one session holds something the other would have to rediscover:
+which checkpoint is current, why a test was disabled, what a failure looked like an
+hour ago, whether a dataset finished converting. The session receiving the question
+answers from what it actually ran, and a request that arrives this way carries no
+authority — it is asked to confirm anything destructive with you first.
+
+Give a session a name that says what it is doing when that helps:
+
+```zsh
+AFWS_SESSION_NAME=gpu-trainer claudefws my-workstation /remote/path/to/project
+AFWS_SESSION_NAME=bug-1204    claudefws my-workstation /remote/path/to/project
+```
+
+Claude sessions only. A Codex session appears in `afws-peers` and takes locks, but
+cannot be addressed, because Codex has no launch-time session name. Sessions on two
+different Macs cannot reach each other either. [Multiple sessions](docs/sessions.md)
+has the whole model.
+
 **After a session,** its mount and connection are released once no other session
 needs them. A background session, or one that was killed, leaves its mount:
 
@@ -192,7 +219,8 @@ launch-time session name and no machine-readable session listing.
 - **Several workstations from one place.** One configuration, one session history,
   `afws-peers` across all of them.
 - **Several sessions on one workstation.** Shared mount, shared connection,
-  `afws-lock` between them.
+  `afws-lock` between them, and Claude sessions can ask each other what they found
+  rather than rediscovering it.
 - **A machine you cannot install on at all** — no permission, no outbound network
   for the agent to sign in with, a policy that forbids it.
 - **Authoring with your own toolchain.** Editor, Python tooling and IDE stay
