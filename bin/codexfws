@@ -151,6 +151,12 @@ see which session it belongs to."
   fi
 fi
 
+# Codex CLI has no flag equivalent to Claude Code's --add-dir, so this is not
+# honoured rather than being honoured differently.
+if [[ -n "${AFWS_ADD_DIR-}" ]]; then
+  print -u2 -r -- "${AFWS_PROGRAM}: AFWS_ADD_DIR is ignored; Codex CLI has no --add-dir equivalent"
+fi
+
 afws_warn_about_home_workspace "$local_workspace" codex
 
 # --- session instructions -------------------------------------------------

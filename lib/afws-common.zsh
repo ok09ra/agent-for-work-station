@@ -325,6 +325,30 @@ afws_mount() {
   return 1
 }
 
+# --- extra local directories ----------------------------------------------
+# A session works on the remote project, but the material it is working from is
+# often local: papers, notes, a scratch analysis. AFWS_ADD_DIR names those so
+# one session can read them and write its conclusions into the remote project,
+# instead of the two living in separate sessions with separate histories.
+# Colon-separated, like PATH.
+# afws_extra_directories -> prints one absolute directory per line
+afws_extra_directories() {
+  local entry
+
+  [[ -n "${AFWS_ADD_DIR-}" ]] || return 0
+
+  for entry in ${(s.:.)AFWS_ADD_DIR}; do
+    [[ -n "$entry" ]] || continue
+    [[ "$entry" == /* ]] ||
+      afws_die "AFWS_ADD_DIR must list absolute directories: ${entry}"
+    [[ "$entry" != *[[:cntrl:]]* ]] ||
+      afws_die "AFWS_ADD_DIR must not contain control characters"
+    [[ -d "$entry" ]] ||
+      afws_die "AFWS_ADD_DIR names a directory that does not exist: ${entry}"
+    print -r -- "$entry"
+  done
+}
+
 # --- workspace shape ------------------------------------------------------
 
 # Mounting a home directory does not grant the agent anything its own account

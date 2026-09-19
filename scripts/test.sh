@@ -321,6 +321,36 @@ long_ok="$(AFWS_STATE_DIR="$long_state" AFWS_NO_CONTROL_MASTER=1 \
 [[ "$long_ok" == *"Would mount"* ]] || \
   fail "the socket-length guard fired even with the shared connection disabled"
 
+# --- extra local directories ---------------------------------------------
+# Local reference material read in the same session that works on the remote
+# project, so the two do not live in separate sessions with separate histories.
+
+reset_state
+mkdir -p "${SANDBOX}/papers" "${SANDBOX}/notes"
+extra_plan="$(AFWS_ADD_DIR="${SANDBOX}/papers:${SANDBOX}/notes" \
+  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$extra_plan" == *"also:    ${SANDBOX}/papers"* ]] || fail "claudefws did not report an extra directory"
+[[ "$extra_plan" == *"also:    ${SANDBOX}/notes"* ]] || fail "claudefws dropped the second extra directory"
+[[ "$extra_plan" == *"--add-dir ${SANDBOX}/papers ${SANDBOX}/notes"* ]] || \
+  fail "claudefws did not plan to pass the extra directories to Claude Code"
+
+no_extra="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$no_extra" != *--add-dir* ]] || fail "claudefws planned --add-dir with nothing to add"
+
+expect_rejected "a relative extra directory" \
+  env AFWS_ADD_DIR=relative "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
+expect_rejected "an extra directory that does not exist" \
+  env AFWS_ADD_DIR=/nonexistent-afws-dir "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
+
+# Refusing before the mount matters: otherwise a typo costs a mount.
+early="$(env AFWS_ADD_DIR=relative "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 || true)"
+[[ "$early" != *"Would mount"* ]] || fail "an invalid extra directory was reported only after planning a mount"
+
+codex_note="$(AFWS_ADD_DIR="${SANDBOX}/papers" \
+  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
+[[ "$codex_note" == *"AFWS_ADD_DIR is ignored"* ]] || \
+  fail "codexfws silently ignored AFWS_ADD_DIR instead of saying so"
+
 # --- mount table ----------------------------------------------------------
 # The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and
 # nesting can be checked without mounting anything.

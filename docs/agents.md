@@ -16,6 +16,7 @@ the workstation — the mount, the shared SSH connection, the registry, the lock
 | Messaged by name from another session | yes, `SendMessage` | no |
 | Locally-run shell commands labelled `[mac]` | yes | no |
 | Background session (`--bg`) | yes | no |
+| Extra local directories (`AFWS_ADD_DIR`) | yes, via `--add-dir` | no |
 
 The differences are not design choices. They follow from what each CLI offers,
 measured against Codex CLI 0.154.0:

@@ -48,6 +48,8 @@ usage() {
   print -r -- "  AFWS_NO_CONTROL_MASTER   Do not share one authenticated SSH connection"
   print -r -- "  AFWS_NO_SHELL_MARKER     Do not label locally-run shell commands"
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
+  print -r -- "  AFWS_ADD_DIR             Extra local directories, colon-separated, that the"
+  print -r -- "                           session may also read (papers, notes, scratch work)"
 }
 
 while (( $# > 0 )); do
@@ -83,6 +85,13 @@ case "$PERMISSION_MODE" in
     afws_die "AFWS_PERMISSION_MODE must be one of: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan"
     ;;
 esac
+
+typeset -a extra_directories
+extra_directories=(${(f)"$(afws_extra_directories)"})
+
+typeset -a add_dir_arguments
+add_dir_arguments=()
+(( ${#extra_directories} > 0 )) && add_dir_arguments=(--add-dir "${extra_directories[@]}")
 
 if (( ! dry_run )); then
   for dependency in ssh sshfs claude; do
@@ -170,7 +179,8 @@ Local workspace: ${local_workspace}
 Remote working directory: ${remote_dir}
 
 Operating rules:
-- Read and edit files only within the current mounted workspace unless the user explicitly expands scope.
+- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
+- An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
 - Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
 - Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: ${remote_runner} -- COMMAND ARG...
 - To send a shell script through standard input, pipe it to: ${remote_runner}
@@ -194,6 +204,9 @@ print -r -- "  session: ${session_name}"
 print -r -- "  ssh:     ${ssh_host}"
 print -r -- "  remote:  ${remote_dir}"
 print -r -- "  local:   ${local_workspace}"
+for extra_directory in "${extra_directories[@]}"; do
+  print -r -- "  also:    ${extra_directory}"
+done
 
 if [[ -x "$PEERS" ]]; then
   if (( dry_run )); then
@@ -212,9 +225,9 @@ if (( dry_run )); then
   fi
   print -r -- "  cd ${(q)local_workspace}"
   if (( background )); then
-    print -r -- "  claude --bg --permission-mode ${PERMISSION_MODE} --name ${session_name} --append-system-prompt <session instructions>"
+    print -r -- "  claude --bg --permission-mode ${PERMISSION_MODE} --name ${session_name}${add_dir_arguments:+ --add-dir ${extra_directories}} --append-system-prompt <session instructions>"
   else
-    print -r -- "  claude --permission-mode ${PERMISSION_MODE} --name ${session_name} --append-system-prompt <session instructions>"
+    print -r -- "  claude --permission-mode ${PERMISSION_MODE} --name ${session_name}${add_dir_arguments:+ --add-dir ${extra_directories}} --append-system-prompt <session instructions>"
   fi
   print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${session_name}.conf"
   if [[ -z "${AFWS_NO_SHELL_MARKER-}" && -x "$SHELL_MARKER" ]]; then
@@ -290,6 +303,7 @@ if (( background )); then
     --bg \
     --permission-mode "$PERMISSION_MODE" \
     --name "$session_name" \
+    "${add_dir_arguments[@]}" \
     --append-system-prompt "$system_prompt" \
     "$@" || {
     afws_remove_session_record
@@ -334,6 +348,7 @@ session_exit=0
 claude \
   --permission-mode "$PERMISSION_MODE" \
   --name "$session_name" \
+  "${add_dir_arguments[@]}" \
   --append-system-prompt "$system_prompt" \
   "$@" || session_exit=$?
 

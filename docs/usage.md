@@ -115,6 +115,28 @@ the workstation and `wc` on the Mac.
 This applies to what you type. Claude itself is instructed to use
 `afws-run` for anything that depends on the remote environment.
 
+## Local material and remote compute in one session
+
+The project is remote, but what you are working *from* is often local: papers, a
+notes directory, a scratch analysis. `AFWS_ADD_DIR` names those, colon-separated,
+so one session reads them and writes its conclusions into the remote project:
+
+```zsh
+AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
+  claudefws SSH_CONFIG_HOST /remote/project
+```
+
+The launcher lists them under `also:` and passes them to Claude Code with
+`--add-dir`. They are validated before anything is mounted, so a typo does not
+cost a mount. The session is told they are local reference material: read from
+them, write into the remote project.
+
+Without this, local reading and remote work end up in two sessions with two
+histories, and everything crossing between them is copied by hand.
+
+Codex CLI has no `--add-dir` equivalent, so `codexfws` says the variable is
+ignored rather than honouring it differently.
+
 ## Work with several sessions
 
 List the sessions on this Mac and what each one is attached to:
@@ -194,6 +216,7 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_KEEP_MOUNT` | Set to any value to leave the mount in place when the session ends |
 | `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
 | `AFWS_ALLOW_HOME_MOUNT` | Set to any value to silence the home-directory warning |
+| `AFWS_ADD_DIR` | Extra local directories the session may read, colon-separated (`claudefws` only) |
 | `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600) |
 | `AFWS_LOCK_TTL` | Seconds after which a lock is reported as stale (default: 7200) |
 
