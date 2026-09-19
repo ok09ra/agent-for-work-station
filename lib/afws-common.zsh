@@ -22,15 +22,18 @@
 # being expanded to this Mac's home directory here.
 : ${AFWS_REMOTE_LOCK_DIR:="~/.afws-locks"}
 
+# Derived from AFWS_STATE_DIR rather than set directly.
 AFWS_SESSION_DIR="${AFWS_STATE_DIR}/sessions"
 AFWS_CONTROL_DIR="${AFWS_STATE_DIR}/control"
 AFWS_LOG_DIR="${AFWS_STATE_DIR}/logs"
-AFWS_MOUNT_TIMEOUT_SECONDS=30
-# A Unix domain socket path cannot exceed 104 bytes on macOS.
+# Overridable: a slow link may need longer than this.
+: ${AFWS_MOUNT_TIMEOUT_SECONDS:=30}
+# Not a setting: a Unix domain socket path cannot exceed 104 bytes on macOS, so
+# there is nothing to tune here.
 AFWS_SOCKET_PATH_LIMIT=100
 # A record written just before the agent starts is not visible to the agent's
 # own session listing yet, so young records are never pruned.
-AFWS_REGISTRATION_GRACE_SECONDS=90
+: ${AFWS_REGISTRATION_GRACE_SECONDS:=90}
 
 # zselect is a zsh builtin, so waiting never depends on an external sleep being
 # present. It returns non-zero when it simply times out, which is normal here.
@@ -413,6 +416,174 @@ afws_warn_about_home_workspace() {
   print -u2 -r -- ""
 
   return 0
+}
+
+# --- what a session is told --------------------------------------------------
+# The facts and the rules that do not depend on which agent is running. Keeping
+# them here means a change to them cannot reach one launcher and not the other.
+
+afws_session_preamble() {
+  print -r -- "This is an agent-for-work-station session backed by an SSHFS mount.
+Session name: ${afws_session_name}
+SSH config host: ${afws_ssh_host}
+Local workspace: ${afws_local_workspace}
+Remote working directory: ${afws_remote_dir}"
+}
+
+afws_shared_operating_rules() {
+  print -r -- "- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
+- An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
+- Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
+- Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: afws-run COMMAND ARG...
+- To send a shell script through standard input, pipe it to: afws-run
+- Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
+- Show the remote command and its relevant stdout and stderr to the user.
+- Ask before destructive operations or before starting expensive or long-running jobs.
+- SSHFS is a network filesystem: prefer one remote command over many small local file operations when scanning large trees."
+}
+
+# The first multi-session rule is the same for both; the rest is not, because
+# only Claude sessions can be addressed.
+afws_shared_session_rules() {
+  print -r -- "- Other sessions, of either agent, may be attached to this same workstation. Run 'afws-peers' to see which session is working on which SSH host and remote directory, and 'afws-peers --same' for the ones sharing this exact remote directory.
+- Before using an exclusive remote resource (a GPU, a shared build or output directory, a dataset being rewritten, a single git worktree), claim it with: afws-lock acquire NAME
+  Release it when finished with: afws-lock release NAME
+  If the lock is held, 'afws-lock status NAME' names the holder; never take a held lock without the user saying so.
+- Do not modify files another session is working on. Coordinate first."
+}
+
+# --- the parts of a launch that do not depend on the agent -----------------
+
+# afws_resolve_session_name PREFIX HOST REMOTE_DIR PEERS DRY_RUN
+# Honours AFWS_SESSION_NAME, otherwise allocates PREFIX-HOST-PROJECT-N.
+afws_resolve_session_name() {
+  local prefix="$1" ssh_host="$2" remote_dir="$3" peers="$4" dry_run="$5" base
+
+  if (( ! dry_run )) && [[ -x "$peers" ]]; then
+    "$peers" --prune --quiet 2>/dev/null || true
+  fi
+
+  if [[ -n "${AFWS_SESSION_NAME-}" ]]; then
+    afws_validate_session_name "$AFWS_SESSION_NAME"
+    print -r -- "$AFWS_SESSION_NAME"
+    return 0
+  fi
+
+  base="${prefix}-$(afws_sanitize_component "$ssh_host")-$(afws_sanitize_component "${remote_dir:t}")"
+  afws_allocate_session_name "$base" ||
+    afws_die "could not allocate a session name; run afws-peers --prune"
+}
+
+# afws_open_session_connection HOST DRY_RUN
+# Sets afws_control_socket_path, empty when the shared connection is turned off.
+# It does not print the path: afws_open_control_master reports what it did on
+# stdout, which a command substitution here would swallow.
+afws_open_session_connection() {
+  local ssh_host="$1" dry_run="$2"
+
+  afws_control_socket_path=""
+  [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && return 0
+
+  afws_control_socket_path="$(afws_control_socket "$ssh_host")"
+  afws_check_socket_length "$afws_control_socket_path"
+
+  if (( ! dry_run )); then
+    afws_open_control_master "$ssh_host" "$afws_control_socket_path" ||
+      afws_die "could not open an SSH connection to ${ssh_host}; run afws-doctor ${ssh_host}"
+  fi
+
+  return 0
+}
+
+# afws_establish_mount HOST REMOTE_DIR SOCKET_OR_EMPTY DRY_RUN LOG_NAME
+# Sets afws_local_workspace and afws_mount_point, reusing a mount that already
+# covers the directory, refusing one that no longer responds or that would hide
+# another, and otherwise mounting.
+afws_establish_mount() {
+  local ssh_host="$1" remote_dir="$2" socket="$3" dry_run="$4" log_name="$5"
+
+  if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
+    print -r -- "Reusing SSHFS mount: ${afws_mount_source}"
+    return 0
+  fi
+
+  if [[ -n "$afws_stale_mount" ]]; then
+    afws_die "$(afws_stale_mount_message "$afws_stale_mount")"
+  fi
+
+  afws_local_workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+  afws_mount_point="$afws_local_workspace"
+
+  if afws_find_nested_mount "$afws_local_workspace"; then
+    afws_die "refusing to mount ${ssh_host}:${remote_dir} on ${afws_local_workspace}
+Another mount is already in use underneath it: ${afws_nested_mount}
+That mount belongs to a session working on a subdirectory of this one. Start this
+session on that deeper directory instead, or unmount it first. Run afws-peers to
+see which session it belongs to."
+  fi
+
+  if (( dry_run )); then
+    print -r -- "Would mount ${ssh_host}:${remote_dir}"
+    print -r -- "  on ${afws_local_workspace}"
+    [[ -n "$socket" ]] && print -r -- "  over a shared SSH connection at ${socket}"
+    return 0
+  fi
+
+  afws_mount "$ssh_host" "$remote_dir" "$afws_local_workspace" "$socket" \
+    "${AFWS_LOG_DIR}/${log_name}.sshfs.log" || exit 1
+}
+
+# afws_print_session_header TITLE PEERS DRY_RUN EXTRA_DIR...
+afws_print_session_header() {
+  local title="$1" peers="$2" dry_run="$3" extra peer_count
+  shift 3
+
+  print -r -- "$title"
+  print -r -- "  session: ${afws_session_name}"
+  print -r -- "  ssh:     ${afws_ssh_host}"
+  print -r -- "  remote:  ${afws_remote_dir}"
+  print -r -- "  local:   ${afws_local_workspace}"
+  for extra in "$@"; do
+    print -r -- "  also:    ${extra}"
+  done
+
+  [[ -x "$peers" ]] || return 0
+  if (( dry_run )); then
+    peer_count="$("$peers" --count --no-prune 2>/dev/null || print -r -- 0)"
+  else
+    peer_count="$("$peers" --count 2>/dev/null || print -r -- 0)"
+  fi
+  print -r -- "  peers:   ${peer_count}"
+}
+
+# What a session's own commands read to reach the same host without asking again.
+afws_export_session_environment() {
+  export AFWS_AGENT="$afws_agent"
+  export AFWS_SESSION_NAME="$afws_session_name"
+  export AFWS_SSH_HOST="$afws_ssh_host"
+  export AFWS_REMOTE_DIR="$afws_remote_dir"
+  export AFWS_LOCAL_WORKSPACE="$afws_local_workspace"
+
+  [[ -S "$afws_control_socket_path" ]] && export AFWS_CONTROL_PATH="$afws_control_socket_path"
+
+  return 0
+}
+
+# EXIT alone does not cover a signal: zsh runs it on a normal exit and on HUP,
+# but not on TERM, so a 'kill' would otherwise leave the mount and the
+# authenticated connection behind. afws_release_session is safe to call twice.
+afws_install_release_traps() {
+  # A global, not a local: a function defined here is global, so it would not
+  # see a local of this one by the time a trap fires.
+  afws_peers_command="$1"
+
+  afws_release_for_traps() { afws_release_session "$afws_peers_command" }
+  trap afws_release_for_traps EXIT
+  trap 'afws_release_for_traps; exit 143' TERM
+  trap 'afws_release_for_traps; exit 129' HUP
+  # Ctrl+C belongs to the agent, which handles it itself; the launcher must stay
+  # alive to clean up after it.
+  trap '' INT
 }
 
 # --- session registry -----------------------------------------------------

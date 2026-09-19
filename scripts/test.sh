@@ -199,13 +199,22 @@ grep -q 'AFWS_CONTROL_PERSIST:=[1-9]' "$LIBRARY" || \
 grep -q 'ControlPersist=\${AFWS_CONTROL_PERSIST}' "$LIBRARY" || \
   fail "the shared SSH connection does not use AFWS_CONTROL_PERSIST"
 
-# zsh runs the EXIT trap on a normal exit and on HUP, but not on TERM.
+# zsh runs the EXIT trap on a normal exit and on HUP, but not on TERM, so the
+# signal traps have to be installed alongside it. Both launchers get them from
+# the same place.
+grep -q "trap 'afws_release_for_traps; exit 143' TERM" "$LIBRARY" || \
+  fail "the launchers do not release what they hold on SIGTERM"
+grep -q "trap 'afws_release_for_traps; exit 129' HUP" "$LIBRARY" || \
+  fail "the launchers do not release what they hold on SIGHUP"
 for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
-  grep -q "trap 'release; exit 143' TERM" "$launcher" || \
-    fail "${launcher:t} does not release what it holds on SIGTERM"
-  grep -q "trap 'release; exit 129' HUP" "$launcher" || \
-    fail "${launcher:t} does not release what it holds on SIGHUP"
+  grep -q 'afws_install_release_traps' "$launcher" || \
+    fail "${launcher:t} does not install the release traps"
 done
+
+# A function defined inside another is global in zsh, so the trap cannot see a
+# local of the function that installed it.
+grep -q 'afws_peers_command=' "$LIBRARY" || \
+  fail "the release traps depend on a local that will not be in scope when they fire"
 
 # AFWS_STATE_DIR decides where the registry and the socket are written, and
 # AFWS_MOUNT_BASE decides what this tool is willing to unmount.

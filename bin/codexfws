@@ -42,7 +42,7 @@ usage() {
   print -r -- "  AFWS_NO_CONTROL_MASTER   Do not share one authenticated SSH connection"
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
   print -r -- "  AFWS_ADD_DIR             Extra local directories, colon-separated, that the"
-  print -r -- "                           session may also read and write (papers, notes, scratch work)"
+  print -r -- "                           session may also write to"
   print -r -- ""
   print -r -- "Codex CLI cannot be given a session name at launch, cannot report its"
   print -r -- "sessions in machine-readable form, and has no shell wrapper, so a Codex"
@@ -59,9 +59,7 @@ while (( $# > 0 )); do
 done
 
 if (( $# == 0 )); then
-  if [[ ! -t 0 ]]; then
-    afws_die "interactive input requires a terminal"
-  fi
+  [[ -t 0 ]] || afws_die "interactive input requires a terminal"
   read -r "ssh_host?SSH config host: "
   read -r "remote_dir?Remote absolute project directory: "
 elif (( $# >= 2 )); then
@@ -76,6 +74,9 @@ fi
 afws_validate_host "$ssh_host"
 remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
 
+# Codex reads outside its workspace but writes only inside it, so the extra
+# directories become writable roots in its sandbox. Claude Code is told the same
+# list with --add-dir; a caller sets one variable either way.
 typeset -a extra_directories
 extra_directories=(${(f)"$(afws_extra_directories)"})
 
@@ -97,165 +98,55 @@ if (( ! dry_run )); then
   done
 fi
 
-# --- session naming -------------------------------------------------------
+# --- the agent-independent part of a launch -------------------------------
 # Codex CLI has no launch-time name flag, so the name is registry bookkeeping:
-# it identifies the session in afws-peers and as a lock holder, but it is not a
-# name Codex itself knows.
+# it identifies the session in afws-peers and as a lock holder, but Codex itself
+# does not know it. The cx- prefix says the name is ours, not the agent's.
 
-if (( ! dry_run )) && [[ -x "$PEERS" ]]; then
-  "$PEERS" --prune --quiet 2>/dev/null || true
-fi
+afws_agent=codex
+afws_ssh_host="$ssh_host"
+afws_remote_dir="$remote_dir"
+afws_session_name="$(afws_resolve_session_name cx "$ssh_host" "$remote_dir" "$PEERS" "$dry_run")"
 
-if [[ -n "${AFWS_SESSION_NAME-}" ]]; then
-  afws_validate_session_name "$AFWS_SESSION_NAME"
-  session_name="$AFWS_SESSION_NAME"
-else
-  session_base="cx-$(afws_sanitize_component "$ssh_host")-$(afws_sanitize_component "${remote_dir:t}")"
-  session_name="$(afws_allocate_session_name "$session_base")" ||
-    afws_die "could not allocate a session name; run afws-peers --prune"
-fi
-
-# --- shared SSH connection ------------------------------------------------
-
-control_socket="$(afws_control_socket "$ssh_host")"
-use_control_master=1
-[[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && use_control_master=0
-
-if (( use_control_master )); then
-  afws_check_socket_length "$control_socket"
-fi
-
-if (( ! dry_run )) && (( use_control_master )); then
-  afws_open_control_master "$ssh_host" "$control_socket" ||
-    afws_die "could not open an SSH connection to ${ssh_host}; run afws-doctor ${ssh_host}"
-fi
-
-# --- mount ----------------------------------------------------------------
-
-if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
-  local_workspace="$afws_local_workspace"
-  mount_point="$afws_mount_point"
-  print -r -- "Reusing SSHFS mount: ${afws_mount_source}"
-elif [[ -n "$afws_stale_mount" ]]; then
-  afws_die "$(afws_stale_mount_message "$afws_stale_mount")"
-else
-  local_workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
-  mount_point="$local_workspace"
-
-  if afws_find_nested_mount "$local_workspace"; then
-    afws_die "refusing to mount ${ssh_host}:${remote_dir} on ${local_workspace}
-Another mount is already in use underneath it: ${afws_nested_mount}
-That mount belongs to a session working on a subdirectory of this one. Start this
-session on that deeper directory instead, or unmount it first. Run afws-peers to
-see which session it belongs to."
-  fi
-
-  if (( dry_run )); then
-    print -r -- "Would mount ${ssh_host}:${remote_dir}"
-    print -r -- "  on ${local_workspace}"
-    (( use_control_master )) &&
-      print -r -- "  over a shared SSH connection at ${control_socket}"
-  else
-    (( use_control_master )) && mount_socket="$control_socket" || mount_socket=""
-    afws_mount "$ssh_host" "$remote_dir" "$local_workspace" "$mount_socket" \
-      "${AFWS_LOG_DIR}/${session_name}.sshfs.log" || exit 1
-  fi
-fi
-
-afws_warn_about_home_workspace "$local_workspace" codex
+afws_open_session_connection "$ssh_host" "$dry_run"
+afws_establish_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
+  "$dry_run" "$afws_session_name"
+afws_warn_about_home_workspace "$afws_local_workspace" codex
 
 # --- session instructions -------------------------------------------------
 
-remote_runner="afws-run"
-developer_instructions="This is an agent-for-work-station session backed by an SSHFS mount.
-Session name: ${session_name}
-SSH config host: ${ssh_host}
-Local workspace: ${local_workspace}
-Remote working directory: ${remote_dir}
+developer_instructions="$(afws_session_preamble)
 
 Operating rules:
-- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
-- An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
-- Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
-- Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: ${remote_runner} COMMAND ARG...
-- To send a shell script through standard input, pipe it to: ${remote_runner}
-- Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
-- Show the remote command and its relevant stdout and stderr to the user.
-- Ask before destructive operations or before starting expensive or long-running jobs.
-- SSHFS is a network filesystem: prefer one remote command over many small local file operations when scanning large trees.
-- Commands you run with the ordinary shell run on this Mac, not on the workstation, even though the files are the workstation's. Only ${remote_runner} reaches the workstation.
+$(afws_shared_operating_rules)
+- Commands you run with the ordinary shell run on this Mac, not on the workstation, even though the files are the workstation's. Only afws-run reaches the workstation.
 
 Multi-session rules:
-- Other sessions, of this agent or of Claude Code, may be attached to this same workstation. Run 'afws-peers' to see which session is working on which SSH host and remote directory, and 'afws-peers --same' for the ones sharing this exact remote directory.
-- This session is registered as '${session_name}'.
-- Before using an exclusive remote resource (a GPU, a shared build or output directory, a dataset being rewritten, a single git worktree), claim it with: afws-lock acquire NAME
-  Release it when finished with: afws-lock release NAME
-  If the lock is held, 'afws-lock status NAME' names the holder. Report the wait to the user; never take a held lock without the user saying so.
-- Do not modify files another session is working on. Ask the user to coordinate."
+$(afws_shared_session_rules)
+- This session is registered as '${afws_session_name}'. Codex sessions cannot be messaged by name, so report a wait to the user rather than trying to reach a peer."
 
-print -r -- "Codex CLI for Work Station"
-print -r -- "  session: ${session_name}"
-print -r -- "  ssh:     ${ssh_host}"
-print -r -- "  remote:  ${remote_dir}"
-print -r -- "  local:   ${local_workspace}"
-for extra_directory in "${extra_directories[@]}"; do
-  print -r -- "  also:    ${extra_directory}"
-done
-
-if [[ -x "$PEERS" ]]; then
-  if (( dry_run )); then
-    peer_count="$("$PEERS" --count --no-prune 2>/dev/null || print -r -- 0)"
-  else
-    peer_count="$("$PEERS" --count 2>/dev/null || print -r -- 0)"
-  fi
-  print -r -- "  peers:   ${peer_count}"
-fi
+afws_print_session_header "Codex CLI for Work Station" "$PEERS" "$dry_run" \
+  "${extra_directories[@]}"
 
 if (( dry_run )); then
   print -r -- "Would start Codex with:"
-  print -r -- "  codex --no-alt-screen -C ${(q)local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions>"
-  print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${session_name}.conf"
+  print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions>"
+  print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${afws_session_name}.conf"
   exit 0
 fi
 
-# --- registry and session environment -------------------------------------
-
-afws_agent=codex
-afws_session_name="$session_name"
-afws_ssh_host="$ssh_host"
-afws_remote_dir="$remote_dir"
-afws_local_workspace="$local_workspace"
-afws_mount_point="$mount_point"
-afws_control_socket_path="$control_socket"
-
-export AFWS_AGENT=codex
-export AFWS_SESSION_NAME="$session_name"
-export AFWS_SSH_HOST="$ssh_host"
-export AFWS_REMOTE_DIR="$remote_dir"
-export AFWS_LOCAL_WORKSPACE="$local_workspace"
-
-if [[ -S "$control_socket" ]]; then
-  export AFWS_CONTROL_PATH="$control_socket"
-fi
+afws_export_session_environment
 
 # Codex takes the workspace with -C, so this shell stays outside the mount and
 # nothing has to be moved out of the way before unmounting.
 
 afws_write_session_record interactive "$$" ""
-
-release() { afws_release_session "$PEERS"; }
-# EXIT alone does not cover a signal: zsh runs it on a normal exit and on HUP,
-# but not on TERM, so a 'kill' would otherwise leave the mount and the
-# authenticated connection behind. afws_release_session is safe to call twice.
-trap release EXIT
-trap 'release; exit 143' TERM
-trap 'release; exit 129' HUP
-trap '' INT
+afws_install_release_traps "$PEERS"
 
 session_exit=0
 codex \
   --no-alt-screen \
-  -C "$local_workspace" \
+  -C "$afws_local_workspace" \
   --sandbox workspace-write \
   --ask-for-approval on-request \
   "${extra_arguments[@]}" \

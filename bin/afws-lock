@@ -142,7 +142,7 @@ esac
 
 readonly ACQUIRE_SCRIPT='(umask 077; mkdir -p "$base")
 chmod 700 "$base" 2>/dev/null || true
-lock=$base/$lock_name
+lock="$base/$lock_name"
 if mkdir "$lock" 2>/dev/null; then
   {
     echo "holder=$holder"
@@ -158,7 +158,7 @@ cat "$lock/owner" 2>/dev/null || true
 exit 3
 '
 
-readonly RELEASE_SCRIPT='lock=$base/$lock_name
+readonly RELEASE_SCRIPT='lock="$base/$lock_name"
 if [ ! -d "$lock" ]; then
   echo "not held $lock_name"
   exit 0
