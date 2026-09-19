@@ -21,6 +21,37 @@ mount and the connection are released when the last session using them exits.
 macOS client only. No real hostnames, addresses, usernames or paths are stored in
 this repository.
 
+## Who this is for
+
+**You share a workstation with other people, and it holds data you are careful
+with.** Other accounts are logged in; installing a coding agent there is a
+decision that affects them. Run it on your Mac instead and nothing of yours
+lands on the shared machine — no credentials, no permission rules accumulating
+for months, no background process left behind by a session that ended. An agent
+used natively on a shared box for half a year ends up with an allowlist nobody
+reviews, applying to every later session on that machine.
+
+**You do not administer the machine.** No permission to install, a policy that
+forbids it, or no outbound network for an agent to sign in with. This needs
+nothing on the workstation but `sshd` and a shell.
+
+**What you read is local and what you compute is remote.** Papers, notes and a
+scratch analysis on your Mac; the project and the GPU on the workstation. Both
+are ordinary paths in one session, so reading a paper and running the job that
+follows from it happen in one conversation rather than two with a copy in between.
+
+**You work across more than one workstation.** One agent configuration, one
+session history, and `afws-peers` showing every session on every host — instead of
+an installation and a permission file per machine, each drifting from the others.
+
+**You run several sessions against one machine.** They share one mount and one
+authenticated connection, `afws-lock` keeps two of them off the same GPU, and
+Claude sessions can ask each other what they found instead of rediscovering it.
+
+Along the way: one password prompt per host rather than one per command, your own
+editor and toolchain for authoring, and a mount and connection that release
+themselves when the last session using them exits.
+
 ## Installation
 
 **1. macFUSE and SSHFS.** The latest stable release from the
@@ -214,25 +245,7 @@ reports a status; a Codex session cannot and does not, because Codex has no
 launch-time session name and no machine-readable session listing.
 [Agents](docs/agents.md) sets out every difference and the measurement behind it.
 
-## What this is good for
-
-- **A workstation you would rather not install an agent on** — shared, sensitive,
-  or not yours to administer. Credentials, permission rules and history stay on
-  your Mac, and nothing accumulates there: no allowlist growing for months, no
-  background process left by a session that ended.
-- **Local material and remote compute in one session.** Papers on your Mac, the
-  project and the GPU on the workstation, one conversation, no copying in between.
-- **Several workstations from one place.** One configuration, one session history,
-  `afws-peers` across all of them.
-- **Several sessions on one workstation.** Shared mount, shared connection,
-  `afws-lock` between them, and Claude sessions can ask each other what they found
-  rather than rediscovering it.
-- **A machine you cannot install on at all** — no permission, no outbound network
-  for the agent to sign in with, a policy that forbids it.
-- **Authoring with your own toolchain.** Editor, Python tooling and IDE stay
-  local; only what needs the remote environment goes over.
-
-## What this is not good for
+## When this is the wrong tool
 
 - **Work that is mostly file traffic.** SSHFS pays a round trip per operation, so
   a large `grep`, a full build or `git status` over a big tree is slower than on
