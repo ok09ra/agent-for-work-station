@@ -193,7 +193,9 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_SHELL_MARKER` | 値を設定すると、ローカル実行への印付けを止めます |
 | `AFWS_ALLOW_HOME_MOUNT` | 値を設定すると、ホームディレクトリの警告を抑止します |
 | `AFWS_ADD_DIR` | セッションが追加で読めるローカルディレクトリ。`:`区切り（`claudefws`のみ） |
-| `AFWS_CONTROL_PERSIST` | 共有SSH接続が無通信で維持される秒数（既定: 600） |
+| `AFWS_KEEP_CONTROL_MASTER` | 値を設定すると、最後のセッション終了後も共有接続を開いたままにします |
+| `AFWS_CONTROL_PERSIST` | 共有SSH接続が無通信で維持される秒数（既定: 600、`AFWS_KEEP_CONTROL_MASTER`指定時は28800） |
+| `AFWS_PROBE_TIMEOUT_SECONDS` | 既存マウントが最初の読み取りに応答するまで待つ秒数（既定: 20） |
 | `AFWS_LOCK_TTL` | ロックをstaleと表示するまでの秒数（既定: 7200） |
 
 セッション内では、launcherが`AFWS_SSH_HOST`、`AFWS_REMOTE_DIR`、`AFWS_LOCAL_WORKSPACE`もexportします。これにより`afws-run`と`afws-lock`を接続名なしで使えます。
@@ -218,7 +220,11 @@ AFWS_PERMISSION_MODE=manual claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ssh -S ~/.afws/control/HOST.sock -O exit HOST
 ```
 
-毎回個別に接続したい場合は`AFWS_NO_CONTROL_MASTER=1`を設定します。その場合、鍵認証が事実上必須になります。
+接続は、そのホストを使う最後のセッションが終了した時点で閉じられます。したがって次回の起動では再度認証します。パスワード認証のホストでは、これは起動ごとに1回のパスワード入力を意味し、さらにセッション外で`afws-run`を使うとコマンドごとに1回聞かれます。`AFWS_KEEP_CONTROL_MASTER=1`を設定すると接続を開いたままにし、寿命を決めるのは`AFWS_CONTROL_PERSIST`だけになります。何を引き換えにするかは[security.ja.md](security.ja.md)を参照してください。
+
+共有接続が無い場合でも`afws-run`と`afws-lock`は動作し、自前で接続を開きます。その際はstderrにその旨を出力します。パスワード認証のホストでは、この暗黙のフォールバックこそが「1回の入力」を「何度もの入力」に変えるためです。
+
+毎回個別に接続したい場合は`AFWS_NO_CONTROL_MASTER=1`を設定します。その場合、鍵認証が事実上必須になり、フォールバックの通知も出力されません。
 
 ## 制限事項
 

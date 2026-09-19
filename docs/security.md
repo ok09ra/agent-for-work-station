@@ -112,6 +112,17 @@ inactivity, 600 by default, because a session killed with `SIGKILL` never gets
 to close it. `afws-umount --orphaned` closes any connection no live session is
 using, and `afws-doctor` reports one it finds.
 
+`AFWS_KEEP_CONTROL_MASTER=1` removes the first of those two bounds: the
+connection is no longer closed when the last session using the host exits, and
+survives until it expires. This is a real widening. An authenticated channel to
+the remote host then outlives every session that had a reason to exist, so
+anything that can reach the socket in that window can act as the remote user.
+It exists for hosts that authenticate by password, where the alternative is
+typing the password on every launch and on every `afws-run` outside a session.
+Set it per host and deliberately, keep `AFWS_CONTROL_PERSIST` no longer than
+the working day it is meant to cover, and close the connection by hand when you
+finish. The default leaves it off.
+
 Close the connection when you finish with a host:
 
 ```zsh

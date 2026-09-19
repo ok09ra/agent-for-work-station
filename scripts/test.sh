@@ -17,13 +17,25 @@ readonly SHELL_WRAPPER="${REPOSITORY_ROOT}/bin/afws-shell"
 readonly SANDBOX="$(mktemp -d /tmp/afws-test.XXXXXX)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
+# Two tests below exercise the non-dry-run path, which ends in ssh. They put
+# this stub ahead of it on PATH, so the suite still reaches no real host.
+readonly STUB_BIN="${SANDBOX}/stub-bin"
+mkdir -p "$STUB_BIN"
+cat >| "${STUB_BIN}/ssh" <<'STUB_SSH'
+#!/bin/zsh
+print -r -- "stub-ssh $*"
+exit 0
+STUB_SSH
+chmod +x "${STUB_BIN}/ssh"
+
 # Every test runs against a throwaway registry and mount root. No test reaches
 # ssh, sshfs, or a real agent session.
 export AFWS_STATE_DIR="${SANDBOX}/state"
 export AFWS_MOUNT_BASE="${SANDBOX}/mounts"
 unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
   AFWS_AGENT AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
-  AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND 2>/dev/null || true
+  AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND AFWS_KEEP_CONTROL_MASTER \
+  AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
 
 fail() {
   print -u2 -r -- "test.sh: $*"
@@ -207,6 +219,68 @@ grep -q 'AFWS_CONTROL_PERSIST:=[1-9]' "$LIBRARY" || \
   fail "the shared SSH connection has no finite ControlPersist"
 grep -q 'ControlPersist=\${AFWS_CONTROL_PERSIST}' "$LIBRARY" || \
   fail "the shared SSH connection does not use AFWS_CONTROL_PERSIST"
+
+# A host that authenticates by password cannot afford to re-authenticate on
+# every launch, so AFWS_KEEP_CONTROL_MASTER trades the close-on-last-exit bound
+# for expiry alone -- which then has to be the longer of the two defaults.
+persist_probe="$(zsh -c '
+  set -eu
+  source '"$LIBRARY"'
+  print -r -- "$AFWS_CONTROL_PERSIST"
+')"
+kept_persist_probe="$(zsh -c '
+  set -eu
+  AFWS_KEEP_CONTROL_MASTER=1
+  source '"$LIBRARY"'
+  print -r -- "$AFWS_CONTROL_PERSIST"
+')"
+chosen_persist_probe="$(zsh -c '
+  set -eu
+  AFWS_KEEP_CONTROL_MASTER=1 AFWS_CONTROL_PERSIST=42
+  source '"$LIBRARY"'
+  print -r -- "$AFWS_CONTROL_PERSIST"
+')"
+(( kept_persist_probe > persist_probe )) || \
+  fail "keeping the connection open did not outlast the default (${kept_persist_probe})"
+[[ "$chosen_persist_probe" == 42 ]] || \
+  fail "AFWS_KEEP_CONTROL_MASTER overrode an explicit AFWS_CONTROL_PERSIST (${chosen_persist_probe})"
+
+# The knob suppresses only the close. Releasing the last session of a host is
+# what reaches that branch, so this stands in for afws-peers reporting none
+# left; the mount point is deliberately outside AFWS_MOUNT_BASE, which leaves
+# the unmount alone and isolates the connection.
+readonly PEERS_STUB="${SANDBOX}/stub-peers"
+cat >| "$PEERS_STUB" <<'STUB_PEERS'
+#!/bin/zsh
+print -r -- 0
+STUB_PEERS
+chmod +x "$PEERS_STUB"
+
+release_probe_for() {
+  zsh -c '
+    set -eu
+    AFWS_PROGRAM=test
+    AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+    AFWS_MOUNT_BASE='"$AFWS_MOUNT_BASE"'
+    export AFWS_KEEP_CONTROL_MASTER='"${1}"'
+    source '"$LIBRARY"'
+    afws_close_control_master() { print -r -- "CLOSED"; }
+    afws_session_name=keep-probe afws_ssh_host=h
+    afws_mount_point='"$SANDBOX"'/not-a-managed-mount
+    afws_control_socket_path=/nonexistent.sock
+    afws_release_session '"$PEERS_STUB"'
+  '
+}
+
+closed_probe="$(release_probe_for '')"
+[[ "$closed_probe" == *CLOSED* ]] || \
+  fail "releasing the last session of a host left the connection open (${closed_probe})"
+
+keep_probe="$(release_probe_for 1)"
+[[ "$keep_probe" != *CLOSED* ]] || \
+  fail "AFWS_KEEP_CONTROL_MASTER still closed the shared connection"
+[[ "$keep_probe" == *"Leaving the shared SSH connection"* ]] || \
+  fail "AFWS_KEEP_CONTROL_MASTER did not say the connection was left open"
 
 # zsh runs the EXIT trap on a normal exit and on HUP, but not on TERM, so the
 # signal traps have to be installed alongside it. Both launchers get them from
@@ -473,8 +547,60 @@ if ! ls -1 "$unreadable" >/dev/null 2>&1; then
     fail "a mount that does not respond to a directory read was reused"
   [[ "$stale" == *"diskutil unmount force"* ]] || \
     fail "the stale-mount message did not offer a way out"
+  [[ "$stale" == *ENXIO* ]] || \
+    fail "a mount that failed its read was not diagnosed as dead"
 fi
 chmod 755 "$unreadable"
+
+# A mount that answers nothing is not the same as one that answers with an
+# error: a cold mount on a slow link also answers nothing, and telling someone
+# to unmount that one costs them a working mount. The deadline is a knob for
+# exactly that reason, so it has to be read rather than hardcoded.
+readonly SLOW_BIN="${SANDBOX}/slow-bin"
+mkdir -p "$SLOW_BIN"
+cat >| "${SLOW_BIN}/ls" <<'STUB_LS'
+#!/bin/zsh
+sleep 30
+STUB_LS
+chmod +x "${SLOW_BIN}/ls"
+
+probe_started=$SECONDS
+slow_probe="$(PATH="${SLOW_BIN}:$PATH" zsh -c '
+  set -eu
+  AFWS_PROBE_TIMEOUT_SECONDS=1
+  source '"$LIBRARY"'
+  afws_directory_responds '"$SANDBOX"' && rc=0 || rc=$?
+  print -r -- "${afws_probe_outcome} ${rc}"
+')"
+probe_elapsed=$(( SECONDS - probe_started ))
+[[ "$slow_probe" == "timeout 1" ]] || \
+  fail "a mount that answered nothing was not reported as a timeout (${slow_probe})"
+(( probe_elapsed < 5 )) || \
+  fail "AFWS_PROBE_TIMEOUT_SECONDS was ignored; the probe took ${probe_elapsed}s"
+
+healthy_probe="$(zsh -c '
+  set -eu
+  source '"$LIBRARY"'
+  afws_directory_responds '"$SANDBOX"' && rc=0 || rc=$?
+  print -r -- "${afws_probe_outcome} ${rc}"
+')"
+[[ "$healthy_probe" == "ok 0" ]] || \
+  fail "a readable directory was not reported as responding (${healthy_probe})"
+
+timeout_message="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  source '"$LIBRARY"'
+  afws_stale_mount_message /some/mount timeout
+')"
+[[ "$timeout_message" == *"not proof"* ]] || \
+  fail "the timeout message claimed more than the probe established"
+[[ "$timeout_message" == *pgrep* ]] || \
+  fail "the timeout message did not say how to check whether sshfs is alive"
+[[ "$timeout_message" != *ENXIO* ]] || \
+  fail "the timeout message asserted the ENXIO diagnosis it has no evidence for"
+[[ "$timeout_message" == *AFWS_PROBE_TIMEOUT_SECONDS* ]] || \
+  fail "the timeout message did not offer a longer deadline"
 
 # --- afws-run -------------------------------------------------------------
 
@@ -559,6 +685,28 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
   mismatch="$(AFWS_STATE_DIR="$short_state" AFWS_CONTROL_PATH="$socket_path" \
     AFWS_SSH_HOST=example-workstation "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
   [[ "$mismatch" != *"-S "* ]] || fail "afws-run applied the session socket to a different host"
+
+  # Falling back to a separate connection is allowed, but a password-authenticated
+  # host turns a silent fallback into one prompt per command, so it must be said.
+  warned="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" \
+    "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
+  [[ "$warned" == *"no shared SSH connection"* ]] || \
+    fail "afws-run fell back to a separate connection in silence"
+
+  warned_lock="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" \
+    "$LOCK" status --host other-workstation 2>&1 >/dev/null || true)"
+  [[ "$warned_lock" == *"no shared SSH connection"* ]] || \
+    fail "afws-lock fell back to a separate connection in silence"
+
+  # A dry run connects to nothing, so it has nothing to warn about.
+  quiet="$(AFWS_STATE_DIR="$short_state" "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd 2>&1 >/dev/null)"
+  [[ "$quiet" != *"no shared SSH connection"* ]] || fail "a dry run warned about a connection it never opens"
+
+  # Asking for separate connections on purpose is not a thing to be warned about.
+  opted_out="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" AFWS_NO_CONTROL_MASTER=1 \
+    "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
+  [[ "$opted_out" != *"no shared SSH connection"* ]] || \
+    fail "AFWS_NO_CONTROL_MASTER was warned about despite being deliberate"
 
   rm -rf "$short_state"
 fi

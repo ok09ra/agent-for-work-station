@@ -58,7 +58,33 @@ the launcher prints the end of that file when it gives up. A permission error
 there means the shared SSH connection is not usable; a timeout means the host
 became unreachable between opening the connection and mounting.
 
+## The mount did not answer within 20 seconds
+
+This is a timeout, not a diagnosis. Before reusing an existing mount the
+launcher reads it once; a mount whose sshfs process has died answers straight
+away with an error, so anything that answers nothing is either hung or merely
+cold, and a cold mount on a slow link can take a while over its first read.
+
+Check which one you have before unmounting anything:
+
+```zsh
+pgrep -fl sshfs
+```
+
+If the process for that mount is still there, the mount is very likely fine and
+only slow. Give the probe longer:
+
+```zsh
+AFWS_PROBE_TIMEOUT_SECONDS=60 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+If there is no such process, the mount is dead; unmount it as below.
+
 ## The mount exists but does not respond
+
+This is the other case: the read came back as an error, which on macFUSE means
+the sshfs process behind the mount is gone and every path inside it now fails
+with `ENXIO`.
 
 SSHFS attempts to reconnect after a network interruption, but recovery is not always possible. Exit Claude Code, eject the corresponding volume in Finder, and start again. Before forcing a process to stop or unmounting, confirm that no write operation is still in progress.
 

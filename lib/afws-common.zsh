@@ -17,7 +17,15 @@
 # A pre-authenticated SSH channel should not outlive the sessions using it. The
 # launcher closes it when the last session exits, but a session killed with
 # SIGKILL never gets to, so the connection also expires on its own.
-: ${AFWS_CONTROL_PERSIST:=600}
+# AFWS_KEEP_CONTROL_MASTER gives up the first of those two bounds: a host that
+# authenticates by password is otherwise asked again on every launch, and every
+# afws-run once the connection is gone. Expiry is then the only bound left, so
+# it is given a longer default; set AFWS_CONTROL_PERSIST to choose your own.
+if [[ -n "${AFWS_KEEP_CONTROL_MASTER-}" ]]; then
+  : ${AFWS_CONTROL_PERSIST:=28800}
+else
+  : ${AFWS_CONTROL_PERSIST:=600}
+fi
 # Quoted on purpose: the tilde must survive to the remote shell rather than
 # being expanded to this Mac's home directory here.
 : ${AFWS_REMOTE_LOCK_DIR:="~/.afws-locks"}
@@ -28,6 +36,10 @@ AFWS_CONTROL_DIR="${AFWS_STATE_DIR}/control"
 AFWS_LOG_DIR="${AFWS_STATE_DIR}/logs"
 # Overridable: a slow link may need longer than this.
 : ${AFWS_MOUNT_TIMEOUT_SECONDS:=30}
+# How long a mount is given to answer its first read. A dead mount answers
+# immediately -- with an error -- so this bounds only the hung and the merely
+# cold, and a cold mount over a slow link is the common case of the two.
+: ${AFWS_PROBE_TIMEOUT_SECONDS:=20}
 # Not a setting: a Unix domain socket path cannot exceed 104 bytes on macOS, so
 # there is nothing to tune here.
 AFWS_SOCKET_PATH_LIMIT=100
@@ -124,26 +136,46 @@ afws_allocate_session_name() {
 
 # A macFUSE mount whose sshfs process is gone still passes -d, but every read
 # inside it fails with ENXIO; only a directory read exposes that. A mount that
-# is merely hung would block forever, so the probe is given a deadline, and
-# success is signalled through a marker file rather than the job's exit status,
+# is merely hung would block forever, so the probe is given a deadline, and the
+# outcome is signalled through a marker file rather than the job's exit status,
 # which is not reliably retrievable once the job has been reaped.
+#
+# The three outcomes are kept apart in afws_probe_outcome, because they call for
+# different advice. A mount that fails is dead and should be unmounted; a mount
+# that says nothing within the deadline may be hung, but may equally be a cold
+# mount on a slow link still setting up its first read, and telling someone to
+# unmount that one destroys a working mount.
 afws_directory_responds() {
-  local target="$1" waited=0 probe_pid probe_marker result=1
+  local target="$1" waited=0 probe_pid probe_marker probe_result result=1
+
+  afws_probe_outcome=timeout
 
   probe_marker="$(mktemp "${TMPDIR:-/tmp}/afws-probe.XXXXXX")" || return 1
 
-  ( ls -1 "$target" >/dev/null 2>&1 && print -r -- ok >"$probe_marker" ) &
+  (
+    if ls -1 "$target" >/dev/null 2>&1; then
+      print -r -- ok
+    else
+      print -r -- error
+    fi >"$probe_marker"
+  ) &
   probe_pid=$!
 
-  while (( waited < 5 )); do
+  while (( waited < AFWS_PROBE_TIMEOUT_SECONDS )); do
     kill -0 "$probe_pid" 2>/dev/null || break
     afws_pause_seconds 1
     waited=$(( waited + 1 ))
   done
 
   kill -9 "$probe_pid" 2>/dev/null || true
-  [[ -s "$probe_marker" ]] && result=0
+  probe_result="$(cat "$probe_marker" 2>/dev/null)"
   rm -f "$probe_marker"
+
+  case "$probe_result" in
+    ok)    afws_probe_outcome=ok; result=0 ;;
+    error) afws_probe_outcome=error ;;
+    *)     afws_probe_outcome=timeout ;;
+  esac
 
   return "$result"
 }
@@ -159,6 +191,7 @@ afws_find_existing_mount() {
   afws_mount_source=""
   afws_mount_point=""
   afws_stale_mount=""
+  afws_stale_mount_reason=""
 
   while IFS= read -r mount_line; do
     src="${mount_line%% on *}"
@@ -188,6 +221,7 @@ afws_find_existing_mount() {
         return 0
       fi
       afws_stale_mount="$mount_path"
+      afws_stale_mount_reason="$afws_probe_outcome"
     fi
   done < <(${=AFWS_MOUNT_COMMAND})
 
@@ -219,13 +253,27 @@ afws_mount_is_present() {
   ${=AFWS_MOUNT_COMMAND} | grep -Fq " on $1 ("
 }
 
+# afws_stale_mount_message MOUNT_POINT [OUTCOME]
 afws_stale_mount_message() {
-  print -r -- "the SSHFS mount at $1 is present but not responding
-Its sshfs process is gone, so every path inside it fails with ENXIO. Unmount it,
-then start again:
+  local unmount_advice="Unmount it, then start again:
   umount ${(q)1}
 If that is refused, close anything still sitting in that directory, or force it:
   diskutil unmount force ${(q)1}"
+
+  if [[ "${2-}" == timeout ]]; then
+    print -r -- "the SSHFS mount at $1 did not answer within ${AFWS_PROBE_TIMEOUT_SECONDS} seconds
+That is not proof that it is dead. A cold mount on a slow link can take longer
+than this to answer its first read, and unmounting one that still works costs
+you the mount. Check whether its sshfs process is still running:
+  pgrep -fl sshfs
+If it is, give the probe longer and start again:
+  AFWS_PROBE_TIMEOUT_SECONDS=60 ${AFWS_PROGRAM} ...
+If there is no such process, the mount is dead. ${unmount_advice}"
+    return 0
+  fi
+
+  print -r -- "the SSHFS mount at $1 is present but not responding
+Its sshfs process is gone, so every path inside it fails with ENXIO. ${unmount_advice}"
 }
 
 # --- shared SSH connection ------------------------------------------------
@@ -286,6 +334,29 @@ afws_resolve_control_path() {
   else
     afws_control_socket "$ssh_host"
   fi
+}
+
+# afws_control_ssh_options HOST [QUIET]
+# Sets afws_ssh_control_options to the ssh options that reuse the connection a
+# launcher authenticated. Falling back to a separate connection is allowed --
+# afws-run is usable on its own -- but never in silence: on a host that asks for
+# a password that fallback is what turns one prompt into one prompt per command.
+# A dry run passes QUIET, having nothing to connect with and nothing to prompt.
+afws_control_ssh_options() {
+  local ssh_host="$1" quiet="${2:-0}" control_path
+
+  afws_ssh_control_options=()
+  [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && return 0
+
+  control_path="$(afws_resolve_control_path "$ssh_host")"
+  if [[ -S "$control_path" ]]; then
+    afws_ssh_control_options=(-S "$control_path")
+  elif (( ! quiet )); then
+    print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
+    print -u2 -r -- "  connecting separately; a host that authenticates by password will ask again"
+  fi
+
+  return 0
 }
 
 # --- mounting -------------------------------------------------------------
@@ -508,7 +579,7 @@ afws_establish_mount() {
   fi
 
   if [[ -n "$afws_stale_mount" ]]; then
-    afws_die "$(afws_stale_mount_message "$afws_stale_mount")"
+    afws_die "$(afws_stale_mount_message "$afws_stale_mount" "$afws_stale_mount_reason")"
   fi
 
   afws_local_workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
@@ -734,8 +805,12 @@ afws_release_session() {
     print -r -- "Leaving ${afws_mount_point} mounted for ${mount_users} other session(s)."
   fi
 
-  if [[ "$host_users" == 0 ]]; then
-    afws_close_control_master "$afws_ssh_host" "$afws_control_socket_path"
+  if [[ "$host_users" == 0 && -n "$afws_control_socket_path" ]]; then
+    if [[ -n "${AFWS_KEEP_CONTROL_MASTER-}" ]]; then
+      print -r -- "Leaving the shared SSH connection to ${afws_ssh_host} open."
+    else
+      afws_close_control_master "$afws_ssh_host" "$afws_control_socket_path"
+    fi
   fi
 
   return 0

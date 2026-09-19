@@ -229,7 +229,9 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
 | `AFWS_ALLOW_HOME_MOUNT` | Set to any value to silence the home-directory warning |
 | `AFWS_ADD_DIR` | Extra local directories the session may read, colon-separated (`claudefws` only) |
-| `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600) |
+| `AFWS_KEEP_CONTROL_MASTER` | Set to any value to keep the shared connection open after the last session exits |
+| `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600, or 28800 with `AFWS_KEEP_CONTROL_MASTER`) |
+| `AFWS_PROBE_TIMEOUT_SECONDS` | Seconds an existing mount is given to answer its first read (default: 20) |
 | `AFWS_LOCK_TTL` | Seconds after which a lock is reported as stale (default: 7200) |
 
 Inside a running session the launcher also exports `AFWS_SSH_HOST`, `AFWS_REMOTE_DIR`, and `AFWS_LOCAL_WORKSPACE`, which is how `afws-run` and `afws-lock` can be used without repeating the host.
@@ -259,8 +261,20 @@ Close it when you are finished with a host:
 ssh -S ~/.afws/control/HOST.sock -O exit HOST
 ```
 
+The connection is closed when the last session using that host exits, so the
+next launch authenticates again. On a host that authenticates by password that
+is a password per launch, and `afws-run` used outside a session then asks once
+per command. `AFWS_KEEP_CONTROL_MASTER=1` keeps the connection open instead,
+leaving `AFWS_CONTROL_PERSIST` as the only thing that bounds its life; see
+[security.md](security.md) for what that gives up.
+
+`afws-run` and `afws-lock` still work with no shared connection to reuse: they
+open their own. They say so on stderr when they do, because that fallback is
+what turns one prompt into many on a host that authenticates by password.
+
 To connect separately every time instead, set `AFWS_NO_CONTROL_MASTER=1`.
-Key-based authentication is then effectively required.
+Key-based authentication is then effectively required, and the fallback notice
+is not printed.
 
 ## Limitations
 

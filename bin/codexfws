@@ -40,6 +40,8 @@ usage() {
   print -r -- "  AFWS_STATE_DIR           Registry root (default: HOME/.afws)"
   print -r -- "  AFWS_SESSION_NAME        Use this session name instead of a generated one"
   print -r -- "  AFWS_NO_CONTROL_MASTER   Do not share one authenticated SSH connection"
+  print -r -- "  AFWS_KEEP_CONTROL_MASTER Keep that connection open after the last session"
+  print -r -- "                           exits, so a password host is not asked again"
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
   print -r -- "  AFWS_ADD_DIR             Extra local directories, colon-separated, that the"
   print -r -- "                           session may also write to"
