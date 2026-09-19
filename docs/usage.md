@@ -134,10 +134,9 @@ them, write into the remote project.
 Without this, local reading and remote work end up in two sessions with two
 histories, and everything crossing between them is copied by hand.
 
-`codexfws` does not need this: Codex reads through a sandbox that permits reads
-outside the workspace, so a local path is readable without being named. It says
-so if the variable is set. Writing outside the workspace is what Codex
-restricts.
+Both launchers take the same variable and report the same thing. What they pass
+to the agent differs, because the two agents ask for it differently, but that is
+the launcher's business.
 
 ## Work with several sessions
 

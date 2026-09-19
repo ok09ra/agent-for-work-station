@@ -41,6 +41,8 @@ usage() {
   print -r -- "  AFWS_SESSION_NAME        Use this session name instead of a generated one"
   print -r -- "  AFWS_NO_CONTROL_MASTER   Do not share one authenticated SSH connection"
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
+  print -r -- "  AFWS_ADD_DIR             Extra local directories, colon-separated, that the"
+  print -r -- "                           session may also read and write (papers, notes, scratch work)"
   print -r -- ""
   print -r -- "Codex CLI cannot be given a session name at launch, cannot report its"
   print -r -- "sessions in machine-readable form, and has no shell wrapper, so a Codex"
@@ -73,6 +75,15 @@ fi
 
 afws_validate_host "$ssh_host"
 remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
+
+typeset -a extra_directories
+extra_directories=(${(f)"$(afws_extra_directories)"})
+
+typeset -a extra_arguments
+extra_arguments=()
+if (( ${#extra_directories} > 0 )); then
+  extra_arguments=(-c "sandbox_workspace_write.writable_roots=$(afws_toml_string_list "${extra_directories[@]}")")
+fi
 
 if (( ! dry_run )); then
   for dependency in ssh sshfs codex; do
@@ -151,16 +162,6 @@ see which session it belongs to."
   fi
 fi
 
-# Claude Code scopes its file tools to the working directory, so extra local
-# directories have to be named with --add-dir. Codex reads through its sandbox,
-# which permits reads outside the workspace, so nothing has to be named: a local
-# path is simply readable. Only writing outside the workspace would need Codex's
-# own writable-roots configuration, which this tool does not set.
-if [[ -n "${AFWS_ADD_DIR-}" ]]; then
-  print -u2 -r -- "${AFWS_PROGRAM}: AFWS_ADD_DIR is not needed here — Codex can already read outside the workspace."
-  print -u2 -r -- "  Writing outside it would need Codex's own writable-roots configuration."
-fi
-
 afws_warn_about_home_workspace "$local_workspace" codex
 
 # --- session instructions -------------------------------------------------
@@ -173,7 +174,8 @@ Local workspace: ${local_workspace}
 Remote working directory: ${remote_dir}
 
 Operating rules:
-- Read and edit files only within the current mounted workspace unless the user explicitly expands scope.
+- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
+- An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
 - Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
 - Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: ${remote_runner} -- COMMAND ARG...
 - To send a shell script through standard input, pipe it to: ${remote_runner}
@@ -196,6 +198,9 @@ print -r -- "  session: ${session_name}"
 print -r -- "  ssh:     ${ssh_host}"
 print -r -- "  remote:  ${remote_dir}"
 print -r -- "  local:   ${local_workspace}"
+for extra_directory in "${extra_directories[@]}"; do
+  print -r -- "  also:    ${extra_directory}"
+done
 
 if [[ -x "$PEERS" ]]; then
   if (( dry_run )); then
@@ -208,7 +213,7 @@ fi
 
 if (( dry_run )); then
   print -r -- "Would start Codex with:"
-  print -r -- "  codex --no-alt-screen -C ${(q)local_workspace} --sandbox workspace-write --ask-for-approval on-request --config developer_instructions=<session instructions>"
+  print -r -- "  codex --no-alt-screen -C ${(q)local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions>"
   print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${session_name}.conf"
   exit 0
 fi
@@ -253,6 +258,7 @@ codex \
   -C "$local_workspace" \
   --sandbox workspace-write \
   --ask-for-approval on-request \
+  "${extra_arguments[@]}" \
   --config "developer_instructions=${developer_instructions}" \
   "$@" || session_exit=$?
 

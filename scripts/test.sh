@@ -346,10 +346,28 @@ expect_rejected "an extra directory that does not exist" \
 early="$(env AFWS_ADD_DIR=relative "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 || true)"
 [[ "$early" != *"Would mount"* ]] || fail "an invalid extra directory was reported only after planning a mount"
 
-codex_note="$(AFWS_ADD_DIR="${SANDBOX}/papers" \
-  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$codex_note" == *"AFWS_ADD_DIR is not needed here"* ]] || \
-  fail "codexfws did not explain that it reads outside the workspace already"
+# The same variable, the same reported effect, whichever agent is launched. Which
+# flag carries it is the launcher's business, not the user's.
+for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  both="$(AFWS_ADD_DIR="${SANDBOX}/papers:${SANDBOX}/notes" \
+    "$launcher" --dry-run example-workstation /remote/project)"
+  [[ "$both" == *"also:    ${SANDBOX}/papers"* ]] || \
+    fail "${launcher:t} did not report an extra directory"
+  [[ "$both" == *"also:    ${SANDBOX}/notes"* ]] || \
+    fail "${launcher:t} dropped the second extra directory"
+done
+
+codex_plan_extra="$(AFWS_ADD_DIR="${SANDBOX}/papers:${SANDBOX}/notes" \
+  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_plan_extra" == *"-c sandbox_workspace_write.writable_roots=[\"${SANDBOX}/papers\",\"${SANDBOX}/notes\"]"* ]] || \
+  fail "codexfws did not plan to make the extra directories writable in its sandbox"
+
+codex_plan_plain="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_plan_plain" != *writable_roots* ]] || \
+  fail "codexfws planned writable roots with nothing to add"
+
+expect_rejected "a relative extra directory (codexfws)" \
+  env AFWS_ADD_DIR=relative "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project
 
 # --- mount table ----------------------------------------------------------
 # The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and

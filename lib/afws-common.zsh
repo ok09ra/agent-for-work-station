@@ -349,6 +349,25 @@ afws_extra_directories() {
   done
 }
 
+# The same list, in the form each agent wants. Claude Code scopes its file tools
+# to the working directory and takes extra directories with --add-dir; Codex
+# reads outside its workspace already but writes only inside it, so the same
+# directories become writable roots in its sandbox. Callers pass AFWS_ADD_DIR;
+# which flag carries it is not their concern.
+# afws_toml_string_list DIR... -> prints ["a","b"]
+afws_toml_string_list() {
+  local entry escaped list=""
+
+  for entry in "$@"; do
+    escaped="${entry//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    [[ -n "$list" ]] && list+=","
+    list+="\"${escaped}\""
+  done
+
+  print -r -- "[${list}]"
+}
+
 # --- workspace shape ------------------------------------------------------
 
 # Mounting a home directory does not grant the agent anything its own account
