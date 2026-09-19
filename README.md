@@ -111,11 +111,15 @@ of your shell history. A password or key passphrase is asked for once, here.
 > actually does.
 
 Nothing has to be declared beforehand. Both sides are ordinary paths on this Mac,
-shell commands are not scoped to the workspace, and the file tools take an
-absolute path outside it. `AFWS_ADD_DIR` exists for the two cases where that is
-not enough: an agent that must *write* to a local directory — under `codexfws`
-the only way, since its sandbox is decided at launch — and skills or commands
-that live in a local directory and have to be loaded.
+shell commands are not scoped to the workspace, and under `claudefws` the file
+tools read, create and edit an absolute path outside the workspace as they would
+inside it.
+
+`AFWS_ADD_DIR` is narrower than it looks. Under `codexfws` it is how a local
+directory becomes writable at all, because Codex's sandbox confines writes to the
+workspace and is decided when the session starts. Under `claudefws` it changes
+nothing about reading or writing; it matters only for loading skills or commands
+that live in that directory.
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \

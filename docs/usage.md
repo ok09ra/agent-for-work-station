@@ -126,9 +126,11 @@ sides are ordinary paths on this Mac, shell commands are not scoped to the
 workspace, and the file tools take an absolute path outside it, so naming the
 path in the conversation is enough.
 
-`AFWS_ADD_DIR` is for the cases where it is not: an agent that must *write* to a
-local directory, or skills and commands living in a local directory that have to
-be loaded. It takes a colon-separated list:
+`AFWS_ADD_DIR` does less than its name suggests. Under `codexfws` it is how a
+local directory becomes writable at all, because Codex confines writes to the
+workspace and settles that at launch. Under `claudefws` reading, creating and
+editing an outside path already work, so it only affects whether skills and
+commands in that directory are loaded. It takes a colon-separated list:
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \

@@ -25,11 +25,13 @@ directories with `--add-dir`, while Codex already reads outside its workspace an
 needs those directories added as writable roots in its sandbox. The launchers
 translate; a caller sets one variable.
 
-Neither agent needs it merely to *read* a local path: a shell command reaches
-anything your account can, and the file tools accept an absolute path outside the
-workspace. The variable earns its place for writing outside the workspace, which
-under Codex can only be decided at launch, and for loading skills or commands
-that live in a local directory.
+The two do not need it for the same reason, and Claude Code barely needs it at
+all. Reading, creating and editing a path outside the workspace were tested
+directly under `claudefws` and all work without it, so there it only decides
+whether skills and commands in that directory are loaded. Under `codexfws` it is
+how a local directory becomes writable, since Codex confines writes to the
+workspace and settles that at launch — that part is inferred from its sandbox
+profile rather than tested.
 
 The remaining differences are not design choices. They follow from what each CLI offers,
 measured against Codex CLI 0.154.0:
