@@ -243,6 +243,32 @@ up. [Security](docs/security.md) says what does and does not hold.
 
 **Anything but macOS on the client side.**
 
+## Operations that carry risk
+
+The agent runs as your SSH user on the workstation, so nothing here grants more
+than your own account already has. What these change is how much of your account
+is exposed, for how long, and how easily a mistake reaches it.
+
+| Operation | Why it matters | Instead |
+| --- | --- | --- |
+| Mounting a home directory | `~/.ssh`, stored credentials and every other project end up inside the workspace, and a `.claude/settings.json` there becomes this session's project settings | Mount the project directory. The launcher warns when the workspace looks like a home |
+| Piping a script to `afws-run`, or `afws-run -- sh -c …` | An unrestricted remote shell as your SSH user. `--cwd` is a starting directory, not a sandbox | Review it before approving. Prefer one named command over a script when you can |
+| Leaving a shared SSH connection open | A pre-authenticated channel any process of your user can reuse without a password. A session killed with `SIGKILL` never closes it | It expires after `AFWS_CONTROL_PERSIST` seconds (600). `afws-umount --orphaned` closes one nothing is using; `afws-doctor` reports one |
+| `AFWS_PERMISSION_MODE=bypassPermissions` | Every write in a session lands on the remote host, so there is no local-only blast radius to fall back on | `manual` or `plan` for sensitive work; `auto` is the default |
+| An `allow` rule with a `*` before the end of the command | `*` spans spaces, so the rule also approves options inserted at that point. A rule containing `;` or a pipe approves a whole compound command | Name the exact value, or put `*` only after the subcommand. Never allowlist a compound command |
+| `AFWS_ADD_DIR` pointing at something sensitive | Those directories become readable, and for Codex writable, by the session — and anything read reaches the model | Name the specific reference directories. Never `~`, `~/.ssh` or `~/Library` |
+| Reading data that must not leave the machine | Mounting changes nothing: a file the agent reads is a file the model is shown | Do not mount it |
+| `afws-lock steal` | Takes a lock someone else holds, which is how two jobs end up on one GPU | Ask the holder first. A lock held for hours is normal for a long job |
+| `afws-umount --force` | `diskutil unmount force` on a mount another session may be writing in | Check `afws-umount --list` first; force only when the holder is really gone |
+| Connecting as a privileged remote account | Passwordless sudo, a container-runtime group, or group-writable shared data widen what a mistake can destroy — check `id` and the permissions of any shared path | Use a least-privilege account |
+| Installing an agent on the workstation as well | Two diverging sets of permission rules and two versions, and the set nobody looks at is the one that grows | `afws-doctor HOST` reports it when a connection is open |
+| Bridging to Claude Desktop with `claude mcp serve` | Hands Desktop arbitrary shell access on your Mac, and none of this tool's scoping, labelling or cleanup applies | Bring local directories into the session with `AFWS_ADD_DIR` instead |
+| Committing real values to this repository | Host aliases, addresses, usernames and remote paths are not secrets, but they do not belong here | `./scripts/prepublish-check.sh`, and read `git diff --cached` |
+
+[Security](docs/security.md) explains what this architecture does and does not
+protect, and why the boundary that actually holds belongs in `authorized_keys` on
+the workstation.
+
 ## Documentation
 
 | Topic | English | 日本語 |
