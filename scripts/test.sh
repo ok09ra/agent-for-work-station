@@ -603,6 +603,60 @@ timeout_message="$(zsh -c '
 [[ "$timeout_message" == *AFWS_PROBE_TIMEOUT_SECONDS* ]] || \
   fail "the timeout message did not offer a longer deadline"
 
+# ssh reaches a password prompt through /dev/tty, which the mount's redirections
+# do not cover. A background mount has nobody to answer one, so it must neither
+# be able to ask nor be able to reach the terminal the agent is drawing on.
+grep -q 'sshfs_options+=(-o BatchMode=yes)' "$LIBRARY" || \
+  fail "sshfs was left able to ask for a password it has nobody to hear from"
+grep -q 'afws_detached "$logfile" sshfs' "$LIBRARY" || \
+  fail "sshfs was started without taking its controlling terminal away"
+
+# Taking it away means a session of its own; a session leader has no terminal
+# inherited from here. Asserted on the process rather than on the source.
+detach_log="$(mktemp "${SANDBOX}/afws-detach.XXXXXX")"
+zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  source '"$LIBRARY"'
+  afws_detached '"$detach_log"' zsh -c "ps -o stat= -p \$\$"
+'
+detach_waited=0
+while (( detach_waited < 10 )) && [[ ! -s "$detach_log" ]]; do
+  sleep 1
+  detach_waited=$(( detach_waited + 1 ))
+done
+[[ "$(cat "$detach_log")" == *s* ]] || \
+  fail "a detached command did not become a session leader ($(cat "$detach_log"))"
+rm -f "$detach_log"
+
+# ENXIO is one symptom of two different faults, and the message used to assert
+# the one it could not see. A reconnect that cannot authenticate leaves the
+# process running behind a mount that answers nothing else.
+enxio_alive="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  source '"$LIBRARY"'
+  afws_sshfs_pids_for() { print -r -- "4242 "; }
+  afws_stale_mount_message /some/mount error
+')"
+[[ "$enxio_alive" == *"still running"* ]] || \
+  fail "a mount whose sshfs is alive was reported as one whose process died"
+[[ "$enxio_alive" == *4242* ]] || fail "the surviving sshfs process was not named"
+[[ "$enxio_alive" != *"process is gone"* ]] || \
+  fail "the message asserted the process was gone while naming it as running"
+
+enxio_dead="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  source '"$LIBRARY"'
+  afws_sshfs_pids_for() { print -r -- ""; }
+  afws_stale_mount_message /some/mount error
+')"
+[[ "$enxio_dead" == *"process is gone"* ]] || \
+  fail "a mount with no sshfs process left was not reported as dead"
+[[ "$enxio_dead" == *"diskutil unmount force"* ]] || \
+  fail "the dead-mount message stopped offering a way out"
+
 # --- afws-run -------------------------------------------------------------
 
 runner_plan="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"

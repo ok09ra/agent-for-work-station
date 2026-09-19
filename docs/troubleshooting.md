@@ -82,9 +82,16 @@ If there is no such process, the mount is dead; unmount it as below.
 
 ## The mount exists but does not respond
 
-This is the other case: the read came back as an error, which on macFUSE means
-the sshfs process behind the mount is gone and every path inside it now fails
-with `ENXIO`.
+This is the other case: the read came back as an error rather than not coming
+back at all, which on macFUSE means every path inside the mount now fails with
+`ENXIO`. Two faults end there, and the message says which one it found -- the
+sshfs process gone, or the process still running behind a connection it could
+not re-establish. Neither recovers on its own.
+
+The mount cannot re-authenticate for itself: it runs with `BatchMode`, in a
+session of its own, precisely so that it can never interrupt the agent's
+terminal to ask. On a host that authenticates by password, that means a
+connection lost for long enough is a mount you remount by hand.
 
 SSHFS attempts to reconnect after a network interruption, but recovery is not always possible. Exit Claude Code, eject the corresponding volume in Finder, and start again. Before forcing a process to stop or unmounting, confirm that no write operation is still in progress.
 

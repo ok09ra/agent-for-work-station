@@ -253,6 +253,14 @@ afws_mount_is_present() {
   ${=AFWS_MOUNT_COMMAND} | grep -Fq " on $1 ("
 }
 
+# The mount answering with ENXIO used to be reported as the sshfs process having
+# died, which is one way to get there but not the only one: a reconnect that
+# cannot authenticate leaves the process running behind a mount that answers
+# nothing else. So look before saying which happened.
+afws_sshfs_pids_for() {
+  pgrep -f "sshfs.*${1}" 2>/dev/null | tr '\n' ' '
+}
+
 # afws_stale_mount_message MOUNT_POINT [OUTCOME]
 afws_stale_mount_message() {
   local unmount_advice="Unmount it, then start again:
@@ -269,6 +277,18 @@ you the mount. Check whether its sshfs process is still running:
 If it is, give the probe longer and start again:
   AFWS_PROBE_TIMEOUT_SECONDS=60 ${AFWS_PROGRAM} ...
 If there is no such process, the mount is dead. ${unmount_advice}"
+    return 0
+  fi
+
+  local pids
+  pids="$(afws_sshfs_pids_for "$1")"
+  pids="${pids%% }"
+
+  if [[ -n "$pids" ]]; then
+    print -r -- "the SSHFS mount at $1 is present but not responding
+Every path inside it fails with ENXIO, yet its sshfs process is still running
+(${pids}). That is a connection it could not re-establish, not a process that
+died, so the mount will not recover on its own. ${unmount_advice}"
     return 0
   fi
 
@@ -403,6 +423,33 @@ afws_report_control_fallback() {
 
 # --- mounting -------------------------------------------------------------
 
+# afws_detached LOGFILE COMMAND [ARG ...]
+# Runs the command with no controlling terminal, its output in LOGFILE. macOS
+# ships no setsid, so perl's POSIX::setsid stands in; it has to fork first
+# because setsid refuses to move a process that already leads its process
+# group, which is exactly what a backgrounded job is. Without perl the command
+# still runs -- detached from this shell, but sharing its terminal.
+afws_detached() {
+  local logfile="$1"
+  shift
+
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '
+      use POSIX ();
+      my $pid = fork();
+      die "fork: $!\n" unless defined $pid;
+      exit 0 if $pid;
+      POSIX::setsid();
+      exec { $ARGV[0] } @ARGV or die "exec: $!\n";
+    ' -- "$@" </dev/null >"$logfile" 2>&1 &!
+    return 0
+  fi
+
+  "$@" </dev/null >"$logfile" 2>&1 &!
+  return 0
+}
+
+
 # afws_mount HOST REMOTE_DIR WORKSPACE SOCKET_OR_EMPTY LOGFILE
 afws_mount() {
   local ssh_host="$1" remote_dir="$2" workspace="$3" socket="$4" logfile="$5"
@@ -415,6 +462,10 @@ afws_mount() {
 
   sshfs_options=(-o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3)
   [[ -n "$socket" ]] && sshfs_options+=(-o "ControlPath=${socket}")
+  # sshfs reconnects on its own after an interruption, and a reconnect that has
+  # to authenticate has nobody to ask: this is a background mount. Left to
+  # itself ssh would ask anyway, on the terminal the agent is drawing on.
+  sshfs_options+=(-o BatchMode=yes)
 
   print -r -- "Mounting ${ssh_host}:${remote_dir}"
   print -r -- "  on ${workspace}"
@@ -422,8 +473,15 @@ afws_mount() {
   # macFUSE refuses the fork that sshfs performs to daemonize itself after
   # mounting, which leaves sshfs holding the terminal. Keeping sshfs in the
   # foreground with -f and detaching it from this shell avoids that fork.
-  sshfs -f "${ssh_host}:${remote_dir}" "$workspace" "${sshfs_options[@]}" \
-    </dev/null >"$logfile" 2>&1 &!
+  #
+  # The redirections below are not enough on their own: ssh reads a password
+  # from /dev/tty, which no redirection covers, so a controlling terminal is
+  # something it can always reach around to. Giving sshfs a session of its own
+  # takes that terminal away, and with it the ability to interfere with the
+  # agent's. It also keeps sshfs out of the terminal's foreground process
+  # group, so a Ctrl-C meant for the agent no longer lands on the mount.
+  afws_detached "$logfile" sshfs -f "${ssh_host}:${remote_dir}" "$workspace" \
+    "${sshfs_options[@]}"
 
   while (( waited < AFWS_MOUNT_TIMEOUT_SECONDS )); do
     afws_mount_is_present "$workspace" && return 0
