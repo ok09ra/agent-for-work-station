@@ -35,9 +35,11 @@ macFUSEはmacOSのセキュリティ機構に関わるため、この部分は�
 
 このプロジェクトでは、特定のサードパーティ製パッケージマネージャーを前提とせず、macFUSEプロジェクトが案内する署名済みパッケージを使います。
 
-## 4. Claude Codeのインストール
+## 4. エージェントを少なくとも1つインストール
 
-[Claude Code公式ドキュメント](https://docs.claude.com/en/docs/claude-code/overview)のinstallerを使います。
+両方とも個別に任意です。使うものだけ、あるいは両方を導入してください。どちらのランチャーが使えるかは`afws-doctor`が報告します。
+
+Claude Codeは[公式ドキュメント](https://docs.claude.com/en/docs/claude-code/overview)のinstallerを使います。
 
 ```zsh
 curl -fsSL https://claude.ai/install.sh | bash
@@ -46,7 +48,15 @@ claude --version
 claude auth login
 ```
 
-公式installerはユーザー領域へ導入するため、Claude Codeの実行に管理者権限は不要です。サインインは一度だけ行えば、`claudefws`から起動する各セッションがそれを再利用します。
+Codex CLIは[公式ドキュメント](https://developers.openai.com/codex/cli)のinstallerを使います。
+
+```zsh
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+exec zsh -l
+codex --version
+```
+
+どちらのinstallerもユーザー領域へ導入するため、管理者権限は不要です。サインインは各エージェントで一度だけ行えば、ランチャーから起動する各セッションがそれを再利用します。
 
 ## 5. SSHの設定
 
@@ -85,7 +95,7 @@ ssh example-workstation
   ServerAliveCountMax 6
 ```
 
-## 6. claudefwsのインストール
+## 6. コマンドのインストール
 
 リポジトリを取得したら、そのルートでinstallerを実行します。Gitが使えない場合は、アーカイブを展開したものでも構いません。
 
@@ -96,29 +106,29 @@ exec zsh -l
 
 installerが行うのは次の操作だけです。
 
-1. `claudefws`、`claudefws-run`、`claudefws-peers`、`claudefws-lock`、`claudefws-doctor`をユーザー領域のコマンドディレクトリへコピーします。
+1. 2つのランチャーと共通コマンドをユーザー領域のコマンドディレクトリへ、`lib/afws-common.zsh`をその隣の`../lib`へコピーします。各コマンドはそこからライブラリを探します。
 2. 必要な場合にのみ、そのディレクトリをzshログインシェルの`PATH`へ追加します。
 3. 新しく開いたターミナルからコマンドを見つけられるようにします。
 
-既存のSSH config、Claude Codeの設定、リモート環境はいずれも変更しません。
+既存のSSH config、各エージェントの設定、リモート環境はいずれも変更しません。また何も削除しません。置き換え対象である旧`claudefws`／`codexfws`の導入物が残っている場合は、削除候補として一覧表示するだけです。
 
 ## 7. 診断の実行
 
 ```zsh
-claudefws-doctor
+afws-doctor
 ```
 
 接続を開かずにSSH configの接続名だけを確認する場合は、引数に渡します。
 
 ```zsh
-claudefws-doctor example-workstation
+afws-doctor example-workstation
 ```
 
-診断では`claude agents --json`が動作することも確認します。`claudefws-peers`がセッションの状態を取得するのにこの一覧を使うためです。失敗する場合は`claude auth login`を実行してから再試行します。
+診断では`claude agents --json`が動作することも確認します。`afws-peers`がセッションの状態を取得するのにこの一覧を使うためです。失敗する場合は`claude auth login`を実行してから再試行します。
 
 すべての診断が`[OK]`になれば準備完了です。
 
-## 8. Claude for Work Stationの起動
+## 8. セッションの起動
 
 シェル履歴に実値を残したくない場合は、引数なしで起動します。
 
@@ -126,21 +136,21 @@ claudefws-doctor example-workstation
 claudefws
 ```
 
-表示に従って、SSHの接続名と許可されたリモートプロジェクトの絶対ディレクトリを入力します。SSHFSがマウントを完了すると、そのマウントポイントを作業ディレクトリとしてClaude Codeが起動します。
+表示に従って、SSHの接続名と許可されたリモートプロジェクトの絶対ディレクトリを入力します。SSHFSがマウントを完了すると、そのマウントポイントを作業ディレクトリとしてエージェントが起動します。`codexfws`も同じ引数を取ります。
 
-新しいマウントポイントでの初回起動時は、Claude Codeがそのフォルダを信頼するか確認します。マウントポイントごとに一度だけ許可します。
+`claudefws`では、新しいマウントポイントでの初回起動時に、Claude Codeがそのフォルダを信頼するか確認します。マウントポイントごとに一度だけ許可します。
 
 ## 9. 終了とアンマウント
 
-Claude Codeを終了すると、そのマウント内で作業している他のセッションがない限り、マウントは解放されます。そのホスト上にセッションが残っていなければ、共有SSH接続も同時に閉じられます。終了したセッションのレジストリ記録も削除され、古い記録は`claudefws-peers`や`claudefws`の実行時に整理されます。
+エージェントを終了すると、そのマウント内で作業している他のセッション（どちらのエージェントであっても）がない限り、マウントは解放されます。そのホスト上にセッションが残っていなければ、共有SSH接続も同時に閉じられます。終了したセッションのレジストリ記録も削除され、古い記録は`afws-peers`や`claudefws`の実行時に整理されます。
 
 セッション実行中は、launcherは要求した接続先とパスを含む既存のSSHFSマウントを再利用します。自身の記録ではなくシステムの`mount`一覧を参照しているためです。
 
 バックグラウンドセッション、および終了ではなく強制終了されたセッションは、マウントを残します。明示的に解放してください。
 
 ```zsh
-claudefws-umount --list
-claudefws-umount --orphaned
+afws-umount --list
+afws-umount --orphaned
 ```
 
 `--list`は各claudefwsマウントと、それを使っている生存セッション数を表示します。`--orphaned`は誰も使っていないものを解放します。通常の`umount`が拒否される場合は`--force`を付けます。Finderでボリュームを取り出す方法も使えます。

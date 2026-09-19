@@ -35,9 +35,12 @@ Because macFUSE interacts with macOS security controls, this part is intentional
 
 This project follows the signed package referenced by the macFUSE project rather than assuming a particular third-party package manager.
 
-## 4. Install Claude Code
+## 4. Install at least one agent
 
-Use the installer documented in the [official Claude Code documentation](https://docs.claude.com/en/docs/claude-code/overview):
+Both are optional individually: install the one you intend to use, or both.
+`afws-doctor` reports which launcher is usable.
+
+Claude Code, per the [official documentation](https://docs.claude.com/en/docs/claude-code/overview):
 
 ```zsh
 curl -fsSL https://claude.ai/install.sh | bash
@@ -46,7 +49,15 @@ claude --version
 claude auth login
 ```
 
-The official installer uses a user-level location, so Claude Code does not need to run with administrator privileges. Complete the sign-in once; every session started through `claudefws` reuses it.
+Codex CLI, per the [official documentation](https://developers.openai.com/codex/cli):
+
+```zsh
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+exec zsh -l
+codex --version
+```
+
+Both installers use a user-level location, so neither agent needs administrator privileges. Complete each sign-in once; every session started through the launchers reuses it.
 
 ## 5. Configure SSH
 
@@ -85,7 +96,7 @@ Because a session can stay attached to the workstation for hours, and a backgrou
   ServerAliveCountMax 6
 ```
 
-## 6. Install claudefws
+## 6. Install the commands
 
 After obtaining the repository, run the installer from its root. If Git is not available, downloading and extracting the repository archive is also sufficient.
 
@@ -96,29 +107,29 @@ exec zsh -l
 
 The installer performs only these actions:
 
-1. Copies `claudefws`, `claudefws-run`, `claudefws-peers`, `claudefws-lock`, and `claudefws-doctor` to a user-level command directory.
+1. Copies both launchers and the shared commands to a user-level command directory, and `lib/afws-common.zsh` to `../lib` next to it, which is where every command looks for it.
 2. Adds that directory to the zsh login `PATH` only when needed.
 3. Makes the commands discoverable in newly opened Terminal sessions.
 
-It does not modify your existing SSH configuration, Claude Code configuration, or remote environment.
+It does not modify your existing SSH configuration, either agent's configuration, or the remote environment. It also never deletes anything: if the separate `claudefws` or `codexfws` installations this replaces are still present, it lists them for you to remove.
 
 ## 7. Run diagnostics
 
 ```zsh
-claudefws-doctor
+afws-doctor
 ```
 
 To validate an SSH configuration alias without opening a connection, pass the alias as an argument:
 
 ```zsh
-claudefws-doctor example-workstation
+afws-doctor example-workstation
 ```
 
-The diagnostic also confirms that `claude agents --json` works, because that listing is how `claudefws-peers` reports the status of live sessions. If it fails, run `claude auth login` and try again.
+The diagnostic also confirms that `claude agents --json` works, because that listing is how `afws-peers` reports the status of live sessions. If it fails, run `claude auth login` and try again.
 
 The setup is ready when every diagnostic reports `[OK]`.
 
-## 8. Start Claude for Work Station
+## 8. Start a session
 
 Start without arguments if you do not want real values stored in shell history:
 
@@ -126,21 +137,21 @@ Start without arguments if you do not want real values stored in shell history:
 claudefws
 ```
 
-Enter the SSH alias and the allowed remote project's absolute path when prompted. After SSHFS mounts the project, Claude Code starts with that mount as its working directory.
+Enter the SSH alias and the allowed remote project's absolute path when prompted. After SSHFS mounts the project, the agent starts with that mount as its working directory. `codexfws` takes the same arguments.
 
-The first launch in a new mount point shows the Claude Code workspace trust prompt, because the directory has not been opened before. Confirm it once per mount point.
+With `claudefws`, the first launch in a new mount point shows the Claude Code workspace trust prompt, because the directory has not been opened before. Confirm it once per mount point.
 
 ## 9. Exit and unmount
 
-Exiting Claude Code releases the mount, unless another session is still working inside it. The shared SSH connection to the host is closed at the same time, once no session is left on that host. The registry record for the finished session is removed too, and stale records are pruned whenever `claudefws-peers` or `claudefws` runs.
+Exiting the agent releases the mount, unless another session is still working inside it, of either agent. The shared SSH connection to the host is closed at the same time, once no session is left on that host. The registry record for the finished session is removed too, and stale records are pruned whenever `afws-peers` or `claudefws` runs.
 
 While a session is running, the launcher reuses any existing SSHFS mount that already covers the requested host and path, because it looks at the system `mount` table rather than at its own records.
 
 A background session, or a session that was killed rather than exited, leaves its mount behind. Release it explicitly:
 
 ```zsh
-claudefws-umount --list
-claudefws-umount --orphaned
+afws-umount --list
+afws-umount --orphaned
 ```
 
 `--list` shows each claudefws mount and how many live sessions are using it; `--orphaned` releases the ones nobody is using. Add `--force` when a plain `umount` is refused. Ejecting the volume in Finder also works.

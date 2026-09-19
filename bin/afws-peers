@@ -1,0 +1,321 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-peers"
+readonly SCRIPT_DIR="${0:A:h}"
+
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+
+if ! typeset -f afws_die >/dev/null; then
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+fi
+
+mode=list
+query_value=""
+filter_host=""
+same_only=0
+quiet=0
+as_json=0
+no_prune=0
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-peers [--host SSH_CONFIG_HOST] [--same] [--json]"
+  print -r -- "  afws-peers --prune [--quiet]"
+  print -r -- "  afws-peers --count"
+  print -r -- "  afws-peers --users-of-mount MOUNT_POINT"
+  print -r -- "  afws-peers --users-of-host SSH_CONFIG_HOST"
+  print -r -- ""
+  print -r -- "Lists the work-station sessions on this Mac, of either agent, and the SSH"
+  print -r -- "host and remote directory each one is working on. Dead records are removed"
+  print -r -- "before listing."
+  print -r -- ""
+  print -r -- "Options:"
+  print -r -- "  --host HOST  Only sessions attached to this SSH config host."
+  print -r -- "  --same       Only sessions sharing this session's remote directory."
+  print -r -- "  --json       Machine-readable output."
+  print -r -- "  --prune      Remove dead records and print nothing else."
+  print -r -- "  --count      Print the number of live peer sessions, excluding this one."
+  print -r -- "  --users-of-mount POINT  Count live sessions whose workspace is in this"
+  print -r -- "                          mount, excluding this one."
+  print -r -- "  --users-of-host HOST    Count live sessions on this host, excluding this one."
+  print -r -- "  --quiet      Suppress informational output."
+  print -r -- "  --no-prune   Never delete records; hide dead ones instead."
+  print -r -- ""
+  print -r -- "Claude Code reports its live sessions in machine-readable form, so a Claude"
+  print -r -- "session shows a status. Codex CLI does not, so a Codex row shows '-' and is"
+  print -r -- "judged live by its process alone."
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --host)
+      (( $# >= 2 )) || afws_die "--host requires an SSH config host name"
+      filter_host="$2"; shift 2 ;;
+    --same) same_only=1; shift ;;
+    --json) as_json=1; shift ;;
+    --prune) mode=prune; shift ;;
+    --count) mode=count; shift ;;
+    --users-of-mount)
+      (( $# >= 2 )) || afws_die "--users-of-mount requires a mount point"
+      mode=users_of_mount; query_value="$2"; shift 2 ;;
+    --users-of-host)
+      (( $# >= 2 )) || afws_die "--users-of-host requires an SSH config host name"
+      mode=users_of_host; query_value="$2"; shift 2 ;;
+    --quiet) quiet=1; shift ;;
+    --no-prune) no_prune=1; shift ;;
+    *) afws_die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$filter_host" ]] && afws_validate_host "$filter_host"
+
+if [[ "$mode" == prune ]] && (( no_prune )); then
+  afws_die "--prune and --no-prune are contradictory"
+fi
+
+# --- live Claude sessions -------------------------------------------------
+
+typeset -A live_status
+live_table_loaded=0
+
+load_live_table() {
+  (( live_table_loaded )) && return 0
+  live_table_loaded=1
+
+  command -v claude >/dev/null 2>&1 || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+
+  local listing index name session_state
+  listing="$(mktemp "${TMPDIR:-/tmp}/afws-agents.XXXXXX")" || return 0
+
+  if ! claude agents --json >"$listing" 2>/dev/null || [[ ! -s "$listing" ]]; then
+    rm -f "$listing"
+    return 0
+  fi
+
+  index=0
+  while (( index < 512 )); do
+    name="$(plutil -extract "${index}.name" raw -o - -- "$listing" 2>/dev/null)" || break
+    [[ -n "$name" ]] || break
+    session_state="$(plutil -extract "${index}.status" raw -o - -- "$listing" 2>/dev/null || print -r -- unknown)"
+    live_status[$name]="${session_state:-unknown}"
+    index=$(( index + 1 ))
+  done
+
+  rm -f "$listing"
+  return 0
+}
+
+claude_knows_session() {
+  load_live_table
+  [[ -n "${live_status[$1]-}" ]]
+}
+
+session_status() {
+  local agent="$1" name="$2"
+
+  if [[ "$agent" != claude ]]; then
+    print -r -- "-"
+    return 0
+  fi
+
+  load_live_table
+  print -r -- "${live_status[$name]-unknown}"
+}
+
+# --- registry -------------------------------------------------------------
+
+record_is_live() {
+  local now age
+
+  # Claude Code's own listing is authoritative for a Claude session. Codex CLI
+  # has no equivalent, so a Codex session is judged by its process.
+  if [[ "$afws_record_agent" == claude ]] && claude_knows_session "$afws_record_session_name"; then
+    return 0
+  fi
+
+  # A record written just before the agent registered itself is not dead yet.
+  if [[ -n "$afws_record_started_epoch" ]]; then
+    now="$(date +%s)"
+    age=$(( now - afws_record_started_epoch ))
+    if (( age < AFWS_REGISTRATION_GRACE_SECONDS )); then
+      return 0
+    fi
+  fi
+
+  # The launcher stays alive for as long as the agent, so its PID is the check.
+  if [[ -n "$afws_record_pid" ]] && kill -0 "$afws_record_pid" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+typeset -a live_records
+live_records=()
+
+collect_live_records() {
+  local record
+
+  [[ -d "$AFWS_SESSION_DIR" ]] || return 0
+
+  for record in "$AFWS_SESSION_DIR"/*.conf(N); do
+    if ! afws_read_record "$record"; then
+      (( no_prune )) || rm -f "$record"
+      continue
+    fi
+
+    if ! record_is_live; then
+      (( no_prune )) || rm -f "$record"
+      continue
+    fi
+
+    live_records+=("$record")
+  done
+
+  return 0
+}
+
+collect_live_records
+
+self_name="${AFWS_SESSION_NAME-}"
+self_host="${AFWS_SSH_HOST-}"
+self_remote_dir="${AFWS_REMOTE_DIR-}"
+
+if [[ "$mode" == users_of_mount || "$mode" == users_of_host ]]; then
+  users=0
+  for record in "${live_records[@]}"; do
+    afws_read_record "$record" || continue
+    [[ -n "$self_name" && "$afws_record_session_name" == "$self_name" ]] && continue
+    if [[ "$mode" == users_of_host ]]; then
+      [[ "$afws_record_ssh_host" == "$query_value" ]] || continue
+    else
+      # The workspace is the mount point itself, or a directory inside it.
+      [[ "$afws_record_mount_point" == "$query_value" ||
+         "$afws_record_local_workspace" == "$query_value" ||
+         "$afws_record_local_workspace" == "${query_value}/"* ]] || continue
+    fi
+    users=$(( users + 1 ))
+  done
+  print -r -- "$users"
+  exit 0
+fi
+
+if [[ "$mode" == prune ]]; then
+  (( quiet )) || print -r -- "Registry holds ${#live_records} live session(s)."
+  exit 0
+fi
+
+# --- filtering ------------------------------------------------------------
+
+if (( same_only )) && [[ -z "$self_host" || -z "$self_remote_dir" ]]; then
+  # Fall back to the workspace the caller is standing in.
+  for record in "${live_records[@]}"; do
+    afws_read_record "$record" || continue
+    if [[ -n "$afws_record_local_workspace" &&
+          ( "$PWD" == "$afws_record_local_workspace" ||
+            "$PWD" == "${afws_record_local_workspace}/"* ) ]]; then
+      self_host="$afws_record_ssh_host"
+      self_remote_dir="$afws_record_remote_dir"
+      break
+    fi
+  done
+  [[ -n "$self_host" ]] ||
+    afws_die "--same needs a work-station session; no AFWS_SSH_HOST and no matching workspace"
+fi
+
+typeset -a shown_records
+shown_records=()
+
+for record in "${live_records[@]}"; do
+  afws_read_record "$record" || continue
+
+  if [[ -n "$filter_host" && "$afws_record_ssh_host" != "$filter_host" ]]; then
+    continue
+  fi
+
+  if (( same_only )); then
+    [[ "$afws_record_ssh_host" == "$self_host" ]] || continue
+    [[ "$afws_record_remote_dir" == "$self_remote_dir" ]] || continue
+  fi
+
+  shown_records+=("$record")
+done
+
+if [[ "$mode" == count ]]; then
+  count=0
+  for record in "${shown_records[@]}"; do
+    afws_read_record "$record" || continue
+    [[ -n "$self_name" && "$afws_record_session_name" == "$self_name" ]] && continue
+    count=$(( count + 1 ))
+  done
+  print -r -- "$count"
+  exit 0
+fi
+
+# --- output ---------------------------------------------------------------
+
+json_escape() {
+  local text="$1"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  print -r -- "$text"
+}
+
+if (( as_json )); then
+  print -r -- "["
+  first=1
+  for record in "${shown_records[@]}"; do
+    afws_read_record "$record" || continue
+    (( first )) || print -r -- ","
+    first=0
+    print -n -r -- "  {"
+    print -n -r -- "\"session_name\":\"$(json_escape "$afws_record_session_name")\","
+    print -n -r -- "\"agent\":\"$(json_escape "$afws_record_agent")\","
+    print -n -r -- "\"kind\":\"$(json_escape "$afws_record_kind")\","
+    print -n -r -- "\"status\":\"$(json_escape "$(session_status "$afws_record_agent" "$afws_record_session_name")")\","
+    print -n -r -- "\"pid\":\"$(json_escape "$afws_record_pid")\","
+    print -n -r -- "\"bg_id\":\"$(json_escape "$afws_record_bg_id")\","
+    print -n -r -- "\"ssh_host\":\"$(json_escape "$afws_record_ssh_host")\","
+    print -n -r -- "\"remote_dir\":\"$(json_escape "$afws_record_remote_dir")\","
+    print -n -r -- "\"local_workspace\":\"$(json_escape "$afws_record_local_workspace")\","
+    print -n -r -- "\"mount_point\":\"$(json_escape "$afws_record_mount_point")\","
+    print -n -r -- "\"started_at\":\"$(json_escape "$afws_record_started_at")\","
+    print -n -r -- "\"self\":$( [[ -n "$self_name" && "$afws_record_session_name" == "$self_name" ]] && print -n -- true || print -n -- false )"
+    print -n -r -- "}"
+  done
+  (( first )) || print -r -- ""
+  print -r -- "]"
+  exit 0
+fi
+
+if (( ${#shown_records} == 0 )); then
+  (( quiet )) || print -r -- "No work-station sessions are registered."
+  exit 0
+fi
+
+printf '%-26s %-7s %-12s %-8s %-18s %s\n' SESSION AGENT KIND STATUS "SSH HOST" "REMOTE DIRECTORY"
+for record in "${shown_records[@]}"; do
+  afws_read_record "$record" || continue
+  marker=""
+  [[ -n "$self_name" && "$afws_record_session_name" == "$self_name" ]] && marker=" (this session)"
+  printf '%-26s %-7s %-12s %-8s %-18s %s%s\n' \
+    "$afws_record_session_name" \
+    "${afws_record_agent:--}" \
+    "$afws_record_kind" \
+    "$(session_status "$afws_record_agent" "$afws_record_session_name")" \
+    "$afws_record_ssh_host" \
+    "$afws_record_remote_dir" \
+    "$marker"
+done

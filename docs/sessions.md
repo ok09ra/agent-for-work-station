@@ -14,12 +14,12 @@ This page describes what `claudefws` adds on top of that, and how to use it.
 
 | Question | Answer |
 | --- | --- |
-| Who else is here, and what are they working on? | `claudefws-peers`, a shell command |
-| Let me talk to that session | `ListAgents` and `SendMessage`, Claude Code tools |
-| Nobody else touch this GPU while I use it | `claudefws-lock`, a shell command |
+| Who else is here, and what are they working on? | `afws-peers`, a shell command |
+| Let me talk to that session | `ListAgents` and `SendMessage`, Claude Code tools — Claude sessions only |
+| Nobody else touch this GPU while I use it | `afws-lock`, a shell command |
 
 `ListAgents` reports the Claude sessions on this Mac and the name each one
-answers to. `claudefws-peers` reports which SSH host and remote directory each
+answers to. `afws-peers` reports which SSH host and remote directory each
 of those names is attached to. You normally want both: the first to address a
 session, the second to know which one to address.
 
@@ -41,8 +41,8 @@ Give a session a name that describes its job when that is more useful than a
 number:
 
 ```zsh
-CLAUDEFWS_SESSION_NAME=gpu-trainer claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
-CLAUDEFWS_SESSION_NAME=bug-1204 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+AFWS_SESSION_NAME=gpu-trainer claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+AFWS_SESSION_NAME=bug-1204 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 Two sessions on the same host and directory share one SSHFS mount. The second
@@ -54,7 +54,7 @@ again.
 A mount point is derived from the host alias and the full remote path:
 
 ```
-~/claudefws-mounts/HOST/REMOTE/PATH
+~/afws-mounts/HOST/REMOTE/PATH
 ```
 
 So two sessions are kept apart automatically. Different hosts land in different
@@ -70,7 +70,7 @@ Three cases are worth knowing:
 A shared mount is released by whichever session leaves last: a session that
 exits while others are still working inside the same mount leaves it in place
 and says so. A background session leaves its mount behind entirely, because no
-launcher process remains to clean up after it — `claudefws-umount --orphaned`
+launcher process remains to clean up after it — `afws-umount --orphaned`
 releases those.
 
 A lock, by contrast, is per **host**, not per directory: the lock directory lives
@@ -82,7 +82,7 @@ same host, so name the resource, not the action: `build-projectX`.
 ## Seeing the other sessions
 
 ```zsh
-claudefws-peers
+afws-peers
 ```
 
 ```
@@ -92,7 +92,8 @@ fws-example-workstation-project-2  interactive  idle  example-workstation /remot
 nightly-watch                background   idle     example-workstation /remote/project
 ```
 
-`STATUS` comes from Claude Code itself, so `busy`, `idle`, and `waiting` say
+`AGENT` is which launcher started the session. `STATUS` comes from Claude Code
+itself, so `busy`, `idle`, and `waiting` say
 whether a session is working, free, or waiting for its user to answer
 something. A session that has exited is removed from the listing the next time
 any of these commands runs.
@@ -100,17 +101,21 @@ any of these commands runs.
 Narrow the listing when several workstations or projects are in play:
 
 ```zsh
-claudefws-peers --host SSH_CONFIG_HOST   # one workstation
-claudefws-peers --same                   # only sessions sharing this exact remote directory
-claudefws-peers --json                   # machine-readable
+afws-peers --host SSH_CONFIG_HOST   # one workstation
+afws-peers --same                   # only sessions sharing this exact remote directory
+afws-peers --json                   # machine-readable
 ```
 
 ## Talking to another session
 
+This works between Claude sessions. A Codex session appears in `afws-peers` and
+takes locks, but cannot be addressed by name, because Codex CLI has no
+launch-time session name — see [what each agent supports](agents.md).
+
 Messaging is done by Claude, not by a shell command. Inside a session, ask for
 it in the ordinary way:
 
-> Check `claudefws-peers`, then ask `gpu-trainer` whether the 8B run has
+> Check `afws-peers`, then ask `gpu-trainer` whether the 8B run has
 > finished and what the final loss was.
 
 The session uses `ListAgents` to confirm the name, `SendMessage` to send the
@@ -125,17 +130,17 @@ a failure looked like an hour ago, whether a dataset has finished converting.
 ## Taking turns on an exclusive resource
 
 Two sessions on one workstation will eventually want the same GPU, the same
-build directory, or the same dataset. `claudefws-lock` makes that explicit.
+build directory, or the same dataset. `afws-lock` makes that explicit.
 
 ```zsh
-claudefws-lock acquire gpu0        # claims it, or exits 3 and names the holder
-claudefws-lock status              # every lock on this host
-claudefws-lock status gpu0         # one lock
-claudefws-lock release gpu0        # only the holder may release it
+afws-lock acquire gpu0        # claims it, or exits 3 and names the holder
+afws-lock status              # every lock on this host
+afws-lock status gpu0         # one lock
+afws-lock release gpu0        # only the holder may release it
 ```
 
 A lock is a directory created atomically on the remote host under
-`~/.claudefws-locks`, so it works without any daemon, is visible to every
+`~/.afws-locks`, so it works without any daemon, is visible to every
 session on the workstation, and never writes inside the project tree. The
 holder is recorded as the session name, which is also the name a peer can be
 messaged by:
@@ -147,7 +152,7 @@ held gpu0 holder=gpu-trainer since=2026-01-01T09:12:44Z age=318s ttl=7200s
 Wait for a lock instead of failing immediately:
 
 ```zsh
-claudefws-lock acquire gpu0 --wait 600
+afws-lock acquire gpu0 --wait 600
 ```
 
 A lock older than its TTL is reported as `stale` rather than released
@@ -155,7 +160,7 @@ automatically, because a long job is a normal reason for a lock to be held for
 hours. Taking a held lock is always an explicit decision:
 
 ```zsh
-claudefws-lock steal gpu0
+afws-lock steal gpu0
 ```
 
 Ask the holder first — that is what messaging is for. A session is told not to
@@ -168,11 +173,13 @@ agree on the name.
 
 ## Background sessions
 
+Claude Code only; `codexfws` has no equivalent.
+
 A session that only needs to watch something does not need a terminal:
 
 ```zsh
 claudefws --bg SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY \
-  "Watch the training job with claudefws-run. Report failures and summarise progress when asked."
+  "Watch the training job with afws-run. Report failures and summarise progress when asked."
 ```
 
 The launcher prints the identifier that Claude Code uses for it:
@@ -185,7 +192,7 @@ claude stop ID         # stop it, keeping the conversation
 claude rm ID           # delete a stopped session
 ```
 
-A background session appears in `claudefws-peers` like any other and can be
+A background session appears in `afws-peers` like any other and can be
 messaged by name, which is the point: an interactive session can ask the
 watcher what happened rather than re-reading the logs itself.
 
@@ -194,17 +201,17 @@ watcher what happened rather than re-reading the logs itself.
 Three sessions against one workstation:
 
 ```zsh
-CLAUDEFWS_SESSION_NAME=gpu-trainer claudefws workstation /remote/project
-CLAUDEFWS_SESSION_NAME=bug-1204 claudefws workstation /remote/project
+AFWS_SESSION_NAME=gpu-trainer claudefws workstation /remote/project
+AFWS_SESSION_NAME=bug-1204 claudefws workstation /remote/project
 claudefws --bg workstation /remote/project "Watch the queue and report failures."
 ```
 
-- `gpu-trainer` takes `claudefws-lock acquire gpu0`, starts the run through
-  `claudefws-run`, and keeps the lock until the run ends.
+- `gpu-trainer` takes `afws-lock acquire gpu0`, starts the run through
+  `afws-run`, and keeps the lock until the run ends.
 - `bug-1204` wants to reproduce a crash on the GPU, finds the lock held by
   `gpu-trainer`, and asks it through `SendMessage` how long the run has left. It
   works on the CPU-only part of the reproduction in the meantime, or waits with
-  `claudefws-lock acquire gpu0 --wait 1800`.
+  `afws-lock acquire gpu0 --wait 1800`.
 - The background session notices a failed job and is asked by either of the
   others what the last error was.
 
@@ -217,7 +224,7 @@ the GPU at the same time.
   different Macs cannot see each other through this tool, even when they share
   a workstation. Claude Code's Remote Control is the mechanism for that, and it
   is outside the scope of `claudefws`.
-- A lock coordinates sessions that use `claudefws-lock`. It does not stop
+- A lock coordinates sessions that use `afws-lock`. It does not stop
   another person, another tool, or a scheduler on the workstation from using
   the same resource.
 - Sessions share the remote filesystem. Two sessions editing the same file

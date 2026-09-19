@@ -5,10 +5,10 @@
 まず診断を実行します。
 
 ```zsh
-claudefws-doctor
+afws-doctor
 ```
 
-## `command not found: claudefws`
+## `command not found: claudefws` / `codexfws`
 
 installer実行後に新しいターミナルを開くか、ログインシェルを読み込み直します。
 
@@ -36,7 +36,7 @@ ssh SSH_CONFIG_HOST
 
 接続名、ユーザー名、鍵、VPNの要否、踏み台ホストは、ローカルのSSH configと所属組織の接続手順で解決してください。パスワードや秘密鍵を課題、ログ、リポジトリへ貼り付けないでください。
 
-## Claude Codeがフォルダを信頼するか確認してくる
+## Claude Codeがフォルダを信頼するか確認してくる（claudefwsのみ）
 
 新しいマウントポイントでの初回起動は、Claude Codeが見たことのないディレクトリを開くため、マウントポイントごとに一度確認します。許可してください。同じマウント上の以降のセッションでは再表示されません。
 
@@ -48,7 +48,7 @@ macFUSEは、sshfsがマウント後に自分をバックグラウンドへ回�
 
 ## マウントが30秒以内に現れない
 
-切り離されたsshfsプロセスは`~/.claudefws/logs/SESSION.sshfs.log`へ出力します。launcherは断念した時点でその末尾を表示します。そこに権限エラーが出ていれば共有SSH接続が使えていない状態、タイムアウトであれば接続を開いてからマウントするまでの間にホストへ到達できなくなった状態です。
+切り離されたsshfsプロセスは`~/.afws/logs/SESSION.sshfs.log`へ出力します。launcherは断念した時点でその末尾を表示します。そこに権限エラーが出ていれば共有SSH接続が使えていない状態、タイムアウトであれば接続を開いてからマウントするまでの間にホストへ到達できなくなった状態です。
 
 ## マウントはあるが応答しない
 
@@ -66,36 +66,36 @@ SSHFSはネットワーク中断後に再接続を試みますが、常に復旧
 `nvidia-smi`はMacではなくSSH接続先で実行します。
 
 ```zsh
-claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
 ```
 
 出力は現在のターミナルへ返るため、利用者とClaudeの双方が確認できます。接続先にコマンドが存在しない場合や権限エラーになる場合は、リモートシステムの管理者へ問い合わせてください。
 
 ## スクリプトのシェルが想定と違う
 
-`claudefws-run`へパイプしたスクリプトは、リモート側の`bash -s`で実行されます。別のシェル向けのコードは、そのシェルを明示的に指定してください。
+`afws-run`へパイプしたスクリプトは、リモート側の`bash -s`で実行されます。別のシェル向けのコードは、そのシェルを明示的に指定してください。
 
 ```zsh
-claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
   zsh -lc 'YOUR_ZSH_CODE'
 ```
 
-## Claudeがテストをローカルで実行しようとする
+## エージェントがテストをローカルで実行しようとする
 
-そのセッションが`claudefws`から起動されたか確認してください。通常の`claude`起動では、リモート実行の指示が渡りません。終了し、対象プロジェクトを指定して`claudefws`から起動し直してください。
+そのセッションが`claudefws`または`codexfws`から起動されたか確認してください。素の`claude`や`codex`では、リモート実行の指示が渡りません。終了し、対象プロジェクトを指定してランチャーから起動し直してください。
 
 ## リモートコマンドが実行されずに止まる
 
-リモートコマンドはすべて`~/.claudefws/control/HOST.sock`の共有SSH接続を通ります。その接続が失われていると、sshは自力で接続し直そうとし、誰も入力できないパスワードを待ち続けることがあります。状態を確認し、`claudefws`を起動し直して開き直してください。
+リモートコマンドはすべて`~/.afws/control/HOST.sock`の共有SSH接続を通ります。その接続が失われていると、sshは自力で接続し直そうとし、誰も入力できないパスワードを待ち続けることがあります。状態を確認し、`claudefws`を起動し直して開き直してください。
 
 ```zsh
-ssh -S ~/.claudefws/control/HOST.sock -O check HOST
+ssh -S ~/.afws/control/HOST.sock -O check HOST
 ```
 
 ## 共有接続を閉じたい、または詰まっている
 
 ```zsh
-ssh -S ~/.claudefws/control/HOST.sock -O exit HOST
+ssh -S ~/.afws/control/HOST.sock -O exit HOST
 ```
 
 次回の`claudefws`起動で新しく開かれます。強制終了で残った古いソケットファイルは、次回起動時に自動的に削除されます。
@@ -105,15 +105,15 @@ ssh -S ~/.claudefws/control/HOST.sock -O exit HOST
 バックグラウンドセッションには後片付けを行うlauncherプロセスが残りません。また終了ではなく強制終了されたセッションは後片付けを実行できません。残っているものを一覧して解放してください。
 
 ```zsh
-claudefws-umount --list
-claudefws-umount --orphaned
+afws-umount --list
+afws-umount --orphaned
 ```
 
 `--list`は各マウントを使っている生存セッション数を表示するため、`0`と表示されたマウントは安全に解放できます。ディレクトリ内に何かが残っていて`umount`が拒否される場合は`--force`を付けます。
 
-## `claudefws-peers`に何も出ない、またはセッションが欠けている
+## `afws-peers`に何も出ない、またはセッションが欠けている
 
-レジストリに入るのは`claudefws`から起動したセッションだけです。マウント済みワークスペース内であっても、素の`claude`で起動したセッションは登録されません。
+レジストリに入るのは`claudefws`または`codexfws`から起動したセッションだけです。マウント済みワークスペース内であっても、素の`claude`や`codex`で起動したセッションは登録されません。
 
 自分が起動したセッションが見えない場合は、まだ動作しているかを確認します。
 
@@ -123,9 +123,9 @@ claude agents
 
 終了したセッションはレジストリから自動的に取り除かれます。レジストリを変更せずに確認したい場合は`--no-prune`を付けます。
 
-## `claudefws-peers`のSTATUSが`unknown`になる
+## `afws-peers`のSTATUSが`unknown`や`-`になる
 
-STATUSは`claude agents --json`から取得しています。直接実行して原因を確認してください。多くの場合、Claude Codeへサインインしていないことが原因です。
+Codexの行は常に`-`です。Codex CLIに機械可読なセッション一覧がないためです。Claudeの行のSTATUSは`claude agents --json`から取得しています。直接実行して原因を確認してください。多くの場合、Claude Codeへサインインしていないことが原因です。
 
 ```zsh
 claude agents --json
@@ -139,13 +139,13 @@ claude auth login
 保持者と経過時間を確認します。
 
 ```zsh
-claudefws-lock status gpu0
+afws-lock status gpu0
 ```
 
-TTLを超えたロックは`stale`と表示されます。`claudefws-peers`と`claude agents`で保持者が実際に存在しないことを確認してから、明示的に解放します。
+TTLを超えたロックは`stale`と表示されます。`afws-peers`と`claude agents`で保持者が実際に存在しないことを確認してから、明示的に解放します。
 
 ```zsh
-claudefws-lock steal gpu0
+afws-lock steal gpu0
 ```
 
 ロックは自動的には奪いません。長時間ジョブでロックが数時間保持されるのは正常な状態だからです。
@@ -156,4 +156,4 @@ Claude Codeは、会話の最初のリクエスト時にシステムプロンプ
 
 ## 2つのセッションが互いの編集を上書きした
 
-どちらのセッションも、同じマウント越しに同じリモートファイルへ書き込んでおり、ファイルシステムはその調整を行いません。ディレクトリ単位で作業を分けるか、共有ファイルを編集する前に`SendMessage`でセッション間で合意してください。共有のビルドディレクトリや出力ディレクトリについては、`claudefws-lock`で同じ問題を防げます。[複数セッション](sessions.ja.md)を参照してください。
+どちらのセッションも、同じマウント越しに同じリモートファイルへ書き込んでおり、ファイルシステムはその調整を行いません。ディレクトリ単位で作業を分けるか、共有ファイルを編集する前に`SendMessage`でセッション間で合意してください。共有のビルドディレクトリや出力ディレクトリについては、`afws-lock`で同じ問題を防げます。[複数セッション](sessions.ja.md)を参照してください。

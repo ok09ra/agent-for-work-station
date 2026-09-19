@@ -16,7 +16,7 @@ To skip the prompts, pass an SSH configuration alias and the remote project's ab
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
-Append any additional Claude Code arguments after those values:
+`codexfws` takes exactly the same two arguments. Append any additional agent arguments after them:
 
 ```zsh
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY --model MODEL_NAME
@@ -28,36 +28,36 @@ claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY --model MODEL_NAME
 2. It reuses that mount when found, or creates a new mount under the user's home directory.
 3. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
 4. It picks an unused session name of the form `fws-HOST-PROJECT-N`.
-5. It records the session in `~/.claudefws/sessions/` so other sessions can see what this one is working on.
-6. It starts Claude Code in the mount with `--permission-mode auto`, the session name, and instructions for working against a remote host.
+5. It records the session in `~/.afws/sessions/` so other sessions can see what this one is working on.
+6. It starts the agent in the mount, with instructions for working against a remote host. `claudefws` passes the session name and `--permission-mode auto`; `codexfws` passes `--sandbox workspace-write` and `--ask-for-approval on-request`.
 
-The local Claude Code process inspects and edits files through the mounted workspace. Python, tests, builds, GPU checks, and other remote-environment operations run on the SSH host.
+The agent runs locally and inspects and edits files through the mounted workspace. Python, tests, builds, GPU checks, and other remote-environment operations run on the SSH host.
 
 ## Run a remote command manually
 
 Use the normal argument form:
 
 ```zsh
-claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
 ```
 
 Inside a session started by `claudefws`, the host and remote directory are already in the environment, so both can be omitted:
 
 ```zsh
-claudefws-run -- nvidia-smi
+afws-run -- nvidia-smi
 ```
 
 You can also send a script through standard input:
 
 ```zsh
 printf '%s\n' 'pwd' 'git status --short' |
-  claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY
+  afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 Standard-input mode runs the supplied script with `bash -s` in the selected remote directory. It can therefore run arbitrary Bash code with the permissions of the configured SSH user. The `--cwd` value sets the initial directory; it is not a remote sandbox, so a script can access other paths available to that user. To use another installed shell explicitly, pass it as the command:
 
 ```zsh
-claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
   zsh -lc 'print -r -- $ZSH_VERSION'
 ```
 
@@ -79,54 +79,54 @@ The third line is the dangerous one. `nvcc` and `conda` are usually absent from 
 Mac and fail loudly, but `python`, `git`, `make` and `gcc` are present and will
 quietly do the wrong thing.
 
-Because that is easy to miss, a session labels every command it runs here:
+Because that is easy to miss, a `claudefws` session labels every command it runs here. A `codexfws` session cannot: Codex CLI has no shell wrapper to hang the label on, so there nothing marks a command as local. See [what each agent supports](agents.md).
 
 ```
 !echo works        → [mac] works
 !python train.py   → [mac] /Library/Frameworks/Python.framework/.../python3
 !nvidia-smi        → [mac] zsh:1: command not found: nvidia-smi
-                     [mac] not found on this Mac. for HOST, use: ws-run <command>
+                     [mac] not found on this Mac. for HOST, use: afws-run -- <command>
 ```
 
 The `[mac]` label goes to standard error, so it never mixes into a command's
 output, and nothing is blocked — a command that belongs on the workstation still
 runs here, it just says so. The second line appears only when the command does
-not exist on the Mac at all. Set `CLAUDEFWS_NO_SHELL_MARKER=1` for a launch to
+not exist on the Mac at all. Set `AFWS_NO_SHELL_MARKER=1` for a launch to
 turn the labelling off.
 
-`ws-run` is the short form for running something on the workstation instead:
+`afws-run` is the short form for running something on the workstation instead:
 
 ```zsh
-!ws-run nvidia-smi
-!ws-run python train.py
-!ws-run sh -c 'ls *.log | wc -l'
+!afws-run -- nvidia-smi
+!afws-run -- python train.py
+!afws-run -- sh -c 'ls *.log | wc -l'
 ```
 
 Every argument is part of the remote command, so no `--` is needed. Shell
 metacharacters are passed through literally rather than interpreted on the
 remote host, which is why the pipeline above is wrapped in `sh -c`. A `|` typed
-after `!` is interpreted by the local shell, so `!ws-run ls | wc -l` runs `ls` on
+after `!` is interpreted by the local shell, so `!afws-run -- ls | wc -l` runs `ls` on
 the workstation and `wc` on the Mac.
 
 This applies to what you type. Claude itself is instructed to use
-`claudefws-run` for anything that depends on the remote environment.
+`afws-run` for anything that depends on the remote environment.
 
 ## Work with several sessions
 
 List the sessions on this Mac and what each one is attached to:
 
 ```zsh
-claudefws-peers
-claudefws-peers --host SSH_CONFIG_HOST
-claudefws-peers --same
+afws-peers
+afws-peers --host SSH_CONFIG_HOST
+afws-peers --same
 ```
 
 Claim an exclusive remote resource before using it, and release it afterwards:
 
 ```zsh
-claudefws-lock acquire gpu0
-claudefws-lock status
-claudefws-lock release gpu0
+afws-lock acquire gpu0
+afws-lock status
+afws-lock release gpu0
 ```
 
 Start a session that keeps running in the background and can be messaged by the others:
@@ -143,7 +143,7 @@ When a session exits, the launcher releases what that session was the last user
 of: its registry record, the SSHFS mount when no other session is working inside
 it, and the shared SSH connection when no other session is on that host. A mount
 that another session is still using is kept, and so is any mount outside
-`~/claudefws-mounts`, which claudefws did not create.
+`~/afws-mounts`, which claudefws did not create.
 
 Two things are not covered automatically. A background session has no launcher
 process left to clean up after it, and a session killed outright (`kill -9`, a
@@ -151,18 +151,18 @@ crash, a closed lid) never runs its cleanup. For both, release the mount
 explicitly:
 
 ```zsh
-claudefws-umount --list                                  # mounts and who uses each
-claudefws-umount --orphaned                              # release the unused ones
-claudefws-umount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
-claudefws-umount --orphaned --force                      # when a plain umount is refused
+afws-umount --list                                  # mounts and who uses each
+afws-umount --orphaned                              # release the unused ones
+afws-umount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+afws-umount --orphaned --force                      # when a plain umount is refused
 ```
 
 To keep the mount after the session ends, for example because you are about to
-start another session on it, set `CLAUDEFWS_KEEP_MOUNT=1` for that launch.
+start another session on it, set `AFWS_KEEP_MOUNT=1` for that launch.
 
 ## Preview without making changes
 
-Use dry-run mode to print the planned operation without mounting SSHFS, writing to the registry, or starting Claude Code:
+Use dry-run mode to print the planned operation without mounting SSHFS, writing to the registry, or starting the agent:
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
@@ -171,39 +171,39 @@ claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 The remote runner and the lock support the same pattern:
 
 ```zsh
-claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY --dry-run -- nvidia-smi
-claudefws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY --dry-run -- nvidia-smi
+afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 ```
 
-`claudefws-lock --dry-run` prints both the SSH command and the script that would run on the remote host, so the whole effect can be reviewed before any connection is made.
+`afws-lock --dry-run` prints both the SSH command and the script that would run on the remote host, so the whole effect can be reviewed before any connection is made.
 
 ## Environment variables
 
 | Variable | Effect |
 | --- | --- |
-| `CLAUDEFWS_MOUNT_BASE` | Root for new mounts (default: `~/claudefws-mounts`) |
-| `CLAUDEFWS_STATE_DIR` | Session registry root (default: `~/.claudefws`) |
-| `CLAUDEFWS_PERMISSION_MODE` | Claude Code permission mode (default: `auto`) |
-| `CLAUDEFWS_SESSION_NAME` | Use this session name instead of a generated one |
-| `CLAUDEFWS_REMOTE_LOCK_DIR` | Remote lock root (default: `~/.claudefws-locks`) |
-| `CLAUDEFWS_NO_CONTROL_MASTER` | Set to any value to authenticate separately for every connection |
-| `CLAUDEFWS_KEEP_MOUNT` | Set to any value to leave the mount in place when the session ends |
-| `CLAUDEFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
-| `CLAUDEFWS_LOCK_TTL` | Seconds after which a lock is reported as stale (default: 7200) |
+| `AFWS_MOUNT_BASE` | Root for new mounts (default: `~/afws-mounts`) |
+| `AFWS_STATE_DIR` | Session registry root (default: `~/.afws`) |
+| `AFWS_PERMISSION_MODE` | Claude Code permission mode, `claudefws` only (default: `auto`) |
+| `AFWS_SESSION_NAME` | Use this session name instead of a generated one |
+| `AFWS_REMOTE_LOCK_DIR` | Remote lock root (default: `~/.afws-locks`) |
+| `AFWS_NO_CONTROL_MASTER` | Set to any value to authenticate separately for every connection |
+| `AFWS_KEEP_MOUNT` | Set to any value to leave the mount in place when the session ends |
+| `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
+| `AFWS_LOCK_TTL` | Seconds after which a lock is reported as stale (default: 7200) |
 
-Inside a running session the launcher also exports `CLAUDEFWS_SSH_HOST`, `CLAUDEFWS_REMOTE_DIR`, and `CLAUDEFWS_LOCAL_WORKSPACE`, which is how `claudefws-run` and `claudefws-lock` can be used without repeating the host.
+Inside a running session the launcher also exports `AFWS_SSH_HOST`, `AFWS_REMOTE_DIR`, and `AFWS_LOCAL_WORKSPACE`, which is how `afws-run` and `afws-lock` can be used without repeating the host.
 
 To give a session a different permission mode, set the variable for that launch only. The accepted values are the ones Claude Code accepts: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, and `plan`. An unrecognised value is rejected before anything is mounted.
 
 ```zsh
-CLAUDEFWS_PERMISSION_MODE=manual claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+AFWS_PERMISSION_MODE=manual claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 ## The shared SSH connection
 
-The mount and every `claudefws-run` and `claudefws-lock` call go through one
+The mount and every `afws-run` and `afws-lock` call go through one
 multiplexed SSH connection, whose control socket lives at
-`~/.claudefws/control/HOST.sock`. This matters for two reasons.
+`~/.afws/control/HOST.sock`. This matters for two reasons.
 
 A host that asks for a password or a key passphrase asks once, in the terminal
 where you started `claudefws`. Nothing afterwards can prompt: the mount is
@@ -215,10 +215,10 @@ every remote command, which is noticeable when a session runs many of them.
 Close it when you are finished with a host:
 
 ```zsh
-ssh -S ~/.claudefws/control/HOST.sock -O exit HOST
+ssh -S ~/.afws/control/HOST.sock -O exit HOST
 ```
 
-To connect separately every time instead, set `CLAUDEFWS_NO_CONTROL_MASTER=1`.
+To connect separately every time instead, set `AFWS_NO_CONTROL_MASTER=1`.
 Key-based authentication is then effectively required.
 
 ## Limitations
@@ -232,4 +232,4 @@ Key-based authentication is then effectively required.
 
 ## If something goes wrong
 
-Read [Troubleshooting](troubleshooting.md) and run `claudefws-doctor` first.
+Read [Troubleshooting](troubleshooting.md) and run `afws-doctor` first.

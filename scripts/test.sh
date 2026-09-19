@@ -3,24 +3,27 @@
 set -eu
 
 readonly REPOSITORY_ROOT="${0:A:h:h}"
-readonly LAUNCHER="${REPOSITORY_ROOT}/bin/claudefws"
-readonly RUNNER="${REPOSITORY_ROOT}/bin/claudefws-run"
-readonly PEERS="${REPOSITORY_ROOT}/bin/claudefws-peers"
-readonly LOCK="${REPOSITORY_ROOT}/bin/claudefws-lock"
-readonly UMOUNT="${REPOSITORY_ROOT}/bin/claudefws-umount"
-readonly WS_RUN="${REPOSITORY_ROOT}/bin/ws-run"
-readonly SHELL_WRAPPER="${REPOSITORY_ROOT}/bin/claudefws-shell"
+readonly LIBRARY="${REPOSITORY_ROOT}/lib/afws-common.zsh"
+readonly CLAUDE_LAUNCHER="${REPOSITORY_ROOT}/bin/claudefws"
+readonly CODEX_LAUNCHER="${REPOSITORY_ROOT}/bin/codexfws"
+readonly RUNNER="${REPOSITORY_ROOT}/bin/afws-run"
+readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
+readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
+readonly UMOUNT="${REPOSITORY_ROOT}/bin/afws-umount"
+readonly SHELL_WRAPPER="${REPOSITORY_ROOT}/bin/afws-shell"
 
 # Kept short on purpose: the shared-connection socket lives under this
 # directory and a Unix domain socket path is limited to 104 bytes.
-readonly SANDBOX="$(mktemp -d /tmp/claudefws-test.XXXXXX)"
+readonly SANDBOX="$(mktemp -d /tmp/afws-test.XXXXXX)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
-# Every test runs against a throwaway registry and mount root, and no test
-# ever reaches ssh, sshfs, or a real Claude session.
-export CLAUDEFWS_STATE_DIR="${SANDBOX}/state"
-export CLAUDEFWS_MOUNT_BASE="${SANDBOX}/mounts"
-unset CLAUDEFWS_SESSION_NAME CLAUDEFWS_SSH_HOST CLAUDEFWS_REMOTE_DIR 2>/dev/null || true
+# Every test runs against a throwaway registry and mount root. No test reaches
+# ssh, sshfs, or a real agent session.
+export AFWS_STATE_DIR="${SANDBOX}/state"
+export AFWS_MOUNT_BASE="${SANDBOX}/mounts"
+unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
+  AFWS_AGENT AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
+  AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND 2>/dev/null || true
 
 fail() {
   print -u2 -r -- "test.sh: $*"
@@ -36,48 +39,71 @@ expect_rejected() {
 }
 
 reset_state() {
-  rm -rf "$CLAUDEFWS_STATE_DIR"
-  mkdir -p "${CLAUDEFWS_STATE_DIR}/sessions"
+  rm -rf "$AFWS_STATE_DIR"
+  mkdir -p "${AFWS_STATE_DIR}/sessions"
 }
 
+# write_record NAME AGENT PID HOST REMOTE_DIR EPOCH [WORKSPACE] [MOUNT_POINT]
 write_record() {
-  local name="$1" kind="$2" pid="$3" host="$4" remote="$5" epoch="$6"
-  mkdir -p "${CLAUDEFWS_STATE_DIR}/sessions"
+  local name="$1" agent="$2" pid="$3" host="$4" remote="$5" epoch="$6"
+  local workspace="${7:-${AFWS_MOUNT_BASE}/${4}${5}}"
+  local point="${8:-$workspace}"
+
+  mkdir -p "${AFWS_STATE_DIR}/sessions"
   {
     print -r -- "session_name=${name}"
-    print -r -- "kind=${kind}"
+    print -r -- "agent=${agent}"
+    print -r -- "kind=interactive"
     print -r -- "pid=${pid}"
     print -r -- "bg_id="
     print -r -- "ssh_host=${host}"
     print -r -- "remote_dir=${remote}"
-    print -r -- "local_workspace=${CLAUDEFWS_MOUNT_BASE}/${host}${remote}"
+    print -r -- "local_workspace=${workspace}"
+    print -r -- "mount_point=${point}"
     print -r -- "started_at=2026-01-01T00:00:00Z"
     print -r -- "started_epoch=${epoch}"
-  } > "${CLAUDEFWS_STATE_DIR}/sessions/${name}.conf"
+  } > "${AFWS_STATE_DIR}/sessions/${name}.conf"
 }
 
 # --- syntax ---------------------------------------------------------------
 
 for script in \
-  "$LAUNCHER" \
+  "$LIBRARY" \
+  "$CLAUDE_LAUNCHER" \
+  "$CODEX_LAUNCHER" \
   "$RUNNER" \
   "$PEERS" \
   "$LOCK" \
   "$UMOUNT" \
-  "$WS_RUN" \
   "${REPOSITORY_ROOT}/scripts/install.sh" \
   "${REPOSITORY_ROOT}/scripts/doctor.sh" \
   "${REPOSITORY_ROOT}/scripts/prepublish-check.sh"; do
   zsh -n "$script" || fail "syntax check failed: ${script:t}"
 done
 
-# --- documentation --------------------------------------------------------
-
 sh -n "$SHELL_WRAPPER" || fail "syntax check failed: ${SHELL_WRAPPER:t}"
+
+# zsh ties 'path' to $PATH and makes 'status' read-only, so assigning to either
+# inside a function breaks command lookup or aborts outright. Both have bitten
+# this code before, and the shared library makes the blast radius large.
+special_parameter_hits=""
+for name in path status cdpath fpath manpath module_path argv options signals \
+  psvar mailpath watch histchars prompt SECONDS RANDOM LINES COLUMNS pipestatus dirstack; do
+  hits="$(grep -nE "(^|[[:space:];(&|]|local |readonly |typeset |integer |export )${name}=" \
+    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$UMOUNT" \
+    "${REPOSITORY_ROOT}/scripts/"*.sh 2>/dev/null || true)"
+  [[ -n "$hits" ]] && special_parameter_hits+="${name}: ${hits}"$'\n'
+done
+[[ -z "$special_parameter_hits" ]] || \
+  fail "assignment to a zsh special parameter:"$'\n'"$special_parameter_hits"
+
+# --- documentation --------------------------------------------------------
 
 for document in \
   "${REPOSITORY_ROOT}/README.md" \
   "${REPOSITORY_ROOT}/README.ja.md" \
+  "${REPOSITORY_ROOT}/docs/agents.md" \
+  "${REPOSITORY_ROOT}/docs/agents.ja.md" \
   "${REPOSITORY_ROOT}/docs/install-macos.md" \
   "${REPOSITORY_ROOT}/docs/install-macos.ja.md" \
   "${REPOSITORY_ROOT}/docs/security.md" \
@@ -98,184 +124,330 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$UMOUNT" "$WS_RUN"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
-# --- launcher -------------------------------------------------------------
+# --- shared library resolution -------------------------------------------
 
 reset_state
-launcher_output="$("$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$launcher_output" == *"Would mount"* ]] || fail "launcher dry run did not plan a mount"
-[[ "$launcher_output" == *"Would start Claude with"* ]] || fail "launcher dry run did not plan Claude startup"
-[[ "$launcher_output" == *"--permission-mode auto"* ]] || fail "launcher dry run did not plan the auto permission mode"
-[[ "$launcher_output" == *"--name fws-example-workstation-project-1"* ]] || fail "launcher dry run did not plan a session name"
-[[ "$launcher_output" == *"--append-system-prompt"* ]] || fail "launcher dry run did not plan session instructions"
+prefix="${SANDBOX}/prefix"
+AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
+  fail "the installer failed"
 
-[[ -d "${CLAUDEFWS_MOUNT_BASE}" ]] && fail "launcher dry run created a mount directory"
-[[ -e "${CLAUDEFWS_STATE_DIR}/sessions/fws-example-workstation-project-1.conf" ]] && \
-  fail "launcher dry run wrote a session record"
+for command_name in claudefws codexfws afws-run afws-peers afws-lock afws-umount afws-shell afws-doctor; do
+  [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
+done
+[[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
+[[ ! -x "${prefix}/lib/afws-common.zsh" ]] || fail "the installed library must not be executable"
 
-background_output="$("$LAUNCHER" --dry-run --bg example-workstation /remote/project)"
-[[ "$background_output" == *"Would start Claude in the background with"* ]] || \
-  fail "launcher dry run did not plan a background session"
-[[ "$background_output" == *"claude --bg --permission-mode auto"* ]] || \
-  fail "launcher background dry run did not plan claude --bg"
+"${prefix}/bin/afws-run" --help >/dev/null || \
+  fail "an installed command could not find the library through ../lib"
+
+# A command with no library anywhere must say so rather than fail obscurely.
+lonely="${SANDBOX}/lonely"
+mkdir -p "$lonely"
+cp "$RUNNER" "${lonely}/afws-run"
+lonely_output="$(HOME="${SANDBOX}/empty-home" "${lonely}/afws-run" --help 2>&1 || true)"
+[[ "$lonely_output" == *"cannot find lib/afws-common.zsh"* ]] || \
+  fail "a command without the shared library did not explain itself"
+
+# --- launchers: dry run ---------------------------------------------------
 
 reset_state
-write_record fws-example-workstation-project-1 interactive "$$" example-workstation /remote/project "$(date +%s)"
-collision_output="$("$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$collision_output" == *"--name fws-example-workstation-project-2"* ]] || \
-  fail "launcher reused a session name that is already registered"
+claude_plan="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$claude_plan" == *"Would mount"* ]] || fail "claudefws dry run did not plan a mount"
+[[ "$claude_plan" == *"Would start Claude with"* ]] || fail "claudefws dry run did not plan a launch"
+[[ "$claude_plan" == *"--permission-mode auto"* ]] || fail "claudefws dry run did not plan the auto permission mode"
+[[ "$claude_plan" == *"--name fws-example-workstation-project-1"* ]] || fail "claudefws dry run did not plan a session name"
+[[ "$claude_plan" == *"--append-system-prompt"* ]] || fail "claudefws dry run did not plan session instructions"
+[[ "$claude_plan" == *"shared SSH connection at ${AFWS_STATE_DIR}/control/example-workstation.sock"* ]] || \
+  fail "claudefws dry run did not plan the shared SSH connection"
+[[ "$claude_plan" == *"Would label locally-run shell commands"* ]] || \
+  fail "claudefws dry run did not mention labelling local shell commands"
+
+[[ -d "$AFWS_MOUNT_BASE" ]] && fail "claudefws dry run created a mount directory"
+[[ -e "${AFWS_STATE_DIR}/control" ]] && fail "claudefws dry run created a control directory"
+[[ -e "${AFWS_STATE_DIR}/sessions/fws-example-workstation-project-1.conf" ]] && \
+  fail "claudefws dry run wrote a session record"
+
+codex_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_plan" == *"Would mount"* ]] || fail "codexfws dry run did not plan a mount"
+[[ "$codex_plan" == *"Would start Codex with"* ]] || fail "codexfws dry run did not plan a launch"
+[[ "$codex_plan" == *"--sandbox workspace-write"* ]] || fail "codexfws dry run lost the sandbox flag"
+[[ "$codex_plan" == *"--ask-for-approval on-request"* ]] || fail "codexfws dry run lost the approval flag"
+[[ "$codex_plan" == *"developer_instructions="* ]] || fail "codexfws dry run did not plan session instructions"
+[[ "$codex_plan" == *"--name "* ]] && fail "codexfws planned a --name flag that Codex does not have"
+[[ "$codex_plan" == *"Would label locally-run shell commands"* ]] && \
+  fail "codexfws planned a shell marker that Codex cannot use"
+
+# Both launchers must agree on where the mount and the socket go.
+[[ "$codex_plan" == *"${AFWS_MOUNT_BASE}/example-workstation/remote/project"* ]] || \
+  fail "codexfws planned a different mount point from claudefws"
+[[ "$codex_plan" == *"${AFWS_STATE_DIR}/control/example-workstation.sock"* ]] || \
+  fail "codexfws planned a different shared connection from claudefws"
+[[ "$codex_plan" == *"session: cx-example-workstation-project-1"* ]] || \
+  fail "codexfws did not allocate its own session name"
+
+background_plan="$("$CLAUDE_LAUNCHER" --dry-run --bg example-workstation /remote/project)"
+[[ "$background_plan" == *"Would start Claude in the background with"* ]] || \
+  fail "claudefws dry run did not plan a background session"
+[[ "$background_plan" == *"claude --bg --permission-mode auto"* ]] || \
+  fail "claudefws background dry run did not plan claude --bg"
+expect_rejected "a background flag for codexfws" "$CODEX_LAUNCHER" --bg example-workstation /remote/project
+
+# --- launchers: naming and validation ------------------------------------
 
 reset_state
-named_output="$(CLAUDEFWS_SESSION_NAME=gpu-watcher "$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$named_output" == *"--name gpu-watcher"* ]] || fail "launcher ignored CLAUDEFWS_SESSION_NAME"
+write_record fws-example-workstation-project-1 claude "$$" example-workstation /remote/project "$(date +%s)"
+collision="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$collision" == *"--name fws-example-workstation-project-2"* ]] || \
+  fail "claudefws reused a session name that is already registered"
+
+reset_state
+named="$(AFWS_SESSION_NAME=gpu-watcher "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$named" == *"--name gpu-watcher"* ]] || fail "claudefws ignored AFWS_SESSION_NAME"
+codex_named="$(AFWS_SESSION_NAME=gpu-watcher "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_named" == *"session: gpu-watcher"* ]] || fail "codexfws ignored AFWS_SESSION_NAME"
+
+mode_plan="$(AFWS_PERMISSION_MODE=manual "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$mode_plan" == *"--permission-mode manual"* ]] || fail "claudefws ignored AFWS_PERMISSION_MODE"
+
+quiet_plan="$(AFWS_NO_SHELL_MARKER=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$quiet_plan" != *"Would label locally-run shell commands"* ]] || \
+  fail "AFWS_NO_SHELL_MARKER did not disable labelling"
+
+no_master="$(AFWS_NO_CONTROL_MASTER=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$no_master" != *"shared SSH connection"* ]] || \
+  fail "AFWS_NO_CONTROL_MASTER did not disable the shared connection"
+
+for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  expect_rejected "a relative remote directory (${launcher:t})" "$launcher" --dry-run example-workstation relative
+  expect_rejected "the remote filesystem root (${launcher:t})" "$launcher" --dry-run example-workstation /
+  expect_rejected "an invalid SSH config host name (${launcher:t})" "$launcher" --dry-run 'invalid host' /remote/project
+  expect_rejected "a parent-directory segment (${launcher:t})" "$launcher" --dry-run example-workstation /remote/../project
+  expect_rejected "repeated slashes (${launcher:t})" "$launcher" --dry-run example-workstation //remote/project
+  expect_rejected "a single positional argument (${launcher:t})" "$launcher" --dry-run example-workstation
+  expect_rejected "an invalid explicit session name (${launcher:t})" \
+    env AFWS_SESSION_NAME='bad name' "$launcher" --dry-run example-workstation /remote/project
+done
 
 expect_rejected "an unsupported permission mode" \
-  env CLAUDEFWS_PERMISSION_MODE=nonsense "$LAUNCHER" --dry-run example-workstation /remote/project
+  env AFWS_PERMISSION_MODE=nonsense "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
 
-mode_output="$(CLAUDEFWS_PERMISSION_MODE=manual "$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$mode_output" == *"--permission-mode manual"* ]] || fail "launcher ignored CLAUDEFWS_PERMISSION_MODE"
+# A Unix domain socket path cannot exceed 104 bytes.
+long_state="/tmp/$(printf 'x%.0s' {1..90})"
+expect_rejected "a socket path that cannot fit in a Unix socket" \
+  env AFWS_STATE_DIR="$long_state" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
+long_ok="$(AFWS_STATE_DIR="$long_state" AFWS_NO_CONTROL_MASTER=1 \
+  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$long_ok" == *"Would mount"* ]] || \
+  fail "the socket-length guard fired even with the shared connection disabled"
 
-expect_rejected "an invalid explicit session name" \
-  env CLAUDEFWS_SESSION_NAME='bad name' "$LAUNCHER" --dry-run example-workstation /remote/project
-expect_rejected "a relative remote directory" \
-  "$LAUNCHER" --dry-run example-workstation relative-directory
-expect_rejected "the remote filesystem root" \
-  "$LAUNCHER" --dry-run example-workstation /
-expect_rejected "an invalid SSH config host name" \
-  "$LAUNCHER" --dry-run 'invalid host' /remote/project
-expect_rejected "a remote path with a parent-directory segment" \
-  "$LAUNCHER" --dry-run example-workstation /remote/../project
-expect_rejected "a remote path with repeated slashes" \
-  "$LAUNCHER" --dry-run example-workstation //remote/project
-expect_rejected "a single positional argument" \
-  "$LAUNCHER" --dry-run example-workstation
-
-# --- mount table handling -------------------------------------------------
-# The launcher reads the mount table through CLAUDEFWS_MOUNT_COMMAND, so reuse
-# and nesting can be checked without mounting anything.
+# --- mount table ----------------------------------------------------------
+# The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and
+# nesting can be checked without mounting anything.
 
 reset_state
 readonly FAKE_MOUNTS="${SANDBOX}/mounts.txt"
-readonly FAKE_ROOT="${CLAUDEFWS_MOUNT_BASE}/example-workstation/remote/project"
+readonly FAKE_ROOT="${AFWS_MOUNT_BASE}/example-workstation/remote/project"
 mkdir -p "${FAKE_ROOT}/inner"
 
-print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" \
-  > "$FAKE_MOUNTS"
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
-reuse_output="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$LAUNCHER" --dry-run example-workstation /remote/project/inner)"
-[[ "$reuse_output" == *"Reusing SSHFS mount: example-workstation:/remote/project"* ]] || \
-  fail "launcher did not reuse a mount that already covers the requested directory"
-[[ "$reuse_output" == *"${FAKE_ROOT}/inner"* ]] || \
-  fail "launcher did not point the workspace at the subdirectory of the reused mount"
+for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  reuse="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$launcher" --dry-run example-workstation /remote/project/inner)"
+  [[ "$reuse" == *"Reusing SSHFS mount: example-workstation:/remote/project"* ]] || \
+    fail "${launcher:t} did not reuse a mount that already covers the requested directory"
+  [[ "$reuse" == *"${FAKE_ROOT}/inner"* ]] || \
+    fail "${launcher:t} did not point the workspace at the subdirectory of the reused mount"
+done
 
-print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" \
-  > "$FAKE_MOUNTS"
+print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
 expect_rejected "a mount that would hide another session's mount underneath it" \
-  env CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$LAUNCHER" --dry-run example-workstation /remote/project
+  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
 
-sibling_output="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$LAUNCHER" --dry-run example-workstation /remote/project/other)"
-[[ "$sibling_output" == *"Would mount"* ]] || \
-  fail "launcher did not plan a separate mount for a sibling directory"
+sibling="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project/other)"
+[[ "$sibling" == *"Would mount"* ]] || fail "a sibling directory did not get its own mount"
 
-print -r -- "other-host:/remote/project on ${CLAUDEFWS_MOUNT_BASE}/other-host/remote/project (macfuse)" \
-  > "$FAKE_MOUNTS"
+print -r -- "other-host:/remote/project on ${AFWS_MOUNT_BASE}/other-host/remote/project (macfuse)" > "$FAKE_MOUNTS"
+other_host="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$other_host" == *"Would mount"* ]] || fail "a mount belonging to another host was reused"
 
-other_host_mount="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$other_host_mount" == *"Would mount"* ]] || \
-  fail "launcher reused a mount belonging to a different host"
+# A mount that exists but cannot be read stands for a dead macFUSE mount.
+unreadable="${AFWS_MOUNT_BASE}/example-workstation/remote/dead"
+mkdir -p "$unreadable"
+chmod 000 "$unreadable"
+if ! ls -1 "$unreadable" >/dev/null 2>&1; then
+  print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
+  stale="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
+  [[ "$stale" == *"present but not responding"* ]] || \
+    fail "a mount that does not respond to a directory read was reused"
+  [[ "$stale" == *"diskutil unmount force"* ]] || \
+    fail "the stale-mount message did not offer a way out"
+fi
+chmod 755 "$unreadable"
 
-reset_state
+# --- afws-run -------------------------------------------------------------
 
-# --- remote runner --------------------------------------------------------
+runner_plan="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"
+[[ "$runner_plan" == ssh\ example-workstation* ]] || fail "afws-run did not plan SSH execution"
 
-runner_output="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"
-[[ "$runner_output" == ssh\ example-workstation* ]] || fail "runner dry run did not plan SSH execution"
+stdin_plan="$(print -r -- 'echo remote-script' | "$RUNNER" example-workstation --cwd /remote/project --dry-run)"
+[[ "$stdin_plan" == *"bash\\ -s"* ]] || fail "afws-run did not plan Bash standard-input execution"
 
-stdin_output="$(print -r -- 'echo remote-script' | \
-  "$RUNNER" example-workstation --cwd /remote/project --dry-run)"
-[[ "$stdin_output" == *"bash\\ -s"* ]] || fail "runner did not plan Bash standard-input execution"
+quoted="$("$RUNNER" example-workstation --cwd '/remote/project' --dry-run -- printf '%s' '$(not-a-command)')"
+[[ "$quoted" != *'$(not-a-command)'* ]] || fail "afws-run left a command substitution unquoted"
 
-quoted_output="$("$RUNNER" example-workstation --cwd '/remote/project with spaces' --dry-run -- printf '%s' '$(not-a-command)')"
-[[ "$quoted_output" == ssh\ example-workstation* ]] || fail "runner did not safely quote shell-sensitive arguments"
-[[ "$quoted_output" != *'$(not-a-command)'* ]] || fail "runner left a command substitution unquoted"
-
-environment_output="$(CLAUDEFWS_SSH_HOST=example-workstation CLAUDEFWS_REMOTE_DIR=/remote/project \
+environment_plan="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" --dry-run -- pwd)"
-[[ "$environment_output" == ssh\ example-workstation* ]] || \
-  fail "runner did not take the host and remote directory from the session environment"
+[[ "$environment_plan" == ssh\ example-workstation* ]] || \
+  fail "afws-run did not take the host and directory from the session environment"
 
-# A shared SSH connection is reused only when the socket exists and belongs to
-# the host being addressed.
+environment_stdin="$(print -r -- 'echo remote-script' | \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project "$RUNNER" --dry-run)"
+[[ "$environment_stdin" == *"bash\\ -s"* ]] || \
+  fail "afws-run did not accept a piped script using the session environment"
+
+expect_rejected "the remote filesystem root" "$RUNNER" example-workstation --cwd / --dry-run -- pwd
+expect_rejected "a control character in the remote path" \
+  "$RUNNER" example-workstation --cwd $'/remote/project\nsecond' --dry-run -- pwd
+expect_rejected "a relative remote path" "$RUNNER" example-workstation --cwd relative --dry-run -- pwd
+expect_rejected "an invalid SSH config host name" "$RUNNER" 'invalid host' --cwd /remote/project --dry-run -- pwd
+expect_rejected "a missing host with no session environment" "$RUNNER" --dry-run -- pwd
+expect_rejected "a piped script with no host anywhere" \
+  env -u AFWS_SSH_HOST sh -c "print -r -- pwd | '$RUNNER' --dry-run"
+
+# --- shared SSH connection reuse -----------------------------------------
+
 if command -v python3 >/dev/null 2>&1; then
-  # A Unix domain socket path must stay under 104 bytes, which the sandbox
-  # directory alone can exceed, so the socket lives in a short directory.
-  short_state="/tmp/claudefws-test-$$"
+  short_state="/tmp/afws-sock-$$"
   mkdir -p "${short_state}/control"
   socket_path="${short_state}/control/example-workstation.sock"
   python3 -c 'import socket,sys
 s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path" ||
     fail "could not create a test socket"
 
-  shared_output="$(CLAUDEFWS_STATE_DIR="$short_state" \
-    "$RUNNER" example-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$shared_output" == *"-S ${socket_path}"* ]] || \
-    fail "runner did not reuse the shared SSH connection"
+  shared="$(AFWS_STATE_DIR="$short_state" "$RUNNER" example-workstation --cwd /remote/project --dry-run -- pwd)"
+  [[ "$shared" == *"-S ${socket_path}"* ]] || fail "afws-run did not reuse the shared SSH connection"
 
-  shared_lock="$(CLAUDEFWS_STATE_DIR="$short_state" \
-    "$LOCK" status --host example-workstation --dry-run)"
-  [[ "$shared_lock" == *"-S ${socket_path}"* ]] || \
-    fail "lock did not reuse the shared SSH connection"
+  shared_lock="$(AFWS_STATE_DIR="$short_state" "$LOCK" status --host example-workstation --dry-run)"
+  [[ "$shared_lock" == *"-S ${socket_path}"* ]] || fail "afws-lock did not reuse the shared SSH connection"
 
-  other_host_output="$(CLAUDEFWS_STATE_DIR="$short_state" \
-    "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$other_host_output" != *"-S "* ]] || \
-    fail "runner reused a shared connection belonging to another host"
+  other="$(AFWS_STATE_DIR="$short_state" "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
+  [[ "$other" != *"-S "* ]] || fail "afws-run reused a connection belonging to another host"
 
-  wrong_env_output="$(CLAUDEFWS_STATE_DIR="$short_state" \
-    CLAUDEFWS_CONTROL_PATH="$socket_path" CLAUDEFWS_SSH_HOST=example-workstation \
-    "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$wrong_env_output" != *"-S "* ]] || \
-    fail "runner applied the session socket to a different host"
+  mismatch="$(AFWS_STATE_DIR="$short_state" AFWS_CONTROL_PATH="$socket_path" \
+    AFWS_SSH_HOST=example-workstation "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
+  [[ "$mismatch" != *"-S "* ]] || fail "afws-run applied the session socket to a different host"
 
   rm -rf "$short_state"
 fi
 
-expect_rejected "a shared-connection socket path that cannot fit in a Unix socket" \
-  env CLAUDEFWS_STATE_DIR="/tmp/$(printf 'x%.0s' {1..90})" \
-  "$LAUNCHER" --dry-run example-workstation /remote/project
+# --- afws-peers -----------------------------------------------------------
 
-# The standard-input script form must also work from the session environment.
-environment_stdin="$(print -r -- 'echo remote-script' | \
-  CLAUDEFWS_SSH_HOST=example-workstation CLAUDEFWS_REMOTE_DIR=/remote/project \
-  "$RUNNER" --dry-run)"
-[[ "$environment_stdin" == ssh\ example-workstation* ]] || \
-  fail "runner did not accept a piped script using the session environment"
-[[ "$environment_stdin" == *"bash\\ -s"* ]] || \
-  fail "runner did not plan Bash standard-input execution from the session environment"
+reset_state
+write_record fws-alpha-live claude "$$" alpha /remote/project 1000000000
+write_record fws-alpha-dead claude 999999 alpha /remote/other 1000000000
+write_record cx-alpha-live codex "$$" alpha /remote/project 1000000000
+write_record fws-beta-live claude "$$" beta /srv/thing 1000000000
 
-expect_rejected "a piped script with no host anywhere" \
-  env -u CLAUDEFWS_SSH_HOST sh -c "print -r -- pwd | '$RUNNER' --dry-run"
+listing="$("$PEERS")"
+[[ "$listing" == *AGENT* ]] || fail "afws-peers did not print an AGENT column"
+[[ "$listing" == *fws-alpha-live* ]] || fail "afws-peers hid a live Claude session"
+[[ "$listing" == *cx-alpha-live* ]] || fail "afws-peers hid a live Codex session"
+[[ "$listing" == *fws-beta-live* ]] || fail "afws-peers hid a session on another host"
+[[ "$listing" != *fws-alpha-dead* ]] || fail "afws-peers listed a dead session"
+[[ ! -e "${AFWS_STATE_DIR}/sessions/fws-alpha-dead.conf" ]] || \
+  fail "afws-peers did not prune the dead session record"
+[[ "$listing" == *codex* ]] || fail "afws-peers did not report the agent of a Codex session"
 
-expect_rejected "the remote filesystem root" \
-  "$RUNNER" example-workstation --cwd / --dry-run -- pwd
-expect_rejected "a control character in the remote path" \
-  "$RUNNER" example-workstation --cwd $'/remote/project\nsecond-line' --dry-run -- pwd
-expect_rejected "a relative remote path" \
-  "$RUNNER" example-workstation --cwd relative --dry-run -- pwd
-expect_rejected "an invalid SSH config host name" \
-  "$RUNNER" 'invalid host' --cwd /remote/project --dry-run -- pwd
-expect_rejected "a missing host with no session environment" \
-  "$RUNNER" --dry-run -- pwd
+host_listing="$("$PEERS" --host alpha)"
+[[ "$host_listing" == *cx-alpha-live* ]] || fail "afws-peers --host dropped a matching session"
+[[ "$host_listing" != *fws-beta-live* ]] || fail "afws-peers --host kept a session on another host"
 
-# --- shell marker ---------------------------------------------------------
+same_listing="$(AFWS_SESSION_NAME=fws-alpha-live AFWS_SSH_HOST=alpha \
+  AFWS_REMOTE_DIR=/remote/project "$PEERS" --same)"
+[[ "$same_listing" == *"(this session)"* ]] || fail "afws-peers --same did not mark the current session"
+[[ "$same_listing" == *cx-alpha-live* ]] || \
+  fail "afws-peers --same hid a session of the other agent in the same directory"
+[[ "$same_listing" != *fws-beta-live* ]] || fail "afws-peers --same kept a session elsewhere"
+
+peer_count="$(AFWS_SESSION_NAME=fws-alpha-live "$PEERS" --count)"
+[[ "$peer_count" == 2 ]] || fail "afws-peers --count did not exclude the current session (got ${peer_count})"
+
+json_listing="$("$PEERS" --json)"
+[[ "$json_listing" == \[* ]] || fail "afws-peers --json did not produce a JSON array"
+[[ "$json_listing" == *'"agent":"codex"'* ]] || fail "afws-peers --json omitted the agent"
+if command -v plutil >/dev/null 2>&1; then
+  # plutil -lint rejects a top-level array, so parse it instead of linting it.
+  print -r -- "$json_listing" | plutil -convert json -o /dev/null -- - 2>/dev/null || \
+    fail "afws-peers --json produced invalid JSON"
+fi
+
+reset_state
+write_record fws-alpha-dead claude 999999 alpha /remote/other 1000000000
+"$PEERS" --no-prune >/dev/null
+[[ -e "${AFWS_STATE_DIR}/sessions/fws-alpha-dead.conf" ]] || fail "afws-peers --no-prune deleted a record"
+
+expect_rejected "contradictory prune options" "$PEERS" --prune --no-prune
+expect_rejected "an invalid SSH config host name" "$PEERS" --host 'invalid host'
+expect_rejected "an unknown option" "$PEERS" --nonsense
+
+# --- releasing mounts -----------------------------------------------------
+
+reset_state
+readonly RELEASE_POINT="${AFWS_MOUNT_BASE}/example-workstation/remote/project"
+mkdir -p "${RELEASE_POINT}/inner"
+print -r -- "example-workstation:/remote/project on ${RELEASE_POINT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
+
+[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 0 ]] || fail "an unused mount was reported as in use"
+
+write_record fws-release-1 claude "$$" example-workstation /remote/project "$(date +%s)" "$RELEASE_POINT" "$RELEASE_POINT"
+[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 1 ]] || fail "a session in the mount was not counted"
+
+write_record cx-release-2 codex "$$" example-workstation /remote/project "$(date +%s)" "${RELEASE_POINT}/inner" "$RELEASE_POINT"
+[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 2 ]] || \
+  fail "a session of the other agent sharing the mount was not counted"
+
+[[ "$(AFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-mount "$RELEASE_POINT")" == 1 ]] || \
+  fail "--users-of-mount did not exclude the current session"
+[[ "$(AFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-host example-workstation)" == 1 ]] || \
+  fail "--users-of-host did not exclude the current session"
+[[ "$("$PEERS" --users-of-host other-workstation)" == 0 ]] || \
+  fail "--users-of-host counted a session on another host"
+
+umount_list="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --list)"
+[[ "$umount_list" == *"${RELEASE_POINT}"* ]] || fail "afws-umount --list hid a mount"
+[[ "$umount_list" == *2* ]] || fail "afws-umount --list did not report the session count"
+
+orphan_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
+[[ "$orphan_plan" == *"still in use"* ]] || \
+  fail "afws-umount --orphaned offered to release a mount that is in use"
+
+expect_rejected "unmounting a mount live sessions are working in" \
+  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" example-workstation /remote/project --dry-run
+
+rm -f "${AFWS_STATE_DIR}/sessions/"*.conf
+release_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" example-workstation /remote/project --dry-run)"
+[[ "$release_plan" == *"Would unmount ${RELEASE_POINT}"* ]] || \
+  fail "afws-umount did not plan to release an unused mount"
+
+orphan_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
+[[ "$orphan_plan" == *"Would unmount ${RELEASE_POINT}"* ]] || \
+  fail "afws-umount --orphaned did not plan to release an unused mount"
+
+not_mounted="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" example-workstation /remote/elsewhere --dry-run)"
+[[ "$not_mounted" == *"Not mounted"* ]] || fail "afws-umount did not report an absent mount"
+
+expect_rejected "an invalid host for afws-umount" "$UMOUNT" 'invalid host' /remote/project
+expect_rejected "a relative directory for afws-umount" "$UMOUNT" example-workstation relative
+expect_rejected "--orphaned combined with a host" "$UMOUNT" --orphaned example-workstation /remote/project
+
+reset_state
+
+# --- afws-shell -----------------------------------------------------------
 
 marker_out="$("$SHELL_WRAPPER" 'echo only-stdout' 2>/dev/null)"
 [[ "$marker_out" == only-stdout ]] || fail "the shell wrapper altered standard output"
@@ -289,180 +461,42 @@ marker_status=0
 
 # These probes exit 127 on purpose, so the substitution must not take the whole
 # script down under 'set -e'.
-hint="$(CLAUDEFWS_SSH_HOST=example-workstation \
+hint="$(AFWS_SSH_HOST=example-workstation \
   "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 2>&1 >/dev/null || true)"
-[[ "$hint" == *"for example-workstation, use: ws-run"* ]] || \
-  fail "the shell wrapper did not suggest ws-run for a command that is not installed here"
+[[ "$hint" == *"for example-workstation, use: afws-run"* ]] || \
+  fail "the shell wrapper did not suggest afws-run for a command that is not installed here"
 
-no_hint="$(env -u CLAUDEFWS_SSH_HOST \
-  "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 2>&1 >/dev/null || true)"
-[[ "$no_hint" != *"ws-run"* ]] || \
-  fail "the shell wrapper suggested ws-run outside a Work Station session"
+no_hint="$(env -u AFWS_SSH_HOST "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 2>&1 >/dev/null || true)"
+[[ "$no_hint" != *afws-run* ]] || fail "the shell wrapper suggested afws-run outside a session"
 
-custom_marker="$(CLAUDEFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
-[[ "$custom_marker" == '[laptop] ' ]] || fail "the shell wrapper ignored CLAUDEFWS_MARKER"
+custom_marker="$(AFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
+[[ "$custom_marker" == '[laptop] ' ]] || fail "the shell wrapper ignored AFWS_MARKER"
 
 # If the single-argument contract ever changes, the wrapper must not eat the
 # command: it becomes a transparent shell instead.
 passthrough="$("$SHELL_WRAPPER" /bin/sh -c 'echo passthrough-ok' 2>/dev/null)"
 [[ "$passthrough" == passthrough-ok ]] || fail "the shell wrapper did not fall back to a transparent shell"
 
-reset_state
-marker_plan="$("$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$marker_plan" == *"Would label locally-run shell commands"* ]] || \
-  fail "launcher dry run did not mention labelling local shell commands"
-
-quiet_plan="$(CLAUDEFWS_NO_SHELL_MARKER=1 "$LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$quiet_plan" != *"Would label locally-run shell commands"* ]] || \
-  fail "CLAUDEFWS_NO_SHELL_MARKER did not disable labelling"
-
-# --- ws-run ------------------------------------------------------------------
-
-expect_rejected "ws-run outside a claudefws session" \
-  env -u CLAUDEFWS_SSH_HOST "$WS_RUN" nvidia-smi
-
-ws_run_plan="$(CLAUDEFWS_SSH_HOST=example-workstation CLAUDEFWS_REMOTE_DIR=/remote/project \
-  CLAUDEFWS_DRY_RUN_PASSTHROUGH=1 "$WS_RUN" --help)"
-[[ "$ws_run_plan" == *"claudefws-run -- COMMAND"* ]] || fail "ws-run --help does not name what it wraps"
-
-# --- session registry -----------------------------------------------------
-
-reset_state
-write_record fws-alpha-live interactive "$$" alpha /remote/project 1000000000
-write_record fws-alpha-dead interactive 999999 alpha /remote/other 1000000000
-write_record fws-beta-live interactive "$$" beta /srv/thing 1000000000
-
-listing="$("$PEERS")"
-[[ "$listing" == *fws-alpha-live* ]] || fail "peers hid a live session"
-[[ "$listing" == *fws-beta-live* ]] || fail "peers hid a live session on another host"
-[[ "$listing" != *fws-alpha-dead* ]] || fail "peers listed a dead session"
-[[ ! -e "${CLAUDEFWS_STATE_DIR}/sessions/fws-alpha-dead.conf" ]] || \
-  fail "peers did not prune the dead session record"
-
-host_listing="$("$PEERS" --host alpha)"
-[[ "$host_listing" == *fws-alpha-live* ]] || fail "peers --host dropped a matching session"
-[[ "$host_listing" != *fws-beta-live* ]] || fail "peers --host kept a session on another host"
-
-same_listing="$(CLAUDEFWS_SESSION_NAME=fws-alpha-live CLAUDEFWS_SSH_HOST=alpha \
-  CLAUDEFWS_REMOTE_DIR=/remote/project "$PEERS" --same)"
-[[ "$same_listing" == *"(this session)"* ]] || fail "peers --same did not mark the current session"
-[[ "$same_listing" != *fws-beta-live* ]] || fail "peers --same kept a session on another remote directory"
-
-peer_count="$(CLAUDEFWS_SESSION_NAME=fws-alpha-live "$PEERS" --count)"
-[[ "$peer_count" == 1 ]] || fail "peers --count did not exclude the current session (got ${peer_count})"
-
-json_listing="$("$PEERS" --json)"
-[[ "$json_listing" == \[* ]] || fail "peers --json did not produce a JSON array"
-if command -v plutil >/dev/null 2>&1; then
-  # plutil -lint rejects a top-level array, so parse it instead of linting it.
-  print -r -- "$json_listing" | plutil -convert json -o /dev/null -- - 2>/dev/null || \
-    fail "peers --json produced invalid JSON"
-fi
-
-reset_state
-write_record fws-alpha-dead interactive 999999 alpha /remote/other 1000000000
-"$PEERS" --no-prune >/dev/null
-[[ -e "${CLAUDEFWS_STATE_DIR}/sessions/fws-alpha-dead.conf" ]] || \
-  fail "peers --no-prune deleted a record"
-
-expect_rejected "contradictory prune options" "$PEERS" --prune --no-prune
-expect_rejected "an invalid SSH config host name" "$PEERS" --host 'invalid host'
-expect_rejected "an unknown option" "$PEERS" --nonsense
-
-# --- releasing mounts -----------------------------------------------------
-
-reset_state
-readonly RELEASE_POINT="${CLAUDEFWS_MOUNT_BASE}/example-workstation/remote/project"
-mkdir -p "${RELEASE_POINT}/inner"
-print -r -- "example-workstation:/remote/project on ${RELEASE_POINT} (macfuse, nodev, nosuid)" \
-  > "$FAKE_MOUNTS"
-
-write_mounted_record() {
-  local name="$1" workspace="$2"
-  mkdir -p "${CLAUDEFWS_STATE_DIR}/sessions"
-  {
-    print -r -- "session_name=${name}"
-    print -r -- "kind=interactive"
-    print -r -- "pid=$$"
-    print -r -- "bg_id="
-    print -r -- "ssh_host=example-workstation"
-    print -r -- "remote_dir=/remote/project"
-    print -r -- "local_workspace=${workspace}"
-    print -r -- "mount_point=${RELEASE_POINT}"
-    print -r -- "started_at=2026-01-01T00:00:00Z"
-    print -r -- "started_epoch=$(date +%s)"
-  } > "${CLAUDEFWS_STATE_DIR}/sessions/${name}.conf"
-}
-
-[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 0 ]] || \
-  fail "an unused mount was reported as in use"
-
-write_mounted_record fws-release-1 "$RELEASE_POINT"
-[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 1 ]] || \
-  fail "a session working in the mount was not counted"
-
-write_mounted_record fws-release-2 "${RELEASE_POINT}/inner"
-[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 2 ]] || \
-  fail "a session working in a subdirectory of the mount was not counted"
-
-[[ "$(CLAUDEFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-mount "$RELEASE_POINT")" == 1 ]] || \
-  fail "--users-of-mount did not exclude the current session"
-[[ "$(CLAUDEFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-host example-workstation)" == 1 ]] || \
-  fail "--users-of-host did not exclude the current session"
-[[ "$("$PEERS" --users-of-host other-workstation)" == 0 ]] || \
-  fail "--users-of-host counted a session on another host"
-
-umount_list="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --list)"
-[[ "$umount_list" == *"${RELEASE_POINT}"* ]] || fail "claudefws-umount --list hid a claudefws mount"
-[[ "$umount_list" == *"2"* ]] || fail "claudefws-umount --list did not report the session count"
-
-orphan_plan="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
-[[ "$orphan_plan" == *"still in use"* ]] || \
-  fail "claudefws-umount --orphaned offered to release a mount that is in use"
-
-expect_rejected "unmounting a mount that live sessions are working in" \
-  env CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$UMOUNT" example-workstation /remote/project --dry-run
-
-rm -f "${CLAUDEFWS_STATE_DIR}/sessions/"*.conf
-release_plan="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$UMOUNT" example-workstation /remote/project --dry-run)"
-[[ "$release_plan" == *"Would unmount ${RELEASE_POINT}"* ]] || \
-  fail "claudefws-umount did not plan to release an unused mount"
-
-orphan_plan="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
-[[ "$orphan_plan" == *"Would unmount ${RELEASE_POINT}"* ]] || \
-  fail "claudefws-umount --orphaned did not plan to release an unused mount"
-
-not_mounted="$(CLAUDEFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$UMOUNT" example-workstation /remote/elsewhere --dry-run)"
-[[ "$not_mounted" == *"Not mounted"* ]] || \
-  fail "claudefws-umount did not report an absent mount as not mounted"
-
-expect_rejected "an invalid host for claudefws-umount" "$UMOUNT" 'invalid host' /remote/project
-expect_rejected "a relative directory for claudefws-umount" "$UMOUNT" example-workstation relative
-expect_rejected "--orphaned combined with a host" "$UMOUNT" --orphaned example-workstation /remote/project
-
-reset_state
-
-# --- remote lock ----------------------------------------------------------
+# --- afws-lock ------------------------------------------------------------
 
 lock_plan="$("$LOCK" acquire gpu0 --host example-workstation --dry-run)"
-[[ "$lock_plan" == ssh\ example-workstation* ]] || fail "lock dry run did not plan SSH execution"
-[[ "$lock_plan" == *"--- remote script ---"* ]] || fail "lock dry run did not show the remote script"
+[[ "$lock_plan" == ssh\ example-workstation* ]] || fail "afws-lock did not plan SSH execution"
+[[ "$lock_plan" == *"--- remote script ---"* ]] || fail "afws-lock did not show the remote script"
+[[ "$lock_plan" == *'\~/.afws-locks'* ]] || \
+  fail "afws-lock did not keep the remote lock root unexpanded for the remote shell"
 
-environment_plan="$(CLAUDEFWS_SSH_HOST=example-workstation "$LOCK" status --dry-run)"
-[[ "$environment_plan" == ssh\ example-workstation* ]] || \
-  fail "lock did not take the host from the session environment"
+environment_lock="$(AFWS_SSH_HOST=example-workstation "$LOCK" status --dry-run)"
+[[ "$environment_lock" == ssh\ example-workstation* ]] || \
+  fail "afws-lock did not take the host from the session environment"
 
 expect_rejected "an invalid lock name" "$LOCK" acquire 'bad name' --host example-workstation --dry-run
 expect_rejected "a missing lock name" "$LOCK" acquire --host example-workstation --dry-run
-expect_rejected "a missing SSH host" env -u CLAUDEFWS_SSH_HOST "$LOCK" acquire gpu0 --dry-run
+expect_rejected "a missing SSH host" env -u AFWS_SSH_HOST "$LOCK" acquire gpu0 --dry-run
 expect_rejected "an unknown action" "$LOCK" frobnicate gpu0 --host example-workstation --dry-run
 expect_rejected "a non-numeric wait" "$LOCK" acquire gpu0 --host example-workstation --wait soon --dry-run
 expect_rejected "a non-numeric ttl" "$LOCK" acquire gpu0 --host example-workstation --ttl forever --dry-run
 expect_rejected "a relative remote lock root" \
-  env CLAUDEFWS_REMOTE_LOCK_DIR=relative/locks "$LOCK" acquire gpu0 --host example-workstation --dry-run
+  env AFWS_REMOTE_LOCK_DIR=relative/locks "$LOCK" acquire gpu0 --host example-workstation --dry-run
 
 # The remote half of the lock is a plain POSIX script, so it can be exercised
 # here against a throwaway directory instead of a real workstation.
@@ -484,11 +518,11 @@ run_remote_lock() {
   return "$exit_status"
 }
 
-run_remote_lock acquire gpu0 session-a 0 >/dev/null || fail "remote lock could not be acquired"
+run_remote_lock acquire gpu0 session-a 0 >/dev/null || fail "the remote lock could not be acquired"
 
-lock_held_status=0
-run_remote_lock acquire gpu0 session-b 0 >/dev/null || lock_held_status=$?
-(( lock_held_status == 3 )) || fail "a held lock was handed to a second session (status ${lock_held_status})"
+held_status=0
+run_remote_lock acquire gpu0 session-b 0 >/dev/null || held_status=$?
+(( held_status == 3 )) || fail "a held lock was handed to a second session (status ${held_status})"
 
 held_report="$(run_remote_lock status '' session-b 0)"
 [[ "$held_report" == held\ gpu0* ]] || fail "lock status did not report the lock as held"
@@ -499,7 +533,7 @@ run_remote_lock release gpu0 session-b 0 >/dev/null || refused_status=$?
 (( refused_status == 4 )) || fail "a session released a lock it does not hold (status ${refused_status})"
 
 steal_report="$(run_remote_lock release gpu0 session-b 1)"
-[[ "$steal_report" == stole\ gpu0\ from\ session-a* ]] || fail "an explicit steal did not report the previous holder"
+[[ "$steal_report" == stole\ gpu0\ from\ session-a* ]] || fail "an explicit steal did not name the previous holder"
 
 run_remote_lock acquire gpu0 session-b 0 >/dev/null || fail "a released lock could not be re-acquired"
 released_report="$(run_remote_lock release gpu0 session-b 0)"

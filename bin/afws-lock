@@ -2,42 +2,47 @@
 
 set -eu
 
-# zselect is a zsh builtin, so waiting never depends on an external sleep being
-# available. It returns non-zero when it simply times out, which is the normal
-# case here.
-zmodload zsh/zselect 2>/dev/null || true
+readonly AFWS_PROGRAM="afws-lock"
+readonly SCRIPT_DIR="${0:A:h}"
 
-pause_seconds() {
-  if zmodload -e zsh/zselect; then
-    zselect -t $(( $1 * 100 )) 2>/dev/null || true
-  else
-    command sleep "$1" 2>/dev/null || true
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
   fi
-}
+done
 
-readonly DEFAULT_REMOTE_BASE="~/.claudefws-locks"
-remote_base="${CLAUDEFWS_REMOTE_LOCK_DIR:-$DEFAULT_REMOTE_BASE}"
-ssh_host="${CLAUDEFWS_SSH_HOST-}"
+if ! typeset -f afws_die >/dev/null; then
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+fi
+
+readonly DEFAULT_REMOTE_BASE="~/.afws-locks"
+remote_base="$AFWS_REMOTE_LOCK_DIR"
+ssh_host="${AFWS_SSH_HOST-}"
 lock_name=""
 wait_seconds=0
-ttl_seconds="${CLAUDEFWS_LOCK_TTL:-7200}"
+ttl_seconds="$AFWS_LOCK_TTL"
 dry_run=0
 action=""
 
 usage() {
   print -r -- "Usage:"
-  print -r -- "  claudefws-lock acquire NAME [--host SSH_CONFIG_HOST] [--wait SECONDS] [--ttl SECONDS]"
-  print -r -- "  claudefws-lock release NAME [--host SSH_CONFIG_HOST]"
-  print -r -- "  claudefws-lock status  [NAME] [--host SSH_CONFIG_HOST]"
-  print -r -- "  claudefws-lock steal   NAME [--host SSH_CONFIG_HOST]"
+  print -r -- "  afws-lock acquire NAME [--host SSH_CONFIG_HOST] [--wait SECONDS] [--ttl SECONDS]"
+  print -r -- "  afws-lock release NAME [--host SSH_CONFIG_HOST]"
+  print -r -- "  afws-lock status  [NAME] [--host SSH_CONFIG_HOST]"
+  print -r -- "  afws-lock steal   NAME [--host SSH_CONFIG_HOST]"
   print -r -- ""
   print -r -- "Claims an exclusive resource on the remote workstation so that several"
-  print -r -- "Claude sessions do not use it at the same time. A lock is a directory"
-  print -r -- "created atomically on the remote host; nothing is written inside the"
-  print -r -- "project tree."
+  print -r -- "sessions, of either agent, do not use it at the same time. A lock is a"
+  print -r -- "directory created atomically on the remote host; nothing is written inside"
+  print -r -- "the project tree. Locks are per host, not per directory, because a GPU is"
+  print -r -- "shared by every session on that workstation."
   print -r -- ""
   print -r -- "Options:"
-  print -r -- "  --host HOST     SSH config host (default: CLAUDEFWS_SSH_HOST)"
+  print -r -- "  --host HOST     SSH config host (default: AFWS_SSH_HOST)"
   print -r -- "  --wait SECONDS  Retry acquire until the lock is free or the time runs out"
   print -r -- "  --ttl SECONDS   Mark the lock stale after this long (default: 7200)"
   print -r -- "  -n, --dry-run   Print the planned SSH command and remote script only"
@@ -45,13 +50,9 @@ usage() {
   print -r -- "Exit status: 0 success, 2 usage error, 3 lock held, 4 refused"
   print -r -- ""
   print -r -- "Environment:"
-  print -r -- "  CLAUDEFWS_SESSION_NAME     Recorded as the lock holder"
-  print -r -- "  CLAUDEFWS_REMOTE_LOCK_DIR  Remote lock root (default: ~/.claudefws-locks)"
-}
-
-die() {
-  print -u2 -r -- "claudefws-lock: $*"
-  exit 2
+  print -r -- "  AFWS_SESSION_NAME     Recorded as the lock holder"
+  print -r -- "  AFWS_REMOTE_LOCK_DIR  Remote lock root (default: ~/.afws-locks)"
+  print -r -- "  AFWS_LOCK_TTL         Default TTL in seconds"
 }
 
 if (( $# == 0 )); then
@@ -60,17 +61,9 @@ if (( $# == 0 )); then
 fi
 
 case "$1" in
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  acquire|release|status|steal)
-    action="$1"
-    shift
-    ;;
-  *)
-    die "unknown action: $1 (expected acquire, release, status, or steal)"
-    ;;
+  -h|--help) usage; exit 0 ;;
+  acquire|release|status|steal) action="$1"; shift ;;
+  *) afws_die "unknown action: $1 (expected acquire, release, status, or steal)" ;;
 esac
 
 if (( $# > 0 )) && [[ "$1" != -* ]]; then
@@ -81,76 +74,54 @@ fi
 while (( $# > 0 )); do
   case "$1" in
     --host)
-      (( $# >= 2 )) || die "--host requires an SSH config host name"
-      ssh_host="$2"
-      shift 2
-      ;;
+      (( $# >= 2 )) || afws_die "--host requires an SSH config host name"
+      ssh_host="$2"; shift 2 ;;
     --wait)
-      (( $# >= 2 )) || die "--wait requires a number of seconds"
-      wait_seconds="$2"
-      shift 2
-      ;;
+      (( $# >= 2 )) || afws_die "--wait requires a number of seconds"
+      wait_seconds="$2"; shift 2 ;;
     --ttl)
-      (( $# >= 2 )) || die "--ttl requires a number of seconds"
-      ttl_seconds="$2"
-      shift 2
-      ;;
-    -n|--dry-run)
-      dry_run=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      die "unknown option: $1"
-      ;;
+      (( $# >= 2 )) || afws_die "--ttl requires a number of seconds"
+      ttl_seconds="$2"; shift 2 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) afws_die "unknown option: $1" ;;
   esac
 done
 
-case "$ssh_host" in
-  '')
-    die "no SSH host given and CLAUDEFWS_SSH_HOST is not set; pass --host"
-    ;;
-  -*|*[!A-Za-z0-9._-]*)
-    die "invalid SSH config host name"
-    ;;
-esac
+[[ -n "$ssh_host" ]] ||
+  afws_die "no SSH host given and AFWS_SSH_HOST is not set; pass --host"
+afws_validate_host "$ssh_host"
 
 if [[ "$action" != status && -z "$lock_name" ]]; then
-  die "${action} requires a lock name"
+  afws_die "${action} requires a lock name"
 fi
 
 if [[ -n "$lock_name" ]]; then
   case "$lock_name" in
     -*|*[!A-Za-z0-9._-]*)
-      die "lock name may contain only letters, numbers, '.', '_', and '-'"
+      afws_die "lock name may contain only letters, numbers, '.', '_', and '-'"
       ;;
   esac
 fi
 
 case "$wait_seconds" in
-  ''|*[!0-9]*) die "--wait must be a whole number of seconds" ;;
+  ''|*[!0-9]*) afws_die "--wait must be a whole number of seconds" ;;
 esac
 
 case "$ttl_seconds" in
-  ''|*[!0-9]*) die "--ttl must be a whole number of seconds" ;;
+  ''|*[!0-9]*) afws_die "--ttl must be a whole number of seconds" ;;
 esac
 
 if [[ "$remote_base" != "$DEFAULT_REMOTE_BASE" && "$remote_base" != /* ]]; then
-  die "CLAUDEFWS_REMOTE_LOCK_DIR must be an absolute remote path"
+  afws_die "AFWS_REMOTE_LOCK_DIR must be an absolute remote path"
 fi
 
-if [[ "$remote_base" == *[[:cntrl:]]* ]]; then
-  die "CLAUDEFWS_REMOTE_LOCK_DIR must not contain control characters"
-fi
+[[ "$remote_base" != *[[:cntrl:]]* ]] ||
+  afws_die "AFWS_REMOTE_LOCK_DIR must not contain control characters"
 
-holder="${CLAUDEFWS_SESSION_NAME:-${USER:-unknown}@$(hostname -s 2>/dev/null || print -r -- localhost)}"
+holder="${AFWS_SESSION_NAME:-${USER:-unknown}@$(hostname -s 2>/dev/null || print -r -- localhost)}"
 case "$holder" in
-  *[!A-Za-z0-9._@-]*)
-    holder="unnamed-session"
-    ;;
+  *[!A-Za-z0-9._@-]*) holder="unnamed-session" ;;
 esac
 
 # --- remote scripts -------------------------------------------------------
@@ -268,14 +239,9 @@ esac
 
 remote_command="bash -s -- ${(q)lock_name} ${(q)holder} ${(q)ttl_seconds} ${(q)remote_base} ${force}"
 
-# Reuse the authenticated connection opened by claudefws when there is one, so
-# a host that requires a password is not asked for it again per command.
+# Reuse the authenticated connection a launcher opened.
 ssh_options=()
-if [[ -n "${CLAUDEFWS_CONTROL_PATH-}" && "${CLAUDEFWS_SSH_HOST-}" == "$ssh_host" ]]; then
-  control_path="$CLAUDEFWS_CONTROL_PATH"
-else
-  control_path="${CLAUDEFWS_STATE_DIR:-${HOME}/.claudefws}/control/${ssh_host}.sock"
-fi
+control_path="$(afws_resolve_control_path "$ssh_host")"
 if [[ -S "$control_path" ]]; then
   ssh_options=(-S "$control_path")
 fi
@@ -291,7 +257,7 @@ if (( dry_run )); then
   exit 0
 fi
 
-command -v ssh >/dev/null 2>&1 || die "ssh not found"
+command -v ssh >/dev/null 2>&1 || afws_die "ssh not found"
 
 run_remote() {
   local exit_status=0
@@ -319,11 +285,11 @@ if [[ "$action" == acquire && "$wait_seconds" -gt 0 ]]; then
     fi
 
     if (( $(date +%s) >= deadline )); then
-      print -u2 -r -- "claudefws-lock: gave up waiting for ${lock_name} after ${wait_seconds}s"
+      print -u2 -r -- "${AFWS_PROGRAM}: gave up waiting for ${lock_name} after ${wait_seconds}s"
       exit 3
     fi
 
-    pause_seconds 5
+    afws_pause_seconds 5
   done
 fi
 

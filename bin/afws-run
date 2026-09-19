@@ -1,0 +1,113 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-run"
+readonly SCRIPT_DIR="${0:A:h}"
+
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+
+if ! typeset -f afws_die >/dev/null; then
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+fi
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- COMMAND [ARG ...]"
+  print -r -- "  SCRIPT | afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY"
+  print -r -- ""
+  print -r -- "Inside a session started by claudefws or codexfws the host and remote"
+  print -r -- "directory come from the environment, so both can be omitted:"
+  print -r -- "  afws-run -- COMMAND [ARG ...]"
+  print -r -- "  SCRIPT | afws-run"
+  print -r -- ""
+  print -r -- "Arguments are passed through literally, so shell metacharacters are not"
+  print -r -- "interpreted on the remote host. Wrap a pipeline or a redirect in 'sh -c'"
+  print -r -- "when the remote shell should see it, or pipe a whole script in instead."
+}
+
+if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+# A positional SSH host can never begin with a hyphen, so an option in first
+# position means the session environment should supply the host. No arguments
+# at all is the standard-input script form, which relies on it too.
+if (( $# == 0 )); then
+  if [[ -t 0 ]]; then
+    usage >&2
+    exit 2
+  fi
+  ssh_host="${AFWS_SSH_HOST-}"
+  [[ -n "$ssh_host" ]] || afws_die "no SSH host given and AFWS_SSH_HOST is not set"
+elif [[ "$1" == -* ]]; then
+  ssh_host="${AFWS_SSH_HOST-}"
+  [[ -n "$ssh_host" ]] || afws_die "no SSH host given and AFWS_SSH_HOST is not set"
+else
+  ssh_host="$1"
+  shift
+fi
+
+afws_validate_host "$ssh_host"
+
+remote_cwd="${AFWS_REMOTE_DIR-}"
+dry_run=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --cwd)
+      (( $# >= 2 )) || afws_die "--cwd requires a remote directory"
+      remote_cwd="$2"
+      shift 2
+      ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+[[ -n "$remote_cwd" ]] || afws_die "--cwd must be an absolute remote path"
+remote_cwd="$(afws_normalize_remote_dir "$remote_cwd")"
+
+remote_command="cd ${(q)remote_cwd} && exec"
+
+if (( $# == 0 )); then
+  if [[ -t 0 ]]; then
+    usage >&2
+    exit 2
+  fi
+  remote_command+=" bash -s"
+else
+  for argument in "$@"; do
+    remote_command+=" ${(q)argument}"
+  done
+fi
+
+# Reuse the authenticated connection a launcher opened, so a host that requires
+# a password is not asked for it again per command.
+ssh_options=()
+control_path="$(afws_resolve_control_path "$ssh_host")"
+if [[ -S "$control_path" ]]; then
+  ssh_options=(-S "$control_path")
+fi
+
+if (( dry_run )); then
+  if (( ${#ssh_options} > 0 )); then
+    print -r -- "ssh ${ssh_options} ${ssh_host} ${(q)remote_command}"
+  else
+    print -r -- "ssh ${ssh_host} ${(q)remote_command}"
+  fi
+  exit 0
+fi
+
+exec ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
