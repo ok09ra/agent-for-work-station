@@ -51,6 +51,9 @@ if (( configure_shell )) && [[ "$INSTALL_DIRECTORY" != "${HOME}/.local/bin" ]]; 
 fi
 
 mkdir -p "$INSTALL_DIRECTORY" "$LIBRARY_DIRECTORY"
+# Every command sources the library, so it must not be group- or world-writable
+# whatever umask happens to be in effect.
+chmod 755 "$LIBRARY_DIRECTORY"
 
 install -m 0644 "${REPOSITORY_ROOT}/lib/afws-common.zsh" "${LIBRARY_DIRECTORY}/afws-common.zsh"
 for command_name in $COMMANDS; do

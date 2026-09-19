@@ -318,7 +318,12 @@ fi
 afws_write_session_record interactive "$$" ""
 
 release() { afws_release_session "$PEERS"; }
+# EXIT alone does not cover a signal: zsh runs it on a normal exit and on HUP,
+# but not on TERM, so a 'kill' would otherwise leave the mount and the
+# authenticated connection behind. afws_release_session is safe to call twice.
 trap release EXIT
+trap 'release; exit 143' TERM
+trap 'release; exit 129' HUP
 # Ctrl+C belongs to Claude Code, which handles it itself; the launcher must
 # stay alive to clean up after it.
 trap '' INT

@@ -18,7 +18,14 @@ fi
 marker="${AFWS_MARKER:-mac}"
 printf '[%s] ' "$marker" >&2
 
-"${AFWS_SHELL:-/bin/zsh}" -c "$1"
+# AFWS_SHELL exists so an unusual setup can choose its shell; anything that is
+# not an executable file falls back rather than breaking every command.
+shell="${AFWS_SHELL:-/bin/zsh}"
+if [ ! -x "$shell" ]; then
+  shell=/bin/zsh
+fi
+
+"$shell" -c "$1"
 command_status=$?
 
 # 127 is "not found here", which inside a session almost always means the

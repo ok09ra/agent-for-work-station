@@ -100,6 +100,20 @@ if (( library_found )); then
     fail "cannot create the session registry: ${AFWS_SESSION_DIR}"
   fi
 
+  # An authenticated SSH channel outliving its sessions is worth surfacing.
+  orphaned=0
+  for socket in "$AFWS_CONTROL_DIR"/*.sock(N); do
+    socket_host="${socket:t:r}"
+    users="$("${SCRIPT_DIR}/../bin/afws-peers" --users-of-host "$socket_host" 2>/dev/null)" ||
+      users="$(command afws-peers --users-of-host "$socket_host" 2>/dev/null)" || users=1
+    [[ "$users" == 0 ]] && orphaned=$(( orphaned + 1 ))
+  done
+  if (( orphaned > 0 )); then
+    fail "${orphaned} shared SSH connection(s) are open with no live session — close with: afws-umount --orphaned"
+  else
+    pass "no shared SSH connection is open without a session"
+  fi
+
   socket_probe="$(afws_control_socket example-workstation)"
   if (( ${#socket_probe} > AFWS_SOCKET_PATH_LIMIT )); then
     fail "AFWS_STATE_DIR is too deep for a shared-connection socket: ${socket_probe}"

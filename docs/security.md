@@ -55,6 +55,41 @@ timestamp, and a TTL — into a lock directory on the remote host under
 `~/.afws-locks`. Nothing is written inside the project tree, so a lock
 never reaches the project's Git history.
 
+## What this architecture does and does not protect
+
+Running the agent on the Mac rather than on the workstation is worth doing, but
+it is worth being exact about what it buys.
+
+**It does keep agent state off the workstation.** Credentials, accumulated
+permission rules, session history and plugins live on your Mac. That matters
+because those rules accumulate: an agent used natively on a shared machine for
+months ends up with a long allowlist that nobody reviews, and it applies to
+every later session on that machine. It also means the agent's shell is on the
+Mac, so it does not incidentally leave long-lived processes running on the
+workstation.
+
+**It does not by itself limit what the agent can reach.** Two things decide
+that, and both are yours to set:
+
+- *What is mounted.* Mounting a remote home directory puts `~/.ssh`, every other
+  project and every dotfile inside the workspace. Mount the project directory,
+  not the home.
+- *What `afws-run` can run.* It is an unrestricted remote shell as the SSH user,
+  so an agent that can call it can read anything that user can read, whatever
+  the mount is scoped to. The mount is a convenience boundary, not a security
+  boundary, as long as that is true.
+
+**It does not reduce what the model sees.** A file read through the mount goes
+to the model exactly as it would if the agent ran on the workstation. If some
+data must not leave the machine, the answer is not to mount it.
+
+The boundary that actually holds is on the workstation side: a separate SSH key
+for the agent, restricted in `authorized_keys` with `restrict` and a
+`command=` forced command that runs a small wrapper — start a job, stop it,
+fetch a log — instead of a shell. Then a mistake on the Mac cannot read
+`~/.ssh` or another project, because the workstation will not run anything else.
+This repository does not set that up for you.
+
 ## The shared SSH connection socket
 
 `~/.afws/control/HOST.sock` is a live, already-authenticated channel to the
@@ -63,6 +98,11 @@ user without authenticating again. The directory is created with owner-only
 permissions, which is the boundary that protects it; do not relax those
 permissions, place the socket on a shared filesystem, or point
 `AFWS_STATE_DIR` somewhere other users can read.
+
+The connection also expires on its own after `AFWS_CONTROL_PERSIST` seconds of
+inactivity, 600 by default, because a session killed with `SIGKILL` never gets
+to close it. `afws-umount --orphaned` closes any connection no live session is
+using, and `afws-doctor` reports one it finds.
 
 Close the connection when you finish with a host:
 

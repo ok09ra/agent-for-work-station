@@ -140,7 +140,7 @@ case $base in
 esac
 '
 
-readonly ACQUIRE_SCRIPT='mkdir -p "$base"
+readonly ACQUIRE_SCRIPT='(umask 077; mkdir -p "$base")
 chmod 700 "$base" 2>/dev/null || true
 lock=$base/$lock_name
 if mkdir "$lock" 2>/dev/null; then

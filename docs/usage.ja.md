@@ -61,6 +61,8 @@ afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
   zsh -lc 'print -r -- $ZSH_VERSION'
 ```
 
+改行を含む引数はzsh形式でクォートされるため、リモートのログインシェルがbashまたはzshでなければ解釈されません。引数に改行が入る場合は、標準入力にスクリプトを流す形式を使ってください。
+
 標準出力と標準エラーは現在のターミナルへ返るため、利用者とClaudeの双方が結果を確認できます。
 
 ## 自分でリモートコマンドを打つ

@@ -34,6 +34,9 @@ usage() {
   print -r -- "  afws-umount --orphaned [--force]"
   print -r -- "  afws-umount --list"
   print -r -- ""
+  print -r -- "--orphaned also closes a shared SSH connection no live session is using."
+  print -r -- "Such a connection is authenticated, so leaving one open is worth avoiding."
+  print -r -- ""
   print -r -- "Releases mounts created under the mount base. A session normally unmounts"
   print -r -- "its own workspace when it exits; this command is for a mount left behind by"
   print -r -- "a background session, by a session that was killed, or by a dead sshfs."
@@ -88,6 +91,18 @@ collect_mounts() {
   done < <(${=AFWS_MOUNT_COMMAND})
 }
 
+users_of_host() {
+  local host="$1" users
+
+  if [[ -x "$PEERS" ]]; then
+    users="$("$PEERS" --users-of-host "$host" 2>/dev/null)" || users=0
+  else
+    users=0
+  fi
+
+  print -r -- "$users"
+}
+
 users_of() {
   local point="$1" users
 
@@ -128,13 +143,18 @@ release() {
 collect_mounts
 
 if (( list_only )); then
-  if (( ${#afws_mounts} == 0 )); then
-    print -r -- "No work-station mounts are present."
+  if (( ${#afws_mounts} == 0 )) && [[ -z "$(print -rl -- "$AFWS_CONTROL_DIR"/*.sock(N))" ]]; then
+    print -r -- "No work-station mounts or shared connections are present."
     exit 0
   fi
   printf '%-8s %s\n' SESSIONS "MOUNT POINT"
   for point in "${afws_mounts[@]}"; do
     printf '%-8s %s\n' "$(users_of "$point")" "$point"
+  done
+
+  for socket in "$AFWS_CONTROL_DIR"/*.sock(N); do
+    printf '%-8s shared SSH connection to %s\n' \
+      "$(users_of_host "${socket:t:r}")" "${socket:t:r}"
   done
   exit 0
 fi
@@ -152,6 +172,24 @@ if (( orphaned )); then
   if (( released == 0 )); then
     print -r -- "Every work-station mount is still in use by a live session."
   fi
+
+  # A shared SSH connection outliving its sessions is an authenticated channel
+  # nobody is watching, so it is closed here too.
+  closed=0
+  for socket in "$AFWS_CONTROL_DIR"/*.sock(N); do
+    socket_host="${socket:t:r}"
+    [[ "$(users_of_host "$socket_host")" == 0 ]] || continue
+    if (( dry_run )); then
+      print -r -- "Would close the shared SSH connection to ${socket_host}"
+    else
+      print -r -- "Closing the shared SSH connection to ${socket_host}"
+      afws_close_control_master "$socket_host" "$socket"
+      rm -f "$socket"
+    fi
+    closed=$(( closed + 1 ))
+  done
+  (( closed > 0 )) || print -r -- "No unused shared SSH connections."
+
   (( failures == 0 )) || exit 1
   exit 0
 fi

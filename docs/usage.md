@@ -61,6 +61,10 @@ afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
   zsh -lc 'print -r -- $ZSH_VERSION'
 ```
 
+An argument containing a newline is quoted in zsh's form, which the remote
+login shell only understands if it is bash or zsh. Pipe a script in instead when
+an argument would contain one.
+
 Standard output and standard error return directly to the current Terminal, so both you and Claude can inspect the result.
 
 ## Typing a remote command yourself

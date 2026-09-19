@@ -14,6 +14,10 @@
 : ${AFWS_STATE_DIR:=${HOME}/.afws}
 : ${AFWS_MOUNT_COMMAND:=mount}
 : ${AFWS_LOCK_TTL:=7200}
+# A pre-authenticated SSH channel should not outlive the sessions using it. The
+# launcher closes it when the last session exits, but a session killed with
+# SIGKILL never gets to, so the connection also expires on its own.
+: ${AFWS_CONTROL_PERSIST:=600}
 # Quoted on purpose: the tilde must survive to the remote shell rather than
 # being expanded to this Mac's home directory here.
 : ${AFWS_REMOTE_LOCK_DIR:="~/.afws-locks"}
@@ -259,7 +263,7 @@ afws_open_control_master() {
 
   rm -f "$socket"
   print -r -- "Opening a shared SSH connection to ${ssh_host}"
-  ssh -M -S "$socket" -o ControlPersist=yes -f -N "$ssh_host"
+  ssh -M -S "$socket" -o "ControlPersist=${AFWS_CONTROL_PERSIST}" -f -N "$ssh_host"
 }
 
 afws_close_control_master() {
@@ -334,6 +338,10 @@ afws_write_session_record() {
   mkdir -p "$AFWS_SESSION_DIR"
   chmod 700 "$AFWS_STATE_DIR" "$AFWS_SESSION_DIR" 2>/dev/null || true
 
+  # The umask is set inside a subshell on purpose: setting it here would leak
+  # into the agent this launcher starts, and every file the agent then created
+  # in the remote project would be owner-only.
+  (
   umask 077
   {
     print -r -- "session_name=${afws_session_name}"
@@ -348,6 +356,7 @@ afws_write_session_record() {
     print -r -- "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     print -r -- "started_epoch=$(date +%s)"
   } > "$record"
+  )
 }
 
 afws_remove_session_record() {
@@ -392,13 +401,56 @@ afws_read_record() {
   [[ -n "$afws_record_session_name" ]]
 }
 
+# --- environment validation -----------------------------------------------
+# AFWS_STATE_DIR decides where the registry, the logs and the shared-connection
+# socket are written, and AFWS_MOUNT_BASE decides which mounts this tool
+# considers its own and is therefore willing to unmount. A relative path would
+# resolve against the working directory, which for claudefws is inside the
+# remote mount, and too broad a mount base would widen the unmount guard.
+
+afws_validate_absolute_directory() {
+  local name="$1" value="$2"
+
+  [[ "$value" == /* ]] || afws_die "${name} must be an absolute path: ${value}"
+  [[ "$value" != *[[:cntrl:]]* ]] || afws_die "${name} must not contain control characters"
+  [[ "$value" != "/" ]] || afws_die "${name} must not be the filesystem root"
+}
+
+afws_validate_environment() {
+  afws_validate_absolute_directory AFWS_STATE_DIR "$AFWS_STATE_DIR"
+  afws_validate_absolute_directory AFWS_MOUNT_BASE "$AFWS_MOUNT_BASE"
+
+  # A mount base that contains the home directory would make the unmount guard
+  # match paths this tool never created.
+  if [[ "${HOME}/" == "${AFWS_MOUNT_BASE}/"* ]]; then
+    afws_die "AFWS_MOUNT_BASE must not contain your home directory: ${AFWS_MOUNT_BASE}"
+  fi
+
+  # The mount table is read through a command so that tests can supply a fixed
+  # table. Anything beyond that would be an arbitrary command run by every
+  # launcher, so only the two shapes that are actually used are accepted.
+  case "${AFWS_MOUNT_COMMAND}" in
+    mount|"cat "*) ;;
+    *) afws_die "AFWS_MOUNT_COMMAND must be 'mount' or 'cat FILE': ${AFWS_MOUNT_COMMAND}" ;;
+  esac
+}
+
+afws_validate_environment
+
 # Releases what this session is the last user of: its registry record, the
 # mount when no other session is working inside it, and the shared SSH
 # connection when no other session is on that host. A mount outside the mount
 # base was not created here and is never unmounted.
 # afws_release_session PEERS_COMMAND
+afws_released=0
+
 afws_release_session() {
   local peers="$1" mount_users=1 host_users=1
+
+  # Reached from the EXIT trap and from the signal traps, so it must be safe to
+  # call more than once.
+  (( afws_released )) && return 0
+  afws_released=1
 
   afws_remove_session_record
 

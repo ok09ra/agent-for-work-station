@@ -152,6 +152,83 @@ lonely_output="$(HOME="${SANDBOX}/empty-home" "${lonely}/afws-run" --help 2>&1 |
 [[ "$lonely_output" == *"cannot find lib/afws-common.zsh"* ]] || \
   fail "a command without the shared library did not explain itself"
 
+# --- library hardening ----------------------------------------------------
+
+# The registry is written with a tight umask, which must not leak into the
+# agent the launcher starts: every file the agent creates in the remote project
+# would otherwise be owner-only.
+umask_probe="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+  source '"$LIBRARY"'
+  afws_agent=claude afws_session_name=umask-probe afws_ssh_host=h
+  afws_remote_dir=/d afws_local_workspace=/w afws_mount_point=/w
+  before=$(umask)
+  afws_write_session_record interactive 1 ""
+  print -r -- "${before} $(umask)"
+')"
+[[ "${umask_probe% *}" == "${umask_probe#* }" ]] || \
+  fail "writing a session record changed the umask of the calling shell (${umask_probe})"
+
+record_mode="$(stat -f '%Sp' "${AFWS_STATE_DIR}/sessions/umask-probe.conf")"
+[[ "$record_mode" == -rw------- ]] || fail "a session record is not owner-only (${record_mode})"
+rm -f "${AFWS_STATE_DIR}/sessions/umask-probe.conf"
+
+# Release runs from the EXIT trap and from the signal traps, so calling it more
+# than once must not unmount or close anything twice.
+release_probe="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+  AFWS_MOUNT_BASE='"$AFWS_MOUNT_BASE"'
+  source '"$LIBRARY"'
+  afws_session_name=release-probe afws_ssh_host=h
+  afws_mount_point='"$AFWS_MOUNT_BASE"'/nothing-here
+  afws_control_socket_path=/nonexistent.sock
+  afws_release_session /nonexistent-peers
+  afws_release_session /nonexistent-peers
+  print -r -- "released=${afws_released}"
+')"
+[[ "$release_probe" == "released=1" ]] || fail "release is not idempotent (${release_probe})"
+
+# A pre-authenticated SSH channel must expire on its own, because a session
+# killed with SIGKILL never closes it.
+grep -q 'AFWS_CONTROL_PERSIST:=[1-9]' "$LIBRARY" || \
+  fail "the shared SSH connection has no finite ControlPersist"
+grep -q 'ControlPersist=\${AFWS_CONTROL_PERSIST}' "$LIBRARY" || \
+  fail "the shared SSH connection does not use AFWS_CONTROL_PERSIST"
+
+# zsh runs the EXIT trap on a normal exit and on HUP, but not on TERM.
+for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  grep -q "trap 'release; exit 143' TERM" "$launcher" || \
+    fail "${launcher:t} does not release what it holds on SIGTERM"
+  grep -q "trap 'release; exit 129' HUP" "$launcher" || \
+    fail "${launcher:t} does not release what it holds on SIGHUP"
+done
+
+# AFWS_STATE_DIR decides where the registry and the socket are written, and
+# AFWS_MOUNT_BASE decides what this tool is willing to unmount.
+expect_rejected "a relative state directory" \
+  env AFWS_STATE_DIR=relative-state "$PEERS" --count
+expect_rejected "the filesystem root as a state directory" \
+  env AFWS_STATE_DIR=/ "$PEERS" --count
+expect_rejected "a relative mount base" \
+  env AFWS_MOUNT_BASE=relative-mounts "$PEERS" --count
+expect_rejected "a mount base containing the home directory" \
+  env AFWS_MOUNT_BASE="${HOME:h}" "$PEERS" --count
+expect_rejected "a mount base that is the home directory" \
+  env AFWS_MOUNT_BASE="$HOME" "$PEERS" --count
+expect_rejected "an arbitrary command as the mount-table source" \
+  env AFWS_MOUNT_COMMAND='touch /tmp/afws-should-not-exist' "$PEERS" --count
+[[ ! -e /tmp/afws-should-not-exist ]] || fail "AFWS_MOUNT_COMMAND ran an arbitrary command"
+
+# The two accepted shapes still work.
+AFWS_MOUNT_COMMAND=mount "$PEERS" --count >/dev/null || fail "'mount' was rejected as the mount-table source"
+: > "${SANDBOX}/empty-table"
+AFWS_MOUNT_COMMAND="cat ${SANDBOX}/empty-table" "$PEERS" --count >/dev/null || \
+  fail "'cat FILE' was rejected as the mount-table source"
+
 # --- launchers: dry run ---------------------------------------------------
 
 reset_state
@@ -477,6 +554,38 @@ custom_marker="$(AFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
 passthrough="$("$SHELL_WRAPPER" /bin/sh -c 'echo passthrough-ok' 2>/dev/null)"
 [[ "$passthrough" == passthrough-ok ]] || fail "the shell wrapper did not fall back to a transparent shell"
 
+# AFWS_SHELL exists for unusual setups, but a value that cannot be executed
+# must not break every command in the session.
+fallback="$(AFWS_SHELL=/nonexistent/shell "$SHELL_WRAPPER" 'echo fell-back' 2>/dev/null)"
+[[ "$fallback" == fell-back ]] || fail "the shell wrapper did not fall back from an unusable AFWS_SHELL"
+
+# --- releasing shared connections ----------------------------------------
+
+if command -v python3 >/dev/null 2>&1; then
+  reset_state
+  mkdir -p "${AFWS_STATE_DIR}/control"
+  orphan_socket="${AFWS_STATE_DIR}/control/example-workstation.sock"
+  python3 -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$orphan_socket" ||
+    fail "could not create a test socket"
+
+  : > "$FAKE_MOUNTS"
+  connection_list="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --list)"
+  [[ "$connection_list" == *"shared SSH connection to example-workstation"* ]] || \
+    fail "afws-umount --list did not show a shared connection"
+
+  connection_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
+  [[ "$connection_plan" == *"Would close the shared SSH connection to example-workstation"* ]] || \
+    fail "afws-umount --orphaned did not offer to close an unused connection"
+
+  write_record fws-holder claude "$$" example-workstation /remote/project "$(date +%s)"
+  held_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" --orphaned --dry-run)"
+  [[ "$held_plan" != *"Would close the shared SSH connection"* ]] || \
+    fail "afws-umount --orphaned offered to close a connection a live session is using"
+
+  reset_state
+fi
+
 # --- afws-lock ------------------------------------------------------------
 
 lock_plan="$("$LOCK" acquire gpu0 --host example-workstation --dry-run)"
@@ -519,6 +628,9 @@ run_remote_lock() {
 }
 
 run_remote_lock acquire gpu0 session-a 0 >/dev/null || fail "the remote lock could not be acquired"
+lock_base_mode="$(stat -f '%Sp' "$LOCK_BASE")"
+[[ "$lock_base_mode" == drwx------ ]] || \
+  fail "the remote lock root is not owner-only (${lock_base_mode}); it is on a shared machine"
 
 held_status=0
 run_remote_lock acquire gpu0 session-b 0 >/dev/null || held_status=$?
