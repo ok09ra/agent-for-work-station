@@ -121,14 +121,14 @@ This applies to what you type. Claude itself is instructed to use
 ## Local material and remote compute in one session
 
 The project is remote, but what you are working *from* is often local: papers, a
-notes directory, a scratch analysis. Most of the time you do not have to arrange
-anything: both sides are ordinary paths on this Mac, shell commands are not
-scoped to the workspace, and Claude Code takes `/add-dir` mid-session for its
-file tools. Naming the directory in the conversation is enough.
+notes directory, a scratch analysis. Usually nothing has to be arranged. Both
+sides are ordinary paths on this Mac, shell commands are not scoped to the
+workspace, and the file tools take an absolute path outside it, so naming the
+path in the conversation is enough.
 
-`AFWS_ADD_DIR` is for the cases where that is not enough — the same directories
-every session, or an agent that must write to a local one as well. It takes a
-colon-separated list:
+`AFWS_ADD_DIR` is for the cases where it is not: an agent that must *write* to a
+local directory, or skills and commands living in a local directory that have to
+be loaded. It takes a colon-separated list:
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \

@@ -105,27 +105,22 @@ codexfws  my-workstation /remote/path/to/project   # Codex CLI
 With no arguments either launcher asks for the two values, which keeps them out
 of your shell history. A password or key passphrase is asked for once, here.
 
-**Bring local material in** — papers, notes, a scratch analysis. Usually just
-say so once you are in the session:
+**Bring local material in** — papers, notes, a scratch analysis. Name the path:
 
-> Read the notes in ~/Documents/papers and compare them with what the pipeline
-> here actually does.
+> Read ~/Documents/papers/method.md and compare it with what the pipeline here
+> actually does.
 
-Nothing has to be declared beforehand: the remote project and your local
-directories are all ordinary paths on this Mac, shell commands are not scoped to
-the workspace, and Claude Code takes `/add-dir` mid-session for its file tools.
-Moving something between the two sides is a plain `cp`.
-
-`AFWS_ADD_DIR` is for when that gets repetitive, or when the agent must *write*
-to a local directory as well:
+Nothing has to be declared beforehand. Both sides are ordinary paths on this Mac,
+shell commands are not scoped to the workspace, and the file tools take an
+absolute path outside it. `AFWS_ADD_DIR` exists for the two cases where that is
+not enough: an agent that must *write* to a local directory — under `codexfws`
+the only way, since its sandbox is decided at launch — and skills or commands
+that live in a local directory and have to be loaded.
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
   claudefws my-workstation /remote/path/to/project
 ```
-
-Under `codexfws` it is the only way to write outside the workspace, because
-Codex's sandbox is set when the session starts.
 
 **Run something on the workstation.** Inside a session the host and directory
 come from the environment:
@@ -276,7 +271,7 @@ is exposed, for how long, and how easily a mistake reaches it.
 | Leaving a shared SSH connection open | A pre-authenticated channel any process of your user can reuse without a password. A session killed with `SIGKILL` never closes it | It expires after `AFWS_CONTROL_PERSIST` seconds (600). `afws-umount --orphaned` closes one nothing is using; `afws-doctor` reports one |
 | `AFWS_PERMISSION_MODE=bypassPermissions` | Every write in a session lands on the remote host, so there is no local-only blast radius to fall back on | `manual` or `plan` for sensitive work; `auto` is the default |
 | An `allow` rule with a `*` before the end of the command | `*` spans spaces, so the rule also approves options inserted at that point. A rule containing `;` or a pipe approves a whole compound command | Name the exact value, or put `*` only after the subcommand. Never allowlist a compound command |
-| `AFWS_ADD_DIR` pointing at something sensitive | Those directories become readable, and for Codex writable, by the session — and anything read reaches the model | Name the specific reference directories. Never `~`, `~/.ssh` or `~/Library` |
+| `AFWS_ADD_DIR` pointing at something sensitive | Those directories become writable by the session, and anything read reaches the model whether or not it is named | Name the specific reference directories. Never `~`, `~/.ssh` or `~/Library` |
 | Reading data that must not leave the machine | Mounting changes nothing: a file the agent reads is a file the model is shown | Do not mount it |
 | `afws-lock steal` | Takes a lock someone else holds, which is how two jobs end up on one GPU | Ask the holder first. A lock held for hours is normal for a long job |
 | `afws-umount --force` | `diskutil unmount force` on a mount another session may be writing in | Check `afws-umount --list` first; force only when the holder is really gone |
