@@ -1,0 +1,332 @@
+#!/bin/zsh
+
+set -eu
+
+# zselect is a zsh builtin, so waiting never depends on an external sleep being
+# available. It returns non-zero when it simply times out, which is the normal
+# case here.
+zmodload zsh/zselect 2>/dev/null || true
+
+pause_seconds() {
+  if zmodload -e zsh/zselect; then
+    zselect -t $(( $1 * 100 )) 2>/dev/null || true
+  else
+    command sleep "$1" 2>/dev/null || true
+  fi
+}
+
+readonly DEFAULT_REMOTE_BASE="~/.claudefws-locks"
+remote_base="${CLAUDEFWS_REMOTE_LOCK_DIR:-$DEFAULT_REMOTE_BASE}"
+ssh_host="${CLAUDEFWS_SSH_HOST-}"
+lock_name=""
+wait_seconds=0
+ttl_seconds="${CLAUDEFWS_LOCK_TTL:-7200}"
+dry_run=0
+action=""
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  claudefws-lock acquire NAME [--host SSH_CONFIG_HOST] [--wait SECONDS] [--ttl SECONDS]"
+  print -r -- "  claudefws-lock release NAME [--host SSH_CONFIG_HOST]"
+  print -r -- "  claudefws-lock status  [NAME] [--host SSH_CONFIG_HOST]"
+  print -r -- "  claudefws-lock steal   NAME [--host SSH_CONFIG_HOST]"
+  print -r -- ""
+  print -r -- "Claims an exclusive resource on the remote workstation so that several"
+  print -r -- "Claude sessions do not use it at the same time. A lock is a directory"
+  print -r -- "created atomically on the remote host; nothing is written inside the"
+  print -r -- "project tree."
+  print -r -- ""
+  print -r -- "Options:"
+  print -r -- "  --host HOST     SSH config host (default: CLAUDEFWS_SSH_HOST)"
+  print -r -- "  --wait SECONDS  Retry acquire until the lock is free or the time runs out"
+  print -r -- "  --ttl SECONDS   Mark the lock stale after this long (default: 7200)"
+  print -r -- "  -n, --dry-run   Print the planned SSH command and remote script only"
+  print -r -- ""
+  print -r -- "Exit status: 0 success, 2 usage error, 3 lock held, 4 refused"
+  print -r -- ""
+  print -r -- "Environment:"
+  print -r -- "  CLAUDEFWS_SESSION_NAME     Recorded as the lock holder"
+  print -r -- "  CLAUDEFWS_REMOTE_LOCK_DIR  Remote lock root (default: ~/.claudefws-locks)"
+}
+
+die() {
+  print -u2 -r -- "claudefws-lock: $*"
+  exit 2
+}
+
+if (( $# == 0 )); then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  acquire|release|status|steal)
+    action="$1"
+    shift
+    ;;
+  *)
+    die "unknown action: $1 (expected acquire, release, status, or steal)"
+    ;;
+esac
+
+if (( $# > 0 )) && [[ "$1" != -* ]]; then
+  lock_name="$1"
+  shift
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --host)
+      (( $# >= 2 )) || die "--host requires an SSH config host name"
+      ssh_host="$2"
+      shift 2
+      ;;
+    --wait)
+      (( $# >= 2 )) || die "--wait requires a number of seconds"
+      wait_seconds="$2"
+      shift 2
+      ;;
+    --ttl)
+      (( $# >= 2 )) || die "--ttl requires a number of seconds"
+      ttl_seconds="$2"
+      shift 2
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+case "$ssh_host" in
+  '')
+    die "no SSH host given and CLAUDEFWS_SSH_HOST is not set; pass --host"
+    ;;
+  -*|*[!A-Za-z0-9._-]*)
+    die "invalid SSH config host name"
+    ;;
+esac
+
+if [[ "$action" != status && -z "$lock_name" ]]; then
+  die "${action} requires a lock name"
+fi
+
+if [[ -n "$lock_name" ]]; then
+  case "$lock_name" in
+    -*|*[!A-Za-z0-9._-]*)
+      die "lock name may contain only letters, numbers, '.', '_', and '-'"
+      ;;
+  esac
+fi
+
+case "$wait_seconds" in
+  ''|*[!0-9]*) die "--wait must be a whole number of seconds" ;;
+esac
+
+case "$ttl_seconds" in
+  ''|*[!0-9]*) die "--ttl must be a whole number of seconds" ;;
+esac
+
+if [[ "$remote_base" != "$DEFAULT_REMOTE_BASE" && "$remote_base" != /* ]]; then
+  die "CLAUDEFWS_REMOTE_LOCK_DIR must be an absolute remote path"
+fi
+
+if [[ "$remote_base" == *[[:cntrl:]]* ]]; then
+  die "CLAUDEFWS_REMOTE_LOCK_DIR must not contain control characters"
+fi
+
+holder="${CLAUDEFWS_SESSION_NAME:-${USER:-unknown}@$(hostname -s 2>/dev/null || print -r -- localhost)}"
+case "$holder" in
+  *[!A-Za-z0-9._@-]*)
+    holder="unnamed-session"
+    ;;
+esac
+
+# --- remote scripts -------------------------------------------------------
+# Sent over standard input, so the local shell never has to nest quotes.
+# Positional arguments: $1 lock name, $2 holder, $3 ttl, $4 remote base,
+# $5 force flag.
+
+readonly PRELUDE='set -eu
+lock_name=$1
+holder=$2
+ttl=$3
+base=$4
+force=$5
+case $base in
+  "~/"*) base=$HOME/${base#"~/"} ;;
+esac
+'
+
+readonly ACQUIRE_SCRIPT='mkdir -p "$base"
+chmod 700 "$base" 2>/dev/null || true
+lock=$base/$lock_name
+if mkdir "$lock" 2>/dev/null; then
+  {
+    echo "holder=$holder"
+    echo "acquired_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "acquired_epoch=$(date +%s)"
+    echo "ttl=$ttl"
+  } > "$lock/owner"
+  echo "acquired $lock_name by $holder"
+  exit 0
+fi
+echo "held $lock_name"
+cat "$lock/owner" 2>/dev/null || true
+exit 3
+'
+
+readonly RELEASE_SCRIPT='lock=$base/$lock_name
+if [ ! -d "$lock" ]; then
+  echo "not held $lock_name"
+  exit 0
+fi
+current=
+if [ -f "$lock/owner" ]; then
+  while IFS= read -r line; do
+    case $line in
+      holder=*) current=${line#holder=} ;;
+    esac
+  done < "$lock/owner"
+fi
+if [ "$force" != 1 ] && [ -n "$current" ] && [ "$current" != "$holder" ]; then
+  echo "refusing to release $lock_name held by $current"
+  exit 4
+fi
+rm -f "$lock/owner"
+rmdir "$lock"
+if [ "$force" = 1 ] && [ -n "$current" ] && [ "$current" != "$holder" ]; then
+  echo "stole $lock_name from $current"
+else
+  echo "released $lock_name"
+fi
+exit 0
+'
+
+readonly STATUS_SCRIPT='if [ ! -d "$base" ]; then
+  echo "no locks on this host"
+  exit 0
+fi
+now=$(date +%s)
+found=0
+for lock in "$base"/*; do
+  [ -d "$lock" ] || continue
+  name=${lock##*/}
+  if [ -n "$lock_name" ] && [ "$name" != "$lock_name" ]; then
+    continue
+  fi
+  found=1
+  current=
+  acquired_at=
+  acquired_epoch=0
+  lock_ttl=0
+  if [ -f "$lock/owner" ]; then
+    while IFS= read -r line; do
+      case $line in
+        holder=*) current=${line#holder=} ;;
+        acquired_at=*) acquired_at=${line#acquired_at=} ;;
+        acquired_epoch=*) acquired_epoch=${line#acquired_epoch=} ;;
+        ttl=*) lock_ttl=${line#ttl=} ;;
+      esac
+    done < "$lock/owner"
+  fi
+  age=$((now - acquired_epoch))
+  state=held
+  if [ "$lock_ttl" -gt 0 ] && [ "$age" -gt "$lock_ttl" ]; then
+    state=stale
+  fi
+  echo "$state $name holder=$current since=$acquired_at age=${age}s ttl=${lock_ttl}s"
+done
+if [ "$found" = 0 ]; then
+  if [ -n "$lock_name" ]; then
+    echo "free $lock_name"
+  else
+    echo "no locks on this host"
+  fi
+fi
+exit 0
+'
+
+force=0
+case "$action" in
+  acquire) remote_script="${PRELUDE}${ACQUIRE_SCRIPT}" ;;
+  release) remote_script="${PRELUDE}${RELEASE_SCRIPT}" ;;
+  steal)   remote_script="${PRELUDE}${RELEASE_SCRIPT}"; force=1 ;;
+  status)  remote_script="${PRELUDE}${STATUS_SCRIPT}" ;;
+esac
+
+remote_command="bash -s -- ${(q)lock_name} ${(q)holder} ${(q)ttl_seconds} ${(q)remote_base} ${force}"
+
+# Reuse the authenticated connection opened by claudefws when there is one, so
+# a host that requires a password is not asked for it again per command.
+ssh_options=()
+if [[ -n "${CLAUDEFWS_CONTROL_PATH-}" && "${CLAUDEFWS_SSH_HOST-}" == "$ssh_host" ]]; then
+  control_path="$CLAUDEFWS_CONTROL_PATH"
+else
+  control_path="${CLAUDEFWS_STATE_DIR:-${HOME}/.claudefws}/control/${ssh_host}.sock"
+fi
+if [[ -S "$control_path" ]]; then
+  ssh_options=(-S "$control_path")
+fi
+
+if (( dry_run )); then
+  if (( ${#ssh_options} > 0 )); then
+    print -r -- "ssh ${ssh_options} ${ssh_host} ${(q)remote_command}"
+  else
+    print -r -- "ssh ${ssh_host} ${(q)remote_command}"
+  fi
+  print -r -- "--- remote script ---"
+  print -r -- "$remote_script"
+  exit 0
+fi
+
+command -v ssh >/dev/null 2>&1 || die "ssh not found"
+
+run_remote() {
+  local exit_status=0
+
+  set +e
+  printf '%s' "$remote_script" | ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
+  exit_status=$?
+  set -e
+
+  return "$exit_status"
+}
+
+if [[ "$action" == acquire && "$wait_seconds" -gt 0 ]]; then
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    exit_status=0
+    run_remote || exit_status=$?
+
+    if (( exit_status == 0 )); then
+      exit 0
+    fi
+
+    if (( exit_status != 3 )); then
+      exit "$exit_status"
+    fi
+
+    if (( $(date +%s) >= deadline )); then
+      print -u2 -r -- "claudefws-lock: gave up waiting for ${lock_name} after ${wait_seconds}s"
+      exit 3
+    fi
+
+    pause_seconds 5
+  done
+fi
+
+exit_status=0
+run_remote || exit_status=$?
+exit "$exit_status"

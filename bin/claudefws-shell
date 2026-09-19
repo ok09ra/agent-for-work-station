@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# Runs a shell command for a Claude for Work Station session and labels it as
+# having run on this Mac. The workspace is an SSHFS mount, so paths are remote
+# but execution is local; the label is what makes that visible instead of
+# silent. Nothing is blocked: a command that belongs on the workstation is
+# still run here, it just says so.
+#
+# claudefws points CLAUDE_CODE_SHELL_PREFIX at this script for its own sessions.
+
+# Claude Code hands the whole shell script over as a single argument. Anything
+# else means the contract changed, so behave as a transparent shell instead.
+if [ "$#" -ne 1 ]; then
+  exec "$@"
+fi
+
+marker="${CLAUDEFWS_MARKER:-mac}"
+printf '[%s] ' "$marker" >&2
+
+"${CLAUDEFWS_SHELL:-/bin/zsh}" -c "$1"
+command_status=$?
+
+# 127 is "not found here", which inside a session almost always means the
+# command lives on the workstation rather than on this Mac.
+if [ "$command_status" -eq 127 ] && [ -n "${CLAUDEFWS_SSH_HOST-}" ]; then
+  printf '[%s] not found on this Mac. for %s, use: ws-run <command>\n' \
+    "$marker" "$CLAUDEFWS_SSH_HOST" >&2
+fi
+
+exit "$command_status"

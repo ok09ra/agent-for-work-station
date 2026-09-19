@@ -1,0 +1,19 @@
+# Copy only the entries you need into your local SSH config.
+# Never put real connection details or credentials in this repository.
+
+Host example-workstation
+  HostName host.example.invalid
+  User remote-user
+  AddKeysToAgent yes
+  UseKeychain yes
+
+# A second alias for the same machine is useful when you want two Claude
+# sessions with different SSH options, for example a long-lived connection
+# for a background session that watches a training job.
+Host example-workstation-watch
+  HostName host.example.invalid
+  User remote-user
+  AddKeysToAgent yes
+  UseKeychain yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 6

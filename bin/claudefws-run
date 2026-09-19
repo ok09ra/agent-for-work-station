@@ -1,0 +1,130 @@
+#!/bin/zsh
+
+set -eu
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- COMMAND [ARG ...]"
+  print -r -- "  SCRIPT | claudefws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY"
+  print -r -- ""
+  print -r -- "Inside a Claude for Work Station session the host and remote directory"
+  print -r -- "default to CLAUDEFWS_SSH_HOST and CLAUDEFWS_REMOTE_DIR:"
+  print -r -- "  claudefws-run -- COMMAND [ARG ...]"
+}
+
+die() {
+  print -u2 -r -- "claudefws-run: $*"
+  exit 2
+}
+
+if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+# A positional SSH host can never begin with a hyphen, so an option in first
+# position means the session environment should supply the host. No arguments
+# at all is the standard-input script form, which also relies on it.
+if (( $# == 0 )); then
+  if [[ -t 0 ]]; then
+    usage >&2
+    exit 2
+  fi
+  ssh_host="${CLAUDEFWS_SSH_HOST-}"
+  [[ -n "$ssh_host" ]] || die "no SSH host given and CLAUDEFWS_SSH_HOST is not set"
+elif [[ "$1" == -* ]]; then
+  ssh_host="${CLAUDEFWS_SSH_HOST-}"
+  [[ -n "$ssh_host" ]] || die "no SSH host given and CLAUDEFWS_SSH_HOST is not set"
+else
+  ssh_host="$1"
+  shift
+fi
+
+case "$ssh_host" in
+  ''|-*|*[!A-Za-z0-9._-]*)
+    die "invalid SSH config host name"
+    ;;
+esac
+
+remote_cwd="${CLAUDEFWS_REMOTE_DIR-}"
+dry_run=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --cwd)
+      (( $# >= 2 )) || die "--cwd requires a remote directory"
+      remote_cwd="$2"
+      shift 2
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ -z "$remote_cwd" || "$remote_cwd" != /* ]]; then
+  die "--cwd must be an absolute remote path"
+fi
+
+if [[ "$remote_cwd" == *[[:cntrl:]]* ]]; then
+  die "remote path must not contain control characters"
+fi
+
+if [[ "$remote_cwd" == "/" ]]; then
+  die "refusing to run from the remote filesystem root"
+fi
+
+remote_cwd="${remote_cwd%/}"
+remote_path_for_check="/${remote_cwd#/}/"
+if [[ "$remote_path_for_check" == *"/../"* || "$remote_path_for_check" == *"/./"* || "$remote_path_for_check" == *"//"* ]]; then
+  die "use a normalized remote path without '.', '..', or repeated slashes"
+fi
+
+remote_command="cd ${(q)remote_cwd} && exec"
+
+if (( $# == 0 )); then
+  if [[ -t 0 ]]; then
+    usage >&2
+    exit 2
+  fi
+  remote_command+=" bash -s"
+else
+  for argument in "$@"; do
+    remote_command+=" ${(q)argument}"
+  done
+fi
+
+# Reuse the authenticated connection opened by claudefws when there is one, so
+# a host that requires a password is not asked for it again per command.
+ssh_options=()
+if [[ -n "${CLAUDEFWS_CONTROL_PATH-}" && "${CLAUDEFWS_SSH_HOST-}" == "$ssh_host" ]]; then
+  control_path="$CLAUDEFWS_CONTROL_PATH"
+else
+  control_path="${CLAUDEFWS_STATE_DIR:-${HOME}/.claudefws}/control/${ssh_host}.sock"
+fi
+if [[ -S "$control_path" ]]; then
+  ssh_options=(-S "$control_path")
+fi
+
+if (( dry_run )); then
+  if (( ${#ssh_options} > 0 )); then
+    print -r -- "ssh ${ssh_options} ${ssh_host} ${(q)remote_command}"
+  else
+    print -r -- "ssh ${ssh_host} ${(q)remote_command}"
+  fi
+  exit 0
+fi
+
+exec ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
