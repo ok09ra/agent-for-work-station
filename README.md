@@ -131,15 +131,24 @@ Codex's sandbox is set when the session starts.
 come from the environment:
 
 ```zsh
-afws-run -- nvidia-smi
-afws-run -- python train.py
-afws-run -- sh -c 'ls *.log | wc -l'     # shell syntax needs a remote shell
+afws-run nvidia-smi
+afws-run python train.py
+afws-run sh -c 'ls *.log | wc -l'      # shell syntax needs a remote shell
 printf 'set -eu\npytest -q\n' | afws-run   # a whole script
 ```
 
-Claude Code's `!` escape runs on your Mac, not on the workstation. A `claudefws`
-session labels those `[mac]` so it is visible; prefix with `afws-run --` when you
-meant the workstation.
+Claude Code's `!` escape runs on your Mac, not on the workstation, so `!nvidia-smi`
+fails here and `!python train.py` quietly uses the wrong interpreter. A `claudefws`
+session labels everything it runs locally `[mac]` so that is visible. Putting
+`afws-run` in front is the whole difference:
+
+```
+!nvidia-smi           → [mac] command not found
+!afws-run nvidia-smi  → the workstation's GPU
+```
+
+Outside a session, name the host and the directory:
+`afws-run my-workstation --cwd /remote/path -- nvidia-smi`.
 
 **See who else is working**, and take turns on a GPU or a shared build
 directory:

@@ -100,13 +100,21 @@ AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
 **ワークステーションで何かを実行する。** セッション内では接続名とディレクトリが環境変数から入ります。
 
 ```zsh
-afws-run -- nvidia-smi
-afws-run -- python train.py
-afws-run -- sh -c 'ls *.log | wc -l'     # シェル構文にはリモートシェルが必要
+afws-run nvidia-smi
+afws-run python train.py
+afws-run sh -c 'ls *.log | wc -l'      # シェル構文にはリモートシェルが必要
 printf 'set -eu\npytest -q\n' | afws-run   # スクリプトまるごと
 ```
 
-Claude Codeの`!`はワークステーションではなく**Macで**実行されます。`claudefws`のセッションはそれに`[mac]`の印を付けて可視化します。ワークステーションで動かすつもりだったなら`afws-run --`を前に付けてください。
+Claude Codeの`!`はワークステーションではなく**Macで**実行されます。`!nvidia-smi`はここでは失敗し、`!python train.py`は黙って間違ったインタプリタで動きます。`claudefws`のセッションはローカル実行に`[mac]`の印を付けて可視化します。違いは`afws-run`を前に置くかどうかだけです。
+
+```
+!nvidia-smi           → [mac] command not found
+!afws-run nvidia-smi  → ワークステーションのGPU
+```
+
+セッション外では接続名とディレクトリを指定します。
+`afws-run my-workstation --cwd /remote/path -- nvidia-smi`
 
 **他に誰が作業しているかを見る。** GPUや共有ビルドディレクトリは順番に使います。
 

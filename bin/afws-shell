@@ -31,7 +31,7 @@ command_status=$?
 # 127 is "not found here", which inside a session almost always means the
 # command lives on the workstation rather than on this Mac.
 if [ "$command_status" -eq 127 ] && [ -n "${AFWS_SSH_HOST-}" ]; then
-  printf '[%s] not found on this Mac. for %s, use: afws-run -- <command>\n' \
+  printf '[%s] not found on this Mac. for %s, use: afws-run <command>\n' \
     "$marker" "$AFWS_SSH_HOST" >&2
 fi
 

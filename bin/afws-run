@@ -25,9 +25,12 @@ usage() {
   print -r -- "  SCRIPT | afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY"
   print -r -- ""
   print -r -- "Inside a session started by claudefws or codexfws the host and remote"
-  print -r -- "directory come from the environment, so both can be omitted:"
-  print -r -- "  afws-run -- COMMAND [ARG ...]"
+  print -r -- "directory come from the environment, so only the command is needed:"
+  print -r -- "  afws-run COMMAND [ARG ...]"
   print -r -- "  SCRIPT | afws-run"
+  print -r -- ""
+  print -r -- "Short enough to type after Claude Code'\''s '\''!'\'', which otherwise runs on"
+  print -r -- "this Mac:  !afws-run nvidia-smi"
   print -r -- ""
   print -r -- "Arguments are passed through literally, so shell metacharacters are not"
   print -r -- "interpreted on the remote host. Wrap a pipeline or a redirect in 'sh -c'"
@@ -39,9 +42,30 @@ if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
   exit 0
 fi
 
-# A positional SSH host can never begin with a hyphen, so an option in first
-# position means the session environment should supply the host. No arguments
-# at all is the standard-input script form, which relies on it too.
+# Two forms. Outside a session the host is positional and the command follows
+# a '--'. Inside one, where AFWS_SSH_HOST and AFWS_REMOTE_DIR are already set,
+# everything given is the remote command, so 'afws-run nvidia-smi' is enough --
+# short enough to type after Claude Code's '!'.
+#
+# The first argument is the host when it cannot be a command: there is no
+# session to take the host from, or --cwd is being given, or it is spelled
+# exactly like the session's own host. A leading '--' forces the command
+# reading either way.
+takes_positional_host() {
+  local argument
+
+  [[ -n "${AFWS_SSH_HOST-}" ]] || return 0
+  [[ "$1" != -* ]] || return 1
+  [[ "$1" != "$AFWS_SSH_HOST" ]] || return 0
+
+  for argument in "$@"; do
+    [[ "$argument" == "--" ]] && return 1
+    [[ "$argument" == "--cwd" ]] && return 0
+  done
+
+  return 1
+}
+
 if (( $# == 0 )); then
   if [[ -t 0 ]]; then
     usage >&2
@@ -49,12 +73,12 @@ if (( $# == 0 )); then
   fi
   ssh_host="${AFWS_SSH_HOST-}"
   [[ -n "$ssh_host" ]] || afws_die "no SSH host given and AFWS_SSH_HOST is not set"
-elif [[ "$1" == -* ]]; then
-  ssh_host="${AFWS_SSH_HOST-}"
-  [[ -n "$ssh_host" ]] || afws_die "no SSH host given and AFWS_SSH_HOST is not set"
-else
+elif takes_positional_host "$@"; then
   ssh_host="$1"
   shift
+else
+  ssh_host="${AFWS_SSH_HOST-}"
+  [[ -n "$ssh_host" ]] || afws_die "no SSH host given and AFWS_SSH_HOST is not set"
 fi
 
 afws_validate_host "$ssh_host"

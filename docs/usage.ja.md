@@ -41,11 +41,14 @@ claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY --model MODEL_NAME
 afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
 ```
 
-`claudefws`から起動したセッション内では、接続名とリモートディレクトリが環境変数に入っているため、どちらも省略できます。
+どちらのランチャーから起動したセッション内でも、接続名とリモートディレクトリは環境変数に入っているので、**渡したものすべてがリモートコマンド**になります。
 
 ```zsh
-afws-run -- nvidia-smi
+afws-run nvidia-smi
+afws-run python train.py
 ```
+
+これはClaude Codeの`!`の後に打つのに十分短く、それが狙いです。`!nvidia-smi`はMacで動きますが、`!afws-run nvidia-smi`はワークステーションに届きます。先頭の`--`も引き続き使えますし、接続名を明示すればセッション内からでもそのホストを指定できます。
 
 標準入力からスクリプトを渡すこともできます。
 

@@ -471,6 +471,37 @@ environment_stdin="$(print -r -- 'echo remote-script' | \
 [[ "$environment_stdin" == *"bash\\ -s"* ]] || \
   fail "afws-run did not accept a piped script using the session environment"
 
+# Inside a session everything given is the remote command, so no '--' and no
+# host: short enough to type after Claude Code's '!'.
+short_form="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run nvidia-smi)"
+[[ "$short_form" == ssh\ example-workstation* ]] || fail "afws-run did not accept the short form"
+[[ "$short_form" == *nvidia-smi* ]] || fail "afws-run lost the command in the short form"
+
+short_args="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run python train.py)"
+[[ "$short_args" == *"python\\ train.py"* ]] || fail "afws-run lost an argument in the short form"
+
+# A command spelled like a host must not be mistaken for one, and a real host
+# must still be addressable from inside a session.
+other_host="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" other-workstation --cwd /elsewhere --dry-run -- pwd)"
+[[ "$other_host" == ssh\ other-workstation* ]] || \
+  fail "afws-run could not address another host from inside a session"
+
+own_host="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" example-workstation --dry-run -- pwd)"
+[[ "$own_host" == ssh\ example-workstation* ]] || \
+  fail "afws-run rejected its own host given explicitly"
+
+dashed="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run -- nvidia-smi)"
+[[ "$dashed" == ssh\ example-workstation* ]] || fail "afws-run rejected the short form with a leading --"
+
+# Outside a session the host is still positional and required.
+expect_rejected "a bare command with no session environment" \
+  env -u AFWS_SSH_HOST "$RUNNER" --dry-run nvidia-smi
+
 expect_rejected "the remote filesystem root" "$RUNNER" example-workstation --cwd / --dry-run -- pwd
 expect_rejected "a control character in the remote path" \
   "$RUNNER" example-workstation --cwd $'/remote/project\nsecond' --dry-run -- pwd

@@ -171,7 +171,7 @@ afws_warn_about_home_workspace "$local_workspace" claude
 
 # --- session instructions -------------------------------------------------
 
-remote_runner="afws-run ${ssh_host} --cwd ${(q)remote_dir}"
+remote_runner="afws-run"
 system_prompt="This is an agent-for-work-station session backed by an SSHFS mount.
 Session name: ${session_name}
 SSH config host: ${ssh_host}
@@ -182,7 +182,7 @@ Operating rules:
 - Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
 - An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
 - Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
-- Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: ${remote_runner} -- COMMAND ARG...
+- Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: ${remote_runner} COMMAND ARG...
 - To send a shell script through standard input, pipe it to: ${remote_runner}
 - Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
 - Show the remote command and its relevant stdout and stderr to the user.

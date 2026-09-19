@@ -41,11 +41,14 @@ Use the normal argument form:
 afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- nvidia-smi
 ```
 
-Inside a session started by `claudefws`, the host and remote directory are already in the environment, so both can be omitted:
+Inside a session started by either launcher, the host and remote directory are already in the environment, so everything you give is the remote command:
 
 ```zsh
-afws-run -- nvidia-smi
+afws-run nvidia-smi
+afws-run python train.py
 ```
+
+That is short enough to type after Claude Code's `!`, which is the point: `!afws-run nvidia-smi` reaches the workstation where `!nvidia-smi` would run on the Mac. A leading `--` still works, and naming a host explicitly still addresses that host even from inside a session.
 
 You can also send a script through standard input:
 
