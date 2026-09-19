@@ -363,10 +363,15 @@ afws_warn_about_home_workspace() {
   [[ -n "${AFWS_ALLOW_HOME_MOUNT-}" ]] && return 0
   [[ -d "$workspace" ]] || return 0
 
+  # .claude and .codex are normal in a project, alongside .git, so they say
+  # nothing about this being a home directory. Only things that belong to a
+  # login account do.
   home_signals=()
   [[ -e "${workspace}/.ssh" ]] && home_signals+=(.ssh)
-  [[ -e "${workspace}/.claude" ]] && home_signals+=(.claude)
-  [[ -e "${workspace}/.codex" ]] && home_signals+=(.codex)
+  [[ -e "${workspace}/.zshrc" ]] && home_signals+=(.zshrc)
+  [[ -e "${workspace}/.bashrc" ]] && home_signals+=(.bashrc)
+  [[ -e "${workspace}/.bash_profile" ]] && home_signals+=(.bash_profile)
+  [[ -e "${workspace}/.profile" ]] && home_signals+=(.profile)
   (( ${#home_signals} > 0 )) || return 0
 
   print -u2 -r -- ""

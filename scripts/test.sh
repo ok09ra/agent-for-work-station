@@ -375,8 +375,13 @@ print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev
 [[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" == "" ]] || \
   fail "a plain project workspace was reported as a home directory"
 
-mkdir -p "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude"
+# A project keeps its own .claude next to .git, so that is not a home signal.
+mkdir -p "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
 print -r -- '{"permissions":{"allow":[]}}' > "${FAKE_ROOT}/.claude/settings.json"
+[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" == "" ]] || \
+  fail "a project with its own .claude was mistaken for a home directory"
+
+mkdir -p "${FAKE_ROOT}/.ssh"
 
 home_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
   "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
@@ -399,7 +404,7 @@ codex_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
 [[ "$codex_warning" != *"Claude Code loads"* ]] || \
   fail "codexfws claimed Claude Code would load the settings file"
 
-rm -rf "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude"
+rm -rf "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
 
 print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
