@@ -112,10 +112,10 @@ afws-run sh -c 'ls *.log | wc -l'            # シェル構文にはリモート
 printf 'set -eu\npytest -q\n' | afws-run     # スクリプトまるごと
 ```
 
-これは**自分で打つとき**に効きます。Claude Codeの`!`はMacで動くので、`!nvidia-smi`はここで失敗し、`!python train.py`は黙って間違ったインタプリタで動きます。`claudefws`のセッションはローカル実行に`[mac]`の印を付けて可視化し、違いは`afws-run`を前に置くかどうかだけです。
+これは**自分で打つとき**に効きます。Claude Codeの`!`はMacで動くので、`!nvidia-smi`はここで失敗し、`!python train.py`は黙って間違ったインタプリタで動きます。`claudefws`のセッションはローカル実行に`[local]`の印を付けて可視化し、違いは`afws-run`を前に置くかどうかだけです。
 
 ```
-!nvidia-smi           → [mac] command not found
+!nvidia-smi           → [local] command not found
 !afws-run nvidia-smi  → ワークステーションのGPU
 ```
 
@@ -180,7 +180,7 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `afws-lock` | リモートの排他資源を確保し、複数セッションの衝突を防ぐ |
 | `afws-umount` | 残されたマウントや接続を解放する |
 | `afws-doctor` | 前提条件を確認する |
-| `afws-shell` | ローカル実行に`[mac]`の印を付ける。`claudefws`が使うもので、手で実行しない |
+| `afws-shell` | ローカル実行に`[local]`の印を付ける。`claudefws`が使うもので、手で実行しない |
 
 配管は共通です。`afws-run`はエージェントごとに分かれておらず1つだけで、`afws-peers`は両方のセッションを一覧します。共通部分は`lib/afws-common.zsh`にあります。
 

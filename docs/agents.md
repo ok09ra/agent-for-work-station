@@ -14,7 +14,7 @@ the workstation — the mount, the shared SSH connection, the registry, the lock
 | Session name the agent itself knows | yes, via `--name` | no |
 | Status column in `afws-peers` (`busy` / `idle` / `waiting`) | yes | no, shows `-` |
 | Messaged by name from another session | yes, `SendMessage` | no |
-| Locally-run shell commands labelled `[mac]` | yes | no |
+| Locally-run shell commands labelled `[local]` | yes | no |
 | Background session (`--bg`) | yes | no |
 | Extra local directories (`AFWS_ADD_DIR`) | yes | yes |
 
@@ -51,7 +51,7 @@ measured against Codex CLI 0.154.0:
   way to set the name at launch there is nothing to address. When Codex CLI
   gains a name flag, this becomes a small change.
 - **No shell wrapper.** Claude Code runs shell commands through
-  `CLAUDE_CODE_SHELL_PREFIX`, which is how `[mac]` gets attached. Codex CLI has
+  `CLAUDE_CODE_SHELL_PREFIX`, which is how `[local]` gets attached. Codex CLI has
   no equivalent, so in a Codex session nothing marks a command as having run on
   the Mac. The session instructions say so in words instead.
 

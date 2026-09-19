@@ -154,11 +154,11 @@ printf 'set -eu\npytest -q\n' | afws-run     # a whole script
 
 This matters for what you type yourself. Claude Code's `!` runs on your Mac, so
 `!nvidia-smi` fails here and `!python train.py` quietly uses the wrong
-interpreter. A `claudefws` session labels everything it runs locally `[mac]` so
+interpreter. A `claudefws` session labels everything it runs locally `[local]` so
 that is visible, and `afws-run` in front is the whole difference:
 
 ```
-!nvidia-smi           → [mac] command not found
+!nvidia-smi           → [local] command not found
 !afws-run nvidia-smi  → the workstation's GPU
 ```
 
@@ -242,7 +242,7 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `afws-lock` | Claim an exclusive remote resource so two sessions do not collide |
 | `afws-umount` | Release a mount or connection left behind |
 | `afws-doctor` | Check the prerequisites |
-| `afws-shell` | Labels local shell commands `[mac]`; used by `claudefws`, not run by hand |
+| `afws-shell` | Labels local shell commands `[local]`; used by `claudefws`, not run by hand |
 
 The plumbing is shared: one `afws-run`, not one per agent, and `afws-peers` lists
 the sessions of both. `lib/afws-common.zsh` holds what they have in common.

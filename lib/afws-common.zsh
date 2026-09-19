@@ -744,6 +744,14 @@ afws_export_session_environment() {
 # but not on TERM, so a 'kill' would otherwise leave the mount and the
 # authenticated connection behind. afws_release_session is safe to call twice.
 afws_install_release_traps() {
+  # zsh runs an EXIT trap set inside a function when that function returns, not
+  # when the shell exits, unless POSIX_TRAPS is set. Without this the release
+  # below runs before the agent has even started: the session record removed,
+  # the shared SSH connection closed, the mount unmounted out from under it,
+  # and the launcher left sitting in $HOME, which the agent then inherits as
+  # its workspace. Set globally on purpose -- it has to outlive this function.
+  setopt POSIX_TRAPS
+
   # A global, not a local: a function defined here is global, so it would not
   # see a local of this one by the time a trap fires.
   afws_peers_command="$1"

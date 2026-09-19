@@ -131,6 +131,14 @@ if (( dry_run )); then
   exit 0
 fi
 
+# A session labels its locally-run shell commands, so the one command that is
+# not local says so too -- otherwise "where did this run" has only one answer
+# on screen and it is the wrong one. Outside a session there is nothing to tell
+# it apart from, so nothing is printed.
+if [[ -z "${AFWS_NO_SHELL_MARKER-}" && -n "${AFWS_SESSION_NAME-}" ]]; then
+  printf '[%s] ' "${AFWS_REMOTE_MARKER:-remote}" >&2
+fi
+
 # Not exec: a connection that had nowhere to ask for a password fails in a way
 # worth explaining, and that can only be said once ssh has come back.
 set +e

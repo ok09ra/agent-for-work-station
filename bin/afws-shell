@@ -15,8 +15,23 @@ if [ "$#" -ne 1 ]; then
   exec "$@"
 fi
 
-marker="${AFWS_MARKER:-mac}"
-printf '[%s] ' "$marker" >&2
+# The shell itself always runs here, whatever the command goes on to do, so
+# this label is about where execution started. A command that hands work to the
+# workstation is labelled by afws-run, which knows that it did.
+marker="${AFWS_MARKER:-local}"
+
+# A command that is nothing but an afws-run invocation runs on the workstation,
+# and afws-run labels it itself. Printing [local] in front of that would label
+# one command twice, leading with the answer that is not the interesting one.
+# Anything more involved keeps the [local] label: the shell did start here, and
+# under-reporting is the failure this labelling exists to prevent.
+case "$1" in
+  afws-run|afws-run\ *|*/afws-run|*/afws-run\ *) marker="" ;;
+esac
+
+if [ -n "$marker" ]; then
+  printf '[%s] ' "$marker" >&2
+fi
 
 # AFWS_SHELL exists so an unusual setup can choose its shell; anything that is
 # not an executable file falls back rather than breaking every command.

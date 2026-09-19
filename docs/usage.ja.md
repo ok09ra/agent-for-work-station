@@ -84,13 +84,16 @@ Claude Codeの`!`は、そのセッション自身のシェル、つまりMac側
 これは見落としやすいので、`claudefws`のセッションはローカルで実行したコマンドに必ず印を付けます。`codexfws`のセッションでは付きません。Codex CLIに印を付ける先のシェルラッパーがないためです。[エージェントごとにできること](agents.ja.md)を参照してください。
 
 ```
-!echo works        → [mac] works
-!python train.py   → [mac] /Library/Frameworks/Python.framework/.../python3
-!nvidia-smi        → [mac] zsh:1: command not found: nvidia-smi
-                     [mac] not found on this Mac. for HOST, use: afws-run -- <command>
+!echo works        → [local] works
+!python train.py   → [local] /Library/Frameworks/Python.framework/.../python3
+!nvidia-smi        → [local] zsh:1: command not found: nvidia-smi
+                     [local] not found on this Mac. for HOST, use: afws-run -- <command>
+!afws-run nvidia-smi → [remote] NVIDIA-SMI ...
 ```
 
-`[mac]`は標準エラーへ出るため、コマンドの出力に混ざりません。また何も禁止しません。ワークステーションで実行すべきコマンドも、ここで実行されたうえで、そう表示されるだけです。2行目はMacにそのコマンドが存在しない場合にのみ出ます。印が不要な場合は、起動時に`AFWS_NO_SHELL_MARKER=1`を指定します。
+「どこで実行されたか」の答えが両方とも画面に出ます。これが要点で、片方しか無い印は役に立ちません。`[remote]`は`afws-run`自身が出すため、ラッパーはその前に割り込みません。一方、`afws-run`を含むだけの複合コマンドには`[local]`が付きます。シェルはここで始まっており、過少申告こそがこの仕組みが防ごうとしている失敗だからです。
+
+印は標準エラーへ出るため、コマンドの出力に混ざりません。また何も禁止しません。ワークステーションで実行すべきコマンドも、ここで実行されたうえで、そう表示されるだけです。「not found on this Mac」の行はMacにそのコマンドが存在しない場合にのみ出ます。印が不要な場合は、起動時に`AFWS_NO_SHELL_MARKER=1`を指定します。語そのものは`AFWS_MARKER`と`AFWS_REMOTE_MARKER`で変えられます。
 
 ワークステーション側で実行する短い形式が`afws-run`です。
 

@@ -89,17 +89,25 @@ quietly do the wrong thing.
 Because that is easy to miss, a `claudefws` session labels every command it runs here. A `codexfws` session cannot: Codex CLI has no shell wrapper to hang the label on, so there nothing marks a command as local. See [what each agent supports](agents.md).
 
 ```
-!echo works        → [mac] works
-!python train.py   → [mac] /Library/Frameworks/Python.framework/.../python3
-!nvidia-smi        → [mac] zsh:1: command not found: nvidia-smi
-                     [mac] not found on this Mac. for HOST, use: afws-run -- <command>
+!echo works        → [local] works
+!python train.py   → [local] /Library/Frameworks/Python.framework/.../python3
+!nvidia-smi        → [local] zsh:1: command not found: nvidia-smi
+                     [local] not found on this Mac. for HOST, use: afws-run -- <command>
+!afws-run nvidia-smi → [remote] NVIDIA-SMI ...
 ```
 
-The `[mac]` label goes to standard error, so it never mixes into a command's
-output, and nothing is blocked — a command that belongs on the workstation still
-runs here, it just says so. The second line appears only when the command does
-not exist on the Mac at all. Set `AFWS_NO_SHELL_MARKER=1` for a launch to
-turn the labelling off.
+Both answers to "where did this run" are on screen, which is the point: the
+label is only useful if the other one exists. `afws-run` prints `[remote]`
+itself, so the wrapper stays out of its way; a command that merely contains an
+`afws-run` somewhere still gets `[local]`, because the shell did start here and
+under-reporting is the failure this labelling exists to prevent.
+
+The labels go to standard error, so they never mix into a command's output, and
+nothing is blocked — a command that belongs on the workstation still runs here,
+it just says so. The "not found on this Mac" line appears only when the command
+does not exist on the Mac at all. Set `AFWS_NO_SHELL_MARKER=1` for a launch to
+turn the labelling off; `AFWS_MARKER` and `AFWS_REMOTE_MARKER` change the two
+words themselves.
 
 `afws-run` is the short form for running something on the workstation instead:
 

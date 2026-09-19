@@ -283,6 +283,26 @@ keep_probe="$(release_probe_for 1)"
 [[ "$keep_probe" == *"Leaving the shared SSH connection"* ]] || \
   fail "AFWS_KEEP_CONTROL_MASTER did not say the connection was left open"
 
+# zsh runs an EXIT trap set inside a function when that function returns, not
+# when the shell exits, unless POSIX_TRAPS is set. Installing the traps from a
+# helper therefore released the session before the agent had started: record
+# removed, connection closed, mount unmounted, and the launcher left in $HOME
+# for the agent to inherit as its workspace.
+trap_order="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+  AFWS_MOUNT_BASE='"$AFWS_MOUNT_BASE"'
+  source '"$LIBRARY"'
+  afws_release_session() { print -r -- "RELEASED"; }
+  afws_session_name=trap-probe afws_ssh_host=h
+  afws_install_release_traps /nonexistent-peers
+  print -r -- "AGENT STARTED"
+')"
+[[ "$trap_order" == "AGENT STARTED
+RELEASED" ]] || \
+  fail "the session was not released exactly once, at the end (${trap_order})"
+
 # zsh runs the EXIT trap on a normal exit and on HUP, but not on TERM, so the
 # signal traps have to be installed alongside it. Both launchers get them from
 # the same place.
@@ -719,6 +739,24 @@ expect_rejected "a missing host with no session environment" "$RUNNER" --dry-run
 expect_rejected "a piped script with no host anywhere" \
   env -u AFWS_SSH_HOST sh -c "print -r -- pwd | '$RUNNER' --dry-run"
 
+# A session labels where a command ran, and afws-run is the one that did not run
+# here. Outside a session there is nothing to tell it apart from.
+remote_marker="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=probe AFWS_SSH_HOST=example-workstation \
+  AFWS_REMOTE_DIR=/remote/project "$RUNNER" -- pwd 2>&1 >/dev/null || true)"
+[[ "$remote_marker" == *'[remote] '* ]] || \
+  fail "afws-run did not say that it ran somewhere else (${remote_marker})"
+
+outside_session="$(PATH="${STUB_BIN}:$PATH" \
+  "$RUNNER" example-workstation --cwd /remote/project -- pwd 2>&1 >/dev/null || true)"
+[[ "$outside_session" != *'[remote]'* ]] || \
+  fail "afws-run labelled itself outside a session, where nothing is labelled"
+
+unlabelled="$(PATH="${STUB_BIN}:$PATH" AFWS_NO_SHELL_MARKER=1 AFWS_SESSION_NAME=probe \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" -- pwd 2>&1 >/dev/null || true)"
+[[ "$unlabelled" != *'[remote]'* ]] || \
+  fail "AFWS_NO_SHELL_MARKER did not turn off the remote label"
+
 # --- shared SSH connection reuse -----------------------------------------
 
 if command -v python3 >/dev/null 2>&1; then
@@ -929,7 +967,7 @@ marker_out="$("$SHELL_WRAPPER" 'echo only-stdout' 2>/dev/null)"
 [[ "$marker_out" == only-stdout ]] || fail "the shell wrapper altered standard output"
 
 marker_err="$("$SHELL_WRAPPER" 'echo ignored' 2>&1 >/dev/null)"
-[[ "$marker_err" == '[mac] ' ]] || fail "the shell wrapper did not label the command on stderr"
+[[ "$marker_err" == '[local] ' ]] || fail "the shell wrapper did not label the command on stderr"
 
 marker_status=0
 "$SHELL_WRAPPER" 'exit 42' >/dev/null 2>&1 || marker_status=$?
@@ -947,6 +985,18 @@ no_hint="$(env -u AFWS_SSH_HOST "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 
 
 custom_marker="$(AFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
 [[ "$custom_marker" == '[laptop] ' ]] || fail "the shell wrapper ignored AFWS_MARKER"
+
+# afws-run labels itself, so the wrapper stepping in front of it would put the
+# less useful of the two answers first.
+deferred="$("$SHELL_WRAPPER" 'afws-run pwd' 2>&1 >/dev/null || true)"
+[[ "$deferred" != *'[local]'* ]] || \
+  fail "the wrapper labelled a command that afws-run labels itself (${deferred})"
+
+# Anything more than a bare afws-run did start here, and saying so matters more
+# than tidiness: under-reporting is what this labelling exists to prevent.
+compound="$("$SHELL_WRAPPER" 'true && afws-run pwd' 2>&1 >/dev/null || true)"
+[[ "$compound" == *'[local]'* ]] || \
+  fail "a command that began locally was not labelled as such (${compound})"
 
 # If the single-argument contract ever changes, the wrapper must not eat the
 # command: it becomes a transparent shell instead.
