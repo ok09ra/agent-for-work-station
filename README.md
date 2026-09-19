@@ -24,41 +24,138 @@ codexfws  SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY   # Codex CLI
 - No real IP addresses, usernames, passwords, or project paths are stored in
   this repository. The supported client operating system is macOS.
 
-## Quick setup
+## Installation
 
-On a clean Mac, prepare the following in order:
+macOS only. Nothing is installed on the workstation.
 
-1. Install the latest stable release from the [official macFUSE website](https://macfuse.github.io/).
-2. Install the macOS SSHFS package linked from the [official macFUSE SSHFS page](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS).
-3. Install at least one agent. Both are optional individually; `afws-doctor`
-   reports which launcher is usable.
+**1. macFUSE and SSHFS.** Install the latest stable release from the
+[macFUSE website](https://macfuse.github.io/), then the macOS SSHFS package
+linked from the [macFUSE SSHFS page](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS).
+macOS may ask you to allow macFUSE in System Settings; follow the official
+instructions and restart if prompted.
 
-   ```zsh
-   curl -fsSL https://claude.ai/install.sh | bash      # Claude Code
-   claude auth login
-   curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
-   ```
+```zsh
+command -v sshfs && sshfs --version
+```
 
-4. Run the installer from the repository root.
+**2. At least one agent.** Install the one you use, or both.
 
-   ```zsh
-   ./scripts/install.sh
-   exec zsh -l
-   afws-doctor
-   ```
+```zsh
+curl -fsSL https://claude.ai/install.sh | bash        # Claude Code
+claude auth login
 
-5. Add a host alias to your local `~/.ssh/config`. Keep real values outside this
-   repository; use the [fictional SSH configuration example](examples/ssh-config.example)
-   as a template.
-6. Start a session. With no arguments either launcher prompts for the SSH host
-   alias and the remote project directory.
+curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
+codex login
+```
 
-   ```zsh
-   claudefws
-   ```
+**3. The commands.** From the repository root:
 
-For SSH authentication, use SSH keys and the macOS Keychain rather than saving a
-password in a file.
+```zsh
+./scripts/install.sh
+exec zsh -l
+```
+
+This copies eight commands into `~/.local/bin` and the shared library into
+`~/.local/lib`, and adds that directory to your login `PATH` if it is not there
+already. It deletes nothing; if an earlier `claudefws` or `codexfws` install is
+present it lists what is left over.
+
+**4. An SSH host alias.** In your local `~/.ssh/config`, using the
+[fictional example](examples/ssh-config.example) as a template. Real values stay
+out of this repository.
+
+```
+Host my-workstation
+  HostName host.example.invalid
+  User remote-user
+  AddKeysToAgent yes
+  UseKeychain yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
+```
+
+Use SSH keys and the macOS Keychain rather than a password in a file. Test the
+alias before going further:
+
+```zsh
+ssh my-workstation
+```
+
+**5. Check.**
+
+```zsh
+afws-doctor                  # prerequisites
+afws-doctor my-workstation   # and your SSH configuration
+```
+
+It is ready when every line reports `[OK]`. `afws-doctor` also tells you which
+launcher is usable, so an agent you did not install is a note rather than a
+failure.
+
+## How to Use
+
+**Start a session** on a remote project directory. Use the project, not the home
+directory — the launcher warns if it looks like a home.
+
+```zsh
+claudefws my-workstation /remote/path/to/project   # Claude Code
+codexfws  my-workstation /remote/path/to/project   # Codex CLI
+```
+
+With no arguments either launcher asks for the two values, which keeps them out
+of your shell history. A password or key passphrase is asked for once, here.
+
+**Bring local material in** — papers, notes, a scratch analysis. Both launchers
+take the same variable.
+
+```zsh
+AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
+  claudefws my-workstation /remote/path/to/project
+```
+
+Inside the session the remote project and those directories are all ordinary
+local paths, so moving something between them is a plain `cp`.
+
+**Run something on the workstation.** Inside a session the host and directory
+come from the environment:
+
+```zsh
+afws-run -- nvidia-smi
+afws-run -- python train.py
+afws-run -- sh -c 'ls *.log | wc -l'     # shell syntax needs a remote shell
+printf 'set -eu\npytest -q\n' | afws-run   # a whole script
+```
+
+Claude Code's `!` escape runs on your Mac, not on the workstation. A `claudefws`
+session labels those `[mac]` so it is visible; prefix with `afws-run --` when you
+meant the workstation.
+
+**See who else is working**, and take turns on a GPU or a shared build
+directory:
+
+```zsh
+afws-peers                  # every session, both agents, with host and directory
+afws-lock acquire gpu0      # claims it, or names the holder
+afws-lock release gpu0
+```
+
+**Ending a session** releases its mount and its shared SSH connection once no
+other session is using them. A background session, or one that was killed,
+leaves its mount behind:
+
+```zsh
+afws-umount --list          # mounts and connections, and who uses each
+afws-umount --orphaned      # release the ones nobody is using
+```
+
+**Preview anything** without mounting, connecting or starting an agent:
+
+```zsh
+claudefws --dry-run my-workstation /remote/path/to/project
+afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
+```
+
+[Usage](docs/usage.md) covers the rest, including every environment variable.
 
 ## Installed commands
 

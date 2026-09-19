@@ -15,36 +15,116 @@ codexfws  SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY   # Codex CLI
 - マウントと接続は、それを使う最後のセッションが終了した時点で解放されます。
 - 実際のIPアドレス、ユーザー名、パスワード、プロジェクトパスはこのリポジトリに保存しません。対象クライアントOSはmacOSのみです。
 
-## 最短の導入手順
+## Installation
 
-何も入っていないMacでは、次の順番で準備します。
+macOS専用です。ワークステーション側には何もインストールしません。
 
-1. [macFUSE公式サイト](https://macfuse.github.io/)から最新の安定版をインストールします。
-2. [macFUSE公式SSHFSページ](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS)からmacOS用SSHFSパッケージをインストールします。
-3. エージェントを少なくとも1つ導入します。両方とも個別に任意で、どちらのランチャーが使えるかは`afws-doctor`が報告します。
+**1. macFUSE と SSHFS。** [macFUSE公式サイト](https://macfuse.github.io/)から最新の安定版を、次に[macFUSE公式SSHFSページ](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS)からmacOS用SSHFSパッケージを導入します。macOSがシステム設定での許可を求めた場合は公式の案内に従い、再起動を求められたら再起動します。
 
-   ```zsh
-   curl -fsSL https://claude.ai/install.sh | bash      # Claude Code
-   claude auth login
-   curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
-   ```
+```zsh
+command -v sshfs && sshfs --version
+```
 
-4. このリポジトリのルートでinstallerを実行します。
+**2. エージェントを少なくとも1つ。** 使うものだけ、あるいは両方。
 
-   ```zsh
-   ./scripts/install.sh
-   exec zsh -l
-   afws-doctor
-   ```
+```zsh
+curl -fsSL https://claude.ai/install.sh | bash        # Claude Code
+claude auth login
 
-5. SSHの接続名をローカルの`~/.ssh/config`に設定します。実値はリポジトリ内へ書かず、[架空のSSH設定例](examples/ssh-config.example)を参考にローカルだけで管理してください。
-6. セッションを起動します。引数を省略すると、どちらのランチャーも接続名とリモートプロジェクトのディレクトリを対話的に尋ねます。
+curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
+codex login
+```
 
-   ```zsh
-   claudefws
-   ```
+**3. コマンド。** リポジトリのルートで実行します。
 
-SSH側はパスワードをファイルへ保存せず、SSH鍵とmacOSのキーチェーンを利用してください。
+```zsh
+./scripts/install.sh
+exec zsh -l
+```
+
+コマンド8本を`~/.local/bin`へ、共有ライブラリを`~/.local/lib`へコピーし、そのディレクトリがログインシェルの`PATH`に無ければ追加します。何も削除しません。旧`claudefws`／`codexfws`の導入物が残っている場合は、残骸として一覧表示するだけです。
+
+**4. SSHの接続名。** ローカルの`~/.ssh/config`に定義します。[架空の設定例](examples/ssh-config.example)を雛形にしてください。実値はこのリポジトリに書きません。
+
+```
+Host my-workstation
+  HostName host.example.invalid
+  User remote-user
+  AddKeysToAgent yes
+  UseKeychain yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
+```
+
+パスワードをファイルに置かず、SSH鍵とmacOSのキーチェーンを使ってください。先に接続名だけ確認します。
+
+```zsh
+ssh my-workstation
+```
+
+**5. 確認。**
+
+```zsh
+afws-doctor                  # 前提条件
+afws-doctor my-workstation   # SSH設定もあわせて
+```
+
+すべての行が`[OK]`になれば準備完了です。`afws-doctor`はどちらのランチャーが使えるかも報告するので、入れていないエージェントは失敗ではなく注記として扱われます。
+
+## How to Use
+
+**セッションを起動**します。指定するのはホームではなくプロジェクトディレクトリです（ホームに見える場合はランチャーが警告します）。
+
+```zsh
+claudefws my-workstation /remote/path/to/project   # Claude Code
+codexfws  my-workstation /remote/path/to/project   # Codex CLI
+```
+
+引数を省略すると2つの値を対話的に尋ねるので、シェル履歴に残りません。パスワードや鍵のパスフレーズを聞かれるのは、ここでの1回だけです。
+
+**ローカルの資料を持ち込む** — 論文、ノート、手元の試し計算。どちらのランチャーも同じ変数を取ります。
+
+```zsh
+AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
+  claudefws my-workstation /remote/path/to/project
+```
+
+セッション内では、リモートのプロジェクトもそれらのディレクトリも**すべてただのローカルパス**になるので、間で何かを移すのは単なる`cp`です。
+
+**ワークステーションで何かを実行する。** セッション内では接続名とディレクトリが環境変数から入ります。
+
+```zsh
+afws-run -- nvidia-smi
+afws-run -- python train.py
+afws-run -- sh -c 'ls *.log | wc -l'     # シェル構文にはリモートシェルが必要
+printf 'set -eu\npytest -q\n' | afws-run   # スクリプトまるごと
+```
+
+Claude Codeの`!`はワークステーションではなく**Macで**実行されます。`claudefws`のセッションはそれに`[mac]`の印を付けて可視化します。ワークステーションで動かすつもりだったなら`afws-run --`を前に付けてください。
+
+**他に誰が作業しているかを見る。** GPUや共有ビルドディレクトリは順番に使います。
+
+```zsh
+afws-peers                  # 全セッション（両エージェント）とホスト・ディレクトリ
+afws-lock acquire gpu0      # 確保する。取れなければ保持者を表示
+afws-lock release gpu0
+```
+
+**セッションを終了**すると、他に使っているセッションがなければマウントと共有SSH接続が解放されます。バックグラウンドセッションや強制終了されたセッションはマウントを残します。
+
+```zsh
+afws-umount --list          # マウントと接続、それぞれの利用者数
+afws-umount --orphaned      # 誰も使っていないものを解放
+```
+
+**何もせずに確認する。** マウントも接続もエージェント起動も行いません。
+
+```zsh
+claudefws --dry-run my-workstation /remote/path/to/project
+afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
+```
+
+残りは[使い方](docs/usage.ja.md)に、環境変数の一覧も含めてあります。
 
 ## インストールされるコマンド
 
