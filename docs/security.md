@@ -79,6 +79,14 @@ that, and both are yours to set:
   the mount is scoped to. The mount is a convenience boundary, not a security
   boundary, as long as that is true.
 
+A launcher says so when it notices: a workspace containing `.ssh`, `.claude` or
+`.codex` is reported as looking like a home directory, naming the settings file
+it pulls in as project settings. It is a warning, not a refusal, because your
+account's permissions still apply either way; `AFWS_ALLOW_HOME_MOUNT=1` silences
+it. And `afws-doctor HOST` reports an agent installed on the workstation when a
+shared connection is already open, because two installations mean two diverging
+sets of permission rules and two versions.
+
 **It does not reduce what the model sees.** A file read through the mount goes
 to the model exactly as it would if the agent ran on the workstation. If some
 data must not leave the machine, the answer is not to mount it.

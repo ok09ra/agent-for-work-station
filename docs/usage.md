@@ -193,6 +193,8 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_CONTROL_MASTER` | Set to any value to authenticate separately for every connection |
 | `AFWS_KEEP_MOUNT` | Set to any value to leave the mount in place when the session ends |
 | `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
+| `AFWS_ALLOW_HOME_MOUNT` | Set to any value to silence the home-directory warning |
+| `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600) |
 | `AFWS_LOCK_TTL` | Seconds after which a lock is reported as stale (default: 7200) |
 
 Inside a running session the launcher also exports `AFWS_SSH_HOST`, `AFWS_REMOTE_DIR`, and `AFWS_LOCAL_WORKSPACE`, which is how `afws-run` and `afws-lock` can be used without repeating the host.

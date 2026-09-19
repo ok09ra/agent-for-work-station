@@ -171,6 +171,8 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_CONTROL_MASTER` | 値を設定すると、接続ごとに個別に認証します |
 | `AFWS_KEEP_MOUNT` | 値を設定すると、セッション終了時にマウントを残します |
 | `AFWS_NO_SHELL_MARKER` | 値を設定すると、ローカル実行への印付けを止めます |
+| `AFWS_ALLOW_HOME_MOUNT` | 値を設定すると、ホームディレクトリの警告を抑止します |
+| `AFWS_CONTROL_PERSIST` | 共有SSH接続が無通信で維持される秒数（既定: 600） |
 | `AFWS_LOCK_TTL` | ロックをstaleと表示するまでの秒数（既定: 7200） |
 
 セッション内では、launcherが`AFWS_SSH_HOST`、`AFWS_REMOTE_DIR`、`AFWS_LOCAL_WORKSPACE`もexportします。これにより`afws-run`と`afws-lock`を接続名なしで使えます。

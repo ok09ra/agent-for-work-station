@@ -340,6 +340,37 @@ for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
     fail "${launcher:t} did not point the workspace at the subdirectory of the reused mount"
 done
 
+# Mounting a home directory is allowed but must say what it costs.
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
+[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" == "" ]] || \
+  fail "a plain project workspace was reported as a home directory"
+
+mkdir -p "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude"
+print -r -- '{"permissions":{"allow":[]}}' > "${FAKE_ROOT}/.claude/settings.json"
+
+home_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
+[[ "$home_warning" == *"looks like a home directory"* ]] || \
+  fail "a workspace containing .ssh and .claude was not flagged as a home directory"
+[[ "$home_warning" == *".claude/settings.json"* ]] || \
+  fail "the home-directory warning did not mention the project settings it pulls in"
+[[ "$home_warning" == *AFWS_ALLOW_HOME_MOUNT* ]] || \
+  fail "the home-directory warning did not say how to silence it"
+
+silenced="$(AFWS_ALLOW_HOME_MOUNT=1 AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
+[[ "$silenced" != *"looks like a home directory"* ]] || \
+  fail "AFWS_ALLOW_HOME_MOUNT did not silence the home-directory warning"
+
+codex_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
+[[ "$codex_warning" == *"looks like a home directory"* ]] || \
+  fail "codexfws did not flag a home directory"
+[[ "$codex_warning" != *"Claude Code loads"* ]] || \
+  fail "codexfws claimed Claude Code would load the settings file"
+
+rm -rf "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude"
+
 print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
 expect_rejected "a mount that would hide another session's mount underneath it" \

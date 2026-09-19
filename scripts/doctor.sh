@@ -127,6 +127,31 @@ if (( $# > 1 )); then
   exit 2
 fi
 
+# An agent installed on the workstation as well as here means two diverging
+# sets of permission rules, histories and versions. This only looks when a
+# shared connection is already open, so it never prompts for a password.
+check_remote_agents() {
+  local ssh_host="$1" socket found
+
+  socket="$(afws_control_socket "$ssh_host")"
+  if ! afws_control_master_is_open "$ssh_host" "$socket"; then
+    note "start a session to also check whether an agent is installed on ${ssh_host}"
+    return 0
+  fi
+
+  found="$(ssh -S "$socket" "$ssh_host" \
+    'for c in claude codex; do command -v $c >/dev/null 2>&1 && printf "%s " "$c"; done' \
+    2>/dev/null)" || found=""
+
+  if [[ -n "$found" ]]; then
+    fail "an agent is installed on ${ssh_host}: ${found}— two installations mean two
+       diverging sets of permission rules and two versions. Running the agent here
+       instead is only a simplification once that one is gone."
+  else
+    pass "no agent is installed on ${ssh_host}; agent state lives only on this Mac"
+  fi
+}
+
 if (( $# == 1 )); then
   ssh_host="$1"
   case "$ssh_host" in
@@ -136,6 +161,7 @@ if (( $# == 1 )); then
     *)
       if ssh -G "$ssh_host" >/dev/null 2>&1; then
         pass "SSH accepts the supplied config host name"
+        (( library_found )) && check_remote_agents "$ssh_host"
       else
         fail "SSH could not resolve the supplied config host name"
       fi

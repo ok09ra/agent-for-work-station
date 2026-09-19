@@ -325,6 +325,48 @@ afws_mount() {
   return 1
 }
 
+# --- workspace shape ------------------------------------------------------
+
+# Mounting a home directory does not grant the agent anything its own account
+# cannot already do, so this warns rather than refuses. What it costs is
+# containment: the agent's own credentials and every other project sit inside
+# the workspace, and a settings file there is read as project settings.
+# afws_warn_about_home_workspace WORKSPACE AGENT
+afws_warn_about_home_workspace() {
+  local workspace="$1" agent="$2" settings
+  local -a home_signals
+
+  [[ -n "${AFWS_ALLOW_HOME_MOUNT-}" ]] && return 0
+  [[ -d "$workspace" ]] || return 0
+
+  home_signals=()
+  [[ -e "${workspace}/.ssh" ]] && home_signals+=(.ssh)
+  [[ -e "${workspace}/.claude" ]] && home_signals+=(.claude)
+  [[ -e "${workspace}/.codex" ]] && home_signals+=(.codex)
+  (( ${#home_signals} > 0 )) || return 0
+
+  print -u2 -r -- ""
+  print -u2 -r -- "${AFWS_PROGRAM}: this workspace looks like a home directory, not a project."
+  print -u2 -r -- "  It contains: ${home_signals}"
+  print -u2 -r -- "  Your account's permissions still apply, so nothing new is reachable, but"
+  print -u2 -r -- "  everything in that home is now inside the agent's workspace: any SSH key,"
+  print -u2 -r -- "  any stored credential, and every other project. A file read there also"
+  print -u2 -r -- "  reaches the model."
+
+  settings="${workspace}/.claude/settings.json"
+  if [[ "$agent" == claude && -f "$settings" ]]; then
+    print -u2 -r -- "  It also contains .claude/settings.json ($(wc -c <"$settings" | tr -d ' ') bytes),"
+    print -u2 -r -- "  which Claude Code loads as this session's project settings, including any"
+    print -u2 -r -- "  permission rules in it."
+  fi
+
+  print -u2 -r -- "  Consider starting on a project directory instead. Set AFWS_ALLOW_HOME_MOUNT=1"
+  print -u2 -r -- "  to silence this."
+  print -u2 -r -- ""
+
+  return 0
+}
+
 # --- session registry -----------------------------------------------------
 # The launchers set these before calling the functions below.
 #   afws_agent afws_session_name afws_ssh_host afws_remote_dir

@@ -151,6 +151,8 @@ see which session it belongs to."
   fi
 fi
 
+afws_warn_about_home_workspace "$local_workspace" codex
+
 # --- session instructions -------------------------------------------------
 
 remote_runner="afws-run ${ssh_host} --cwd ${(q)remote_dir}"
