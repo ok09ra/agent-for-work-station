@@ -118,8 +118,14 @@ This applies to what you type. Claude itself is instructed to use
 ## Local material and remote compute in one session
 
 The project is remote, but what you are working *from* is often local: papers, a
-notes directory, a scratch analysis. `AFWS_ADD_DIR` names those, colon-separated,
-so one session reads them and writes its conclusions into the remote project:
+notes directory, a scratch analysis. Most of the time you do not have to arrange
+anything: both sides are ordinary paths on this Mac, shell commands are not
+scoped to the workspace, and Claude Code takes `/add-dir` mid-session for its
+file tools. Naming the directory in the conversation is enough.
+
+`AFWS_ADD_DIR` is for the cases where that is not enough — the same directories
+every session, or an agent that must write to a local one as well. It takes a
+colon-separated list:
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
@@ -131,8 +137,8 @@ The launcher lists them under `also:` and passes them to Claude Code with
 cost a mount. The session is told they are local reference material: read from
 them, write into the remote project.
 
-Without this, local reading and remote work end up in two sessions with two
-histories, and everything crossing between them is copied by hand.
+Under `codexfws` it is the only way to write outside the workspace, because
+Codex's sandbox is decided when the session starts rather than during it.
 
 Both launchers take the same variable and report the same thing. What they pass
 to the agent differs, because the two agents ask for it differently, but that is

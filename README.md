@@ -105,16 +105,27 @@ codexfws  my-workstation /remote/path/to/project   # Codex CLI
 With no arguments either launcher asks for the two values, which keeps them out
 of your shell history. A password or key passphrase is asked for once, here.
 
-**Bring local material in** — papers, notes, a scratch analysis. Both launchers
-take the same variable.
+**Bring local material in** — papers, notes, a scratch analysis. Usually just
+say so once you are in the session:
+
+> Read the notes in ~/Documents/papers and compare them with what the pipeline
+> here actually does.
+
+Nothing has to be declared beforehand: the remote project and your local
+directories are all ordinary paths on this Mac, shell commands are not scoped to
+the workspace, and Claude Code takes `/add-dir` mid-session for its file tools.
+Moving something between the two sides is a plain `cp`.
+
+`AFWS_ADD_DIR` is for when that gets repetitive, or when the agent must *write*
+to a local directory as well:
 
 ```zsh
 AFWS_ADD_DIR=~/Documents/papers:~/Documents/notes \
   claudefws my-workstation /remote/path/to/project
 ```
 
-Inside the session the remote project and those directories are all ordinary
-local paths, so moving something between them is a plain `cp`.
+Under `codexfws` it is the only way to write outside the workspace, because
+Codex's sandbox is set when the session starts.
 
 **Run something on the workstation.** Inside a session the host and directory
 come from the environment:
