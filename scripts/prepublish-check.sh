@@ -31,8 +31,8 @@ executables=(
   bin/afws-lock
   bin/afws-umount
   bin/afws-shell
+  bin/afws-doctor
   scripts/install.sh
-  scripts/doctor.sh
   scripts/test.sh
   scripts/prepublish-check.sh
 )
@@ -77,8 +77,8 @@ stale_name_pattern+='|CLAUDEFWS'"_"'|CODEXFWS'"_"')'
 # replaces. Everywhere else an old name is a leftover.
 renamed_scope=(lib/afws-common.zsh docs/*.md examples/*
   bin/claudefws bin/codexfws bin/afws-run bin/afws-peers bin/afws-lock
-  bin/afws-umount bin/afws-shell
-  scripts/doctor.sh scripts/test.sh scripts/prepublish-check.sh)
+  bin/afws-umount bin/afws-shell bin/afws-doctor
+  bin/afws-doctor scripts/test.sh scripts/prepublish-check.sh)
 scan "no leftover command or variable names from before the merge" "$stale_name_pattern" $renamed_scope
 
 if find . -path './.git' -prune -o -type l -print | grep -q .; then

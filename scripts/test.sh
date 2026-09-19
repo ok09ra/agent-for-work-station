@@ -76,7 +76,7 @@ for script in \
   "$LOCK" \
   "$UMOUNT" \
   "${REPOSITORY_ROOT}/scripts/install.sh" \
-  "${REPOSITORY_ROOT}/scripts/doctor.sh" \
+  "${REPOSITORY_ROOT}/bin/afws-doctor" \
   "${REPOSITORY_ROOT}/scripts/prepublish-check.sh"; do
   zsh -n "$script" || fail "syntax check failed: ${script:t}"
 done

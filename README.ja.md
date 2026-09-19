@@ -45,16 +45,32 @@ curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
 codex login
 ```
 
-**3. コマンド。** リポジトリのルートで実行します。
+**3. このリポジトリ。** 置き場所は任意です。
+
+```zsh
+git clone https://github.com/ok09ra/agent-for-work-station.git ~/src/agent-for-work-station
+cd ~/src/agent-for-work-station
+```
+
+**4. コマンドを `PATH` に乗せる。** どちらでも動きます。各コマンドは共有ライブラリを自分からの相対位置で見つけます。
+
+*clone を指す* — コピーを作らず、`git pull` だけで更新されます。
+
+```zsh
+echo 'export PATH="$HOME/src/agent-for-work-station/bin:$PATH"' >> ~/.zprofile
+exec zsh -l
+```
+
+*またはコピーを入れる* — `~/.local/bin` へ、ライブラリはその隣の `~/.local/lib` へ。
 
 ```zsh
 ./scripts/install.sh
 exec zsh -l
 ```
 
-コマンド8本が`~/.local/bin`へ、共有ライブラリが`~/.local/lib`へ入り、そのディレクトリがログインシェルの`PATH`に無ければ追加されます。何も削除しません。旧`claudefws`／`codexfws`の導入物は一覧表示するだけです。
+installer は `~/.local/bin` がログインシェルの `PATH` に無ければ追加し、何も削除しません（旧 `claudefws`／`codexfws` の導入物は一覧表示するだけ）。コピーを入れた場合は `git pull` のあとに再インストールが必要です。clone を指す方式では不要です。
 
-**4. SSHの接続名。** `~/.ssh/config`に定義します。実値はこのリポジトリに書きません（[設定例](examples/ssh-config.example)は架空の値です）。
+**5. SSHの接続名。** `~/.ssh/config`に定義します。実値はこのリポジトリに書きません（[設定例](examples/ssh-config.example)は架空の値です）。
 
 ```
 Host my-workstation
@@ -68,7 +84,7 @@ Host my-workstation
 
 パスワードをファイルに置かず、SSH鍵とmacOSのキーチェーンを使ってください。先に`ssh my-workstation`で接続名を確認します。
 
-**5. 確認。**
+**6. 確認。**
 
 ```zsh
 afws-doctor                  # 前提条件

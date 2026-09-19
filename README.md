@@ -73,19 +73,37 @@ curl -fsSL https://chatgpt.com/codex/install.sh | sh  # Codex CLI
 codex login
 ```
 
-**3. The commands**, from the repository root:
+**3. This repository.** Anywhere you like.
+
+```zsh
+git clone https://github.com/ok09ra/agent-for-work-station.git ~/src/agent-for-work-station
+cd ~/src/agent-for-work-station
+```
+
+**4. The commands on your `PATH`.** Either way works; each command finds the
+shared library relative to itself.
+
+*Point at the clone* — nothing is copied, and `git pull` updates everything:
+
+```zsh
+echo 'export PATH="$HOME/src/agent-for-work-station/bin:$PATH"' >> ~/.zprofile
+exec zsh -l
+```
+
+*Or install a copy* into `~/.local/bin`, with the library next to it in
+`~/.local/lib`:
 
 ```zsh
 ./scripts/install.sh
 exec zsh -l
 ```
 
-Eight commands go into `~/.local/bin` and the shared library into `~/.local/lib`,
-and that directory is added to your login `PATH` if it is not there already.
-Nothing is deleted; an earlier `claudefws` or `codexfws` install is listed, not
-removed.
+The installer adds `~/.local/bin` to your login `PATH` if it is not there
+already, and deletes nothing — an earlier `claudefws` or `codexfws` install is
+listed, not removed. Remember that a copy has to be reinstalled after a `git
+pull`; pointing at the clone does not.
 
-**4. An SSH host alias** in `~/.ssh/config`. Real values stay out of this
+**5. An SSH host alias** in `~/.ssh/config`. Real values stay out of this
 repository — the [example](examples/ssh-config.example) is fictional.
 
 ```
@@ -101,7 +119,7 @@ Host my-workstation
 Use SSH keys and the macOS Keychain, not a password in a file. Check the alias
 works before going on: `ssh my-workstation`.
 
-**5. Check.**
+**6. Check.**
 
 ```zsh
 afws-doctor                  # prerequisites

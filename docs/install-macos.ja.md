@@ -97,7 +97,21 @@ ssh example-workstation
 
 ## 6. コマンドのインストール
 
-リポジトリを取得したら、そのルートでinstallerを実行します。Gitが使えない場合は、アーカイブを展開したものでも構いません。
+リポジトリを任意の場所へcloneします。アーカイブを展開したものでも構いません。
+
+```zsh
+git clone https://github.com/ok09ra/agent-for-work-station.git ~/src/agent-for-work-station
+cd ~/src/agent-for-work-station
+```
+
+各コマンドは共有ライブラリを自分からの相対位置で探すため、cloneの`bin`を`PATH`に入れるだけで足ります。その場合は`git pull`だけで更新されます。
+
+```zsh
+echo 'export PATH="$HOME/src/agent-for-work-station/bin:$PATH"' >> ~/.zprofile
+exec zsh -l
+```
+
+固定の場所へコピーを置きたい場合はinstallerを使います。
 
 ```zsh
 ./scripts/install.sh

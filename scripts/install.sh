@@ -10,7 +10,8 @@ readonly PROFILE_BEGIN="# >>> agent-for-work-station >>>"
 readonly PROFILE_END="# <<< agent-for-work-station <<<"
 configure_shell=1
 
-readonly COMMANDS=(claudefws codexfws afws-run afws-peers afws-lock afws-umount afws-shell)
+readonly COMMANDS=(claudefws codexfws afws-run afws-peers afws-lock afws-umount
+  afws-shell afws-doctor)
 
 usage() {
   print -r -- "Usage: ./scripts/install.sh [--no-shell-config]"
@@ -59,7 +60,6 @@ install -m 0644 "${REPOSITORY_ROOT}/lib/afws-common.zsh" "${LIBRARY_DIRECTORY}/a
 for command_name in $COMMANDS; do
   install -m 0755 "${REPOSITORY_ROOT}/bin/${command_name}" "${INSTALL_DIRECTORY}/${command_name}"
 done
-install -m 0755 "${REPOSITORY_ROOT}/scripts/doctor.sh" "${INSTALL_DIRECTORY}/afws-doctor"
 
 if (( configure_shell )); then
   touch "$PROFILE_FILE"
@@ -77,7 +77,7 @@ if (( configure_shell )); then
 fi
 
 print -r -- "Installed:"
-for command_name in $COMMANDS afws-doctor; do
+for command_name in $COMMANDS; do
   print -r -- "  ${INSTALL_DIRECTORY}/${command_name}"
 done
 print -r -- "  ${LIBRARY_DIRECTORY}/afws-common.zsh"

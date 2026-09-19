@@ -98,7 +98,22 @@ Because a session can stay attached to the workstation for hours, and a backgrou
 
 ## 6. Install the commands
 
-After obtaining the repository, run the installer from its root. If Git is not available, downloading and extracting the repository archive is also sufficient.
+Clone the repository anywhere; downloading and extracting its archive works too.
+
+```zsh
+git clone https://github.com/ok09ra/agent-for-work-station.git ~/src/agent-for-work-station
+cd ~/src/agent-for-work-station
+```
+
+Every command locates the shared library relative to itself, so putting the
+clone's `bin` on your `PATH` is enough and a `git pull` then updates everything:
+
+```zsh
+echo 'export PATH="$HOME/src/agent-for-work-station/bin:$PATH"' >> ~/.zprofile
+exec zsh -l
+```
+
+The installer is the alternative, for a copy in a fixed place:
 
 ```zsh
 ./scripts/install.sh
