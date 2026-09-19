@@ -119,7 +119,7 @@ fi
 
 # Reuse the authenticated connection a launcher opened, so a host that requires
 # a password is not asked for it again per command.
-afws_control_ssh_options "$ssh_host" "$dry_run"
+afws_control_ssh_options "$ssh_host"
 ssh_options=("${afws_ssh_control_options[@]}")
 
 if (( dry_run )); then
@@ -131,4 +131,12 @@ if (( dry_run )); then
   exit 0
 fi
 
-exec ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
+# Not exec: a connection that had nowhere to ask for a password fails in a way
+# worth explaining, and that can only be said once ssh has come back.
+set +e
+ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
+session_status=$?
+set -e
+
+afws_report_control_fallback "$ssh_host" "$session_status"
+exit "$session_status"

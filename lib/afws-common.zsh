@@ -343,16 +343,17 @@ afws_has_controlling_terminal() {
   { : >/dev/tty } 2>/dev/null
 }
 
-# afws_control_ssh_options HOST [QUIET]
+# afws_control_ssh_options HOST
 # Sets afws_ssh_control_options to the ssh options that reuse the connection a
-# launcher authenticated. Falling back to a separate connection is allowed --
-# afws-run is usable on its own -- but never in silence: on a host that asks for
-# a password that fallback is what turns one prompt into one prompt per command.
-# A dry run passes QUIET, having nothing to connect with and nothing to prompt.
+# launcher authenticated, and afws_control_fallback to why there was nothing to
+# reuse: empty when a connection was reused, "terminal" when ssh can still ask
+# for a password itself, "batch" when there is nowhere to ask at all.
 afws_control_ssh_options() {
-  local ssh_host="$1" quiet="${2:-0}" control_path
+  local ssh_host="$1" control_path
 
   afws_ssh_control_options=()
+  afws_control_fallback=""
+  afws_control_fallback_path=""
   [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && return 0
 
   control_path="$(afws_resolve_control_path "$ssh_host")"
@@ -361,26 +362,41 @@ afws_control_ssh_options() {
     return 0
   fi
 
+  afws_control_fallback_path="$control_path"
+
   # With no connection to reuse, ssh authenticates on its own and needs somewhere
   # to ask. Where it cannot ask -- no terminal, no askpass helper -- it tries an
   # askpass binary that macOS does not ship and reports that three times over,
   # which says nothing about what went wrong. BatchMode turns that into one
   # refusal, and key-based authentication still goes through untouched.
   if afws_has_controlling_terminal || [[ -n "${SSH_ASKPASS-}" ]]; then
-    (( quiet )) || {
-      print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
-      print -u2 -r -- "  connecting separately; a host that authenticates by password will ask again"
-    }
+    afws_control_fallback=terminal
     return 0
   fi
 
+  afws_control_fallback=batch
   afws_ssh_control_options=(-o BatchMode=yes)
-  (( quiet )) || {
-    print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
-    print -u2 -r -- "  and no terminal here to answer a password prompt. Reopen the shared"
-    print -u2 -r -- "  connection from the terminal you launched from, then try again:"
-    print -u2 -r -- "    ssh -M -S ${(q)control_path} -o ControlPersist=${AFWS_CONTROL_PERSIST} -f -N ${(q)ssh_host}"
-  }
+
+  return 0
+}
+
+# afws_report_control_fallback HOST SSH_EXIT_STATUS
+# A fallback that worked needs no explaining: a key-authenticated host takes it
+# on every call and gets where it was going. 255 is ssh's own failure, as
+# opposed to the remote command's, and with nowhere to have asked for a password
+# that is the failure worth explaining.
+afws_report_control_fallback() {
+  local ssh_host="$1" exit_status="$2"
+
+  [[ "$afws_control_fallback" == batch ]] || return 0
+  (( exit_status == 255 )) || return 0
+
+  print -u2 -r -- "${AFWS_PROGRAM}: ssh failed. It said why above; this may be the reason."
+  print -u2 -r -- "  There was no shared SSH connection to reuse at ${afws_control_fallback_path},"
+  print -u2 -r -- "  and no terminal here, so a host that authenticates by password could not"
+  print -u2 -r -- "  have been given one. Reopen the shared connection from the terminal you"
+  print -u2 -r -- "  launched from, then try again:"
+  print -u2 -r -- "    ssh -M -S ${(q)afws_control_fallback_path} -o ControlPersist=${AFWS_CONTROL_PERSIST} -f -N ${(q)ssh_host}"
 
   return 0
 }

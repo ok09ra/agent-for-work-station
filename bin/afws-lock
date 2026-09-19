@@ -240,7 +240,7 @@ esac
 remote_command="bash -s -- ${(q)lock_name} ${(q)holder} ${(q)ttl_seconds} ${(q)remote_base} ${force}"
 
 # Reuse the authenticated connection a launcher opened.
-afws_control_ssh_options "$ssh_host" "$dry_run"
+afws_control_ssh_options "$ssh_host"
 ssh_options=("${afws_ssh_control_options[@]}")
 
 if (( dry_run )); then
@@ -263,6 +263,8 @@ run_remote() {
   printf '%s' "$remote_script" | ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
   exit_status=$?
   set -e
+
+  afws_report_control_fallback "$ssh_host" "$exit_status"
 
   return "$exit_status"
 }

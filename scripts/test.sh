@@ -24,7 +24,7 @@ mkdir -p "$STUB_BIN"
 cat >| "${STUB_BIN}/ssh" <<'STUB_SSH'
 #!/bin/zsh
 print -r -- "stub-ssh $*"
-exit 0
+exit "${STUB_SSH_EXIT:-0}"
 STUB_SSH
 chmod +x "${STUB_BIN}/ssh"
 
@@ -688,68 +688,81 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
     AFWS_SSH_HOST=example-workstation "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
   [[ "$mismatch" != *"-S "* ]] || fail "afws-run applied the session socket to a different host"
 
-  # Falling back to a separate connection is allowed, but a password-authenticated
-  # host turns a silent fallback into one prompt per command, so it must be said.
-  warned="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" \
+  # Falling back to a separate connection is allowed and usually works: a
+  # key-authenticated host takes that path on every call and gets where it was
+  # going. So the fallback is explained only when it actually failed, and only
+  # when there was nowhere to have answered a password prompt.
+  succeeded="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" \
     "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
-  [[ "$warned" == *"no shared SSH connection"* ]] || \
-    fail "afws-run fell back to a separate connection in silence"
+  [[ -z "$succeeded" ]] || fail "a fallback that worked was complained about (${succeeded})"
 
-  warned_lock="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" \
+  # 255 is ssh's own failure rather than the remote command's.
+  ssh_failed="$(PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=255 AFWS_STATE_DIR="$short_state" \
+    "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
+  [[ "$ssh_failed" == *"no shared SSH connection to reuse"* ]] || \
+    fail "ssh failed with nowhere to ask for a password and nothing said why"
+  [[ "$ssh_failed" == *"ssh -M -S"* ]] || \
+    fail "the failure did not say how to reopen the shared connection"
+
+  # A remote command that fails is not the connection's fault.
+  command_failed="$(PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=1 AFWS_STATE_DIR="$short_state" \
+    "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
+  [[ "$command_failed" != *"no shared SSH connection to reuse"* ]] || \
+    fail "a failing remote command was blamed on the shared connection"
+
+  # The status has to survive the reporting that was added around it.
+  runner_status=0
+  PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=42 AFWS_STATE_DIR="$short_state" \
+    "$RUNNER" other-workstation --cwd /remote/project -- true >/dev/null 2>&1 || runner_status=$?
+  (( runner_status == 42 )) || fail "afws-run did not pass the remote exit status through (${runner_status})"
+
+  ssh_failed_lock="$(PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=255 AFWS_STATE_DIR="$short_state" \
     "$LOCK" status --host other-workstation 2>&1 >/dev/null || true)"
-  [[ "$warned_lock" == *"no shared SSH connection"* ]] || \
-    fail "afws-lock fell back to a separate connection in silence"
+  [[ "$ssh_failed_lock" == *"no shared SSH connection to reuse"* ]] || \
+    fail "afws-lock said nothing when ssh had nowhere to ask for a password"
 
-  # A dry run connects to nothing, so it has nothing to warn about.
+  # A dry run connects to nothing, so it has nothing to report either way.
   quiet="$(AFWS_STATE_DIR="$short_state" "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd 2>&1 >/dev/null)"
-  [[ "$quiet" != *"no shared SSH connection"* ]] || fail "a dry run warned about a connection it never opens"
+  [[ -z "$quiet" ]] || fail "a dry run reported on a connection it never opens (${quiet})"
 
   # ssh asks for a password on the controlling terminal. Where there is none --
-  # inside an agent session -- it cannot ask at all, so it must fail once and say
-  # how to recover. The terminal check is stubbed rather than inherited, so this
-  # holds whether or not the suite itself was started from a terminal.
-  fallback_options() {
+  # inside an agent session -- it cannot ask at all, and that is the case the
+  # explanation is for. The terminal check is stubbed rather than inherited, so
+  # this holds whether or not the suite itself was started from a terminal.
+  fallback_state() {
     zsh -c '
       set -eu
       AFWS_PROGRAM=test
       AFWS_STATE_DIR='"$short_state"'
       source '"$LIBRARY"'
       afws_has_controlling_terminal() { return '"${1}"'; }
-      afws_control_ssh_options other-workstation
-      print -r -- "OPTIONS=${afws_ssh_control_options[*]}"
+      afws_control_ssh_options '"${2}"'
+      print -r -- "OPTIONS=${afws_ssh_control_options[*]} FALLBACK=${afws_control_fallback}"
     ' 2>&1
   }
 
-  no_terminal="$(fallback_options 1)"
+  no_terminal="$(fallback_state 1 other-workstation)"
   [[ "$no_terminal" == *"OPTIONS=-o BatchMode=yes"* ]] || \
     fail "ssh was left to hunt for an askpass helper with no terminal to ask on (${no_terminal})"
-  [[ "$no_terminal" == *"ssh -M -S"* ]] || \
-    fail "the no-terminal message did not say how to reopen the shared connection"
+  [[ "$no_terminal" == *"FALLBACK=batch"* ]] || fail "the no-terminal fallback was not recorded as such"
 
-  with_terminal="$(fallback_options 0)"
+  with_terminal="$(fallback_state 0 other-workstation)"
   [[ "$with_terminal" != *BatchMode* ]] || \
     fail "a terminal that could answer a password prompt was denied the chance"
-  [[ "$with_terminal" == *"will ask again"* ]] || \
-    fail "the fallback on a terminal stopped saying a password may be asked for"
+  [[ "$with_terminal" == *"FALLBACK=terminal"* ]] || fail "the fallback on a terminal was not recorded as such"
 
-  # A connection to reuse needs none of this.
-  reusing="$(zsh -c '
-    set -eu
-    AFWS_PROGRAM=test
-    AFWS_STATE_DIR='"$short_state"'
-    source '"$LIBRARY"'
-    afws_has_controlling_terminal() { return 1; }
-    afws_control_ssh_options example-workstation
-    print -r -- "OPTIONS=${afws_ssh_control_options[*]}"
-  ' 2>&1)"
+  reusing="$(fallback_state 1 example-workstation)"
   [[ "$reusing" == *"-S ${socket_path}"* ]] || fail "the shared connection was not reused (${reusing})"
   [[ "$reusing" != *BatchMode* ]] || fail "a reused connection was given BatchMode it does not need"
+  [[ "$reusing" == *"FALLBACK=" ]] || \
+    fail "reusing a connection was recorded as a fallback (${reusing})"
 
-  # Asking for separate connections on purpose is not a thing to be warned about.
-  opted_out="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" AFWS_NO_CONTROL_MASTER=1 \
+  # Asking for separate connections on purpose is not a thing to report on.
+  opted_out="$(PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=255 AFWS_STATE_DIR="$short_state" \
+    AFWS_NO_CONTROL_MASTER=1 \
     "$RUNNER" other-workstation --cwd /remote/project -- true 2>&1 >/dev/null || true)"
-  [[ "$opted_out" != *"no shared SSH connection"* ]] || \
-    fail "AFWS_NO_CONTROL_MASTER was warned about despite being deliberate"
+  [[ "$opted_out" != *"no shared SSH connection to reuse"* ]] || \
+    fail "AFWS_NO_CONTROL_MASTER was reported on despite being deliberate"
 
   rm -rf "$short_state"
 fi

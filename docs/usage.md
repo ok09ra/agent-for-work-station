@@ -269,12 +269,15 @@ leaving `AFWS_CONTROL_PERSIST` as the only thing that bounds its life; see
 [security.md](security.md) for what that gives up.
 
 `afws-run` and `afws-lock` still work with no shared connection to reuse: they
-open their own. They say so on stderr when they do, because that fallback is
-what turns one prompt into many on a host that authenticates by password.
+open their own, which on a key-authenticated host simply works. Where it cannot
+work -- no connection to reuse, and no terminal to answer a password prompt on,
+which is the situation inside a session -- ssh is given `BatchMode` so it fails
+at once instead of hunting for an askpass helper, and the failure says how to
+reopen the shared connection. A fallback that worked is not reported.
 
 To connect separately every time instead, set `AFWS_NO_CONTROL_MASTER=1`.
-Key-based authentication is then effectively required, and the fallback notice
-is not printed.
+Key-based authentication is then effectively required, and nothing is reported
+about connections that were never meant to be shared.
 
 ## Limitations
 
