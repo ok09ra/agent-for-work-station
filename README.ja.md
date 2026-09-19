@@ -242,3 +242,11 @@ cx-workstation-project-1   codex   interactive  -        workstation   /remote/p
 `test.sh`は使い捨てのレジストリと、マウントテーブルの代わりのテキストファイルの上で動きます。SSH接続、マウント、エージェント起動はいずれも行いません。`prepublish-check.sh`は秘密鍵、トークン形式、IPリテラル、ホームディレクトリのパス、パスワードらしき内容、統合前の旧名称の残留を検査します。
 
 installer、doctor、testはGit remoteの追加、commit、push、release作成を行いません。
+
+## ライセンス
+
+[MIT](LICENSE)。利用・改変・再配布・商用利用のいずれも自由です。条件は著作権表示とライセンス本文を一緒に残すことだけです。
+
+```
+Copyright (c) 2026 Sota Okuda (ok09ra)
+```

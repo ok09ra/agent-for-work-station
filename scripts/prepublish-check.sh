@@ -39,6 +39,7 @@ executables=(
 
 files=(
   README*.md
+  LICENSE
   .gitignore
   .gitattributes
   lib/afws-common.zsh

@@ -327,3 +327,12 @@ passwords, and names left over from before the merge.
 
 The installer, doctor and tests never add a Git remote, commit, push, or create a
 release.
+
+## License
+
+[MIT](LICENSE). Use it, change it, redistribute it, build something commercial on
+it — keep the copyright notice and the licence text with it.
+
+```
+Copyright (c) 2026 Sota Okuda (ok09ra)
+```

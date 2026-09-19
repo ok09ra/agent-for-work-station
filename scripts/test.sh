@@ -117,6 +117,15 @@ for document in \
   [[ -f "$document" ]] || fail "bilingual documentation is missing: ${document:t}"
 done
 
+[[ -f "${REPOSITORY_ROOT}/LICENSE" ]] || fail "LICENSE is missing"
+grep -Fq 'MIT License' "${REPOSITORY_ROOT}/LICENSE" || fail "LICENSE is not the MIT licence"
+grep -Fq 'Copyright (c) 2026 Sota Okuda (ok09ra)' "${REPOSITORY_ROOT}/LICENSE" || \
+  fail "LICENSE has no copyright line"
+for readme in README.md README.ja.md; do
+  grep -Fq '(LICENSE)' "${REPOSITORY_ROOT}/${readme}" || \
+    fail "${readme} does not link to the licence"
+done
+
 grep -Fq '[日本語](README.ja.md)' "${REPOSITORY_ROOT}/README.md" || \
   fail "English README does not link to Japanese README"
 grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
