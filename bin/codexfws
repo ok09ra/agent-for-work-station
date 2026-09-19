@@ -151,10 +151,14 @@ see which session it belongs to."
   fi
 fi
 
-# Codex CLI has no flag equivalent to Claude Code's --add-dir, so this is not
-# honoured rather than being honoured differently.
+# Claude Code scopes its file tools to the working directory, so extra local
+# directories have to be named with --add-dir. Codex reads through its sandbox,
+# which permits reads outside the workspace, so nothing has to be named: a local
+# path is simply readable. Only writing outside the workspace would need Codex's
+# own writable-roots configuration, which this tool does not set.
 if [[ -n "${AFWS_ADD_DIR-}" ]]; then
-  print -u2 -r -- "${AFWS_PROGRAM}: AFWS_ADD_DIR is ignored; Codex CLI has no --add-dir equivalent"
+  print -u2 -r -- "${AFWS_PROGRAM}: AFWS_ADD_DIR is not needed here — Codex can already read outside the workspace."
+  print -u2 -r -- "  Writing outside it would need Codex's own writable-roots configuration."
 fi
 
 afws_warn_about_home_workspace "$local_workspace" codex

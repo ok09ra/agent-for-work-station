@@ -348,8 +348,8 @@ early="$(env AFWS_ADD_DIR=relative "$CLAUDE_LAUNCHER" --dry-run example-workstat
 
 codex_note="$(AFWS_ADD_DIR="${SANDBOX}/papers" \
   "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$codex_note" == *"AFWS_ADD_DIR is ignored"* ]] || \
-  fail "codexfws silently ignored AFWS_ADD_DIR instead of saying so"
+[[ "$codex_note" == *"AFWS_ADD_DIR is not needed here"* ]] || \
+  fail "codexfws did not explain that it reads outside the workspace already"
 
 # --- mount table ----------------------------------------------------------
 # The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and

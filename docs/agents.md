@@ -16,7 +16,7 @@ the workstation — the mount, the shared SSH connection, the registry, the lock
 | Messaged by name from another session | yes, `SendMessage` | no |
 | Locally-run shell commands labelled `[mac]` | yes | no |
 | Background session (`--bg`) | yes | no |
-| Extra local directories (`AFWS_ADD_DIR`) | yes, via `--add-dir` | no |
+| Reading local material outside the workspace | needs `AFWS_ADD_DIR` (`--add-dir`) | already allowed by its sandbox |
 
 The differences are not design choices. They follow from what each CLI offers,
 measured against Codex CLI 0.154.0:
@@ -35,6 +35,13 @@ measured against Codex CLI 0.154.0:
   --message TEXT` does exist, and would be the right mechanism, but without a
   way to set the name at launch there is nothing to address. When Codex CLI
   gains a name flag, this becomes a small change.
+- **Reading outside the workspace is not a difference in capability.** Claude
+  Code scopes its file tools to the working directory, so a local papers or notes
+  directory has to be named with `--add-dir`, which is what `AFWS_ADD_DIR` does.
+  Codex reads through its sandbox, whose macOS profile permits read-only file
+  operations outside the workspace, so a local path is simply readable and
+  nothing has to be named. Writing outside the workspace is the part Codex
+  restricts, and that would need its own writable-roots configuration.
 - **No shell wrapper.** Claude Code runs shell commands through
   `CLAUDE_CODE_SHELL_PREFIX`, which is how `[mac]` gets attached. Codex CLI has
   no equivalent, so in a Codex session nothing marks a command as having run on
