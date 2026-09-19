@@ -336,6 +336,13 @@ afws_resolve_control_path() {
   fi
 }
 
+# ssh asks for a password on the controlling terminal, not on stdin, so a piped
+# script still gets its prompt. Inside an agent session there is no terminal at
+# all, and that is the case worth knowing about.
+afws_has_controlling_terminal() {
+  { : >/dev/tty } 2>/dev/null
+}
+
 # afws_control_ssh_options HOST [QUIET]
 # Sets afws_ssh_control_options to the ssh options that reuse the connection a
 # launcher authenticated. Falling back to a separate connection is allowed --
@@ -351,10 +358,29 @@ afws_control_ssh_options() {
   control_path="$(afws_resolve_control_path "$ssh_host")"
   if [[ -S "$control_path" ]]; then
     afws_ssh_control_options=(-S "$control_path")
-  elif (( ! quiet )); then
-    print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
-    print -u2 -r -- "  connecting separately; a host that authenticates by password will ask again"
+    return 0
   fi
+
+  # With no connection to reuse, ssh authenticates on its own and needs somewhere
+  # to ask. Where it cannot ask -- no terminal, no askpass helper -- it tries an
+  # askpass binary that macOS does not ship and reports that three times over,
+  # which says nothing about what went wrong. BatchMode turns that into one
+  # refusal, and key-based authentication still goes through untouched.
+  if afws_has_controlling_terminal || [[ -n "${SSH_ASKPASS-}" ]]; then
+    (( quiet )) || {
+      print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
+      print -u2 -r -- "  connecting separately; a host that authenticates by password will ask again"
+    }
+    return 0
+  fi
+
+  afws_ssh_control_options=(-o BatchMode=yes)
+  (( quiet )) || {
+    print -u2 -r -- "${AFWS_PROGRAM}: no shared SSH connection at ${control_path}"
+    print -u2 -r -- "  and no terminal here to answer a password prompt. Reopen the shared"
+    print -u2 -r -- "  connection from the terminal you launched from, then try again:"
+    print -u2 -r -- "    ssh -M -S ${(q)control_path} -o ControlPersist=${AFWS_CONTROL_PERSIST} -f -N ${(q)ssh_host}"
+  }
 
   return 0
 }

@@ -36,6 +36,7 @@ unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
   AFWS_AGENT AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
   AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND AFWS_KEEP_CONTROL_MASTER \
   AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
+unset SSH_ASKPASS 2>/dev/null || true
 
 fail() {
   print -u2 -r -- "test.sh: $*"
@@ -605,7 +606,8 @@ timeout_message="$(zsh -c '
 # --- afws-run -------------------------------------------------------------
 
 runner_plan="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"
-[[ "$runner_plan" == ssh\ example-workstation* ]] || fail "afws-run did not plan SSH execution"
+[[ "$runner_plan" == ssh\ * && "$runner_plan" == *" example-workstation "* ]] || \
+  fail "afws-run did not plan SSH execution"
 
 stdin_plan="$(print -r -- 'echo remote-script' | "$RUNNER" example-workstation --cwd /remote/project --dry-run)"
 [[ "$stdin_plan" == *"bash\\ -s"* ]] || fail "afws-run did not plan Bash standard-input execution"
@@ -615,7 +617,7 @@ quoted="$("$RUNNER" example-workstation --cwd '/remote/project' --dry-run -- pri
 
 environment_plan="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" --dry-run -- pwd)"
-[[ "$environment_plan" == ssh\ example-workstation* ]] || \
+[[ "$environment_plan" == ssh\ * && "$environment_plan" == *" example-workstation "* ]] || \
   fail "afws-run did not take the host and directory from the session environment"
 
 environment_stdin="$(print -r -- 'echo remote-script' | \
@@ -627,7 +629,7 @@ environment_stdin="$(print -r -- 'echo remote-script' | \
 # host: short enough to type after Claude Code's '!'.
 short_form="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" --dry-run nvidia-smi)"
-[[ "$short_form" == ssh\ example-workstation* ]] || fail "afws-run did not accept the short form"
+[[ "$short_form" == ssh\ * && "$short_form" == *" example-workstation "* ]] || fail "afws-run did not accept the short form"
 [[ "$short_form" == *nvidia-smi* ]] || fail "afws-run lost the command in the short form"
 
 short_args="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
@@ -638,17 +640,17 @@ short_args="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project 
 # must still be addressable from inside a session.
 other_host="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" other-workstation --cwd /elsewhere --dry-run -- pwd)"
-[[ "$other_host" == ssh\ other-workstation* ]] || \
+[[ "$other_host" == ssh\ * && "$other_host" == *" other-workstation "* ]] || \
   fail "afws-run could not address another host from inside a session"
 
 own_host="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" example-workstation --dry-run -- pwd)"
-[[ "$own_host" == ssh\ example-workstation* ]] || \
+[[ "$own_host" == ssh\ * && "$own_host" == *" example-workstation "* ]] || \
   fail "afws-run rejected its own host given explicitly"
 
 dashed="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   "$RUNNER" --dry-run -- nvidia-smi)"
-[[ "$dashed" == ssh\ example-workstation* ]] || fail "afws-run rejected the short form with a leading --"
+[[ "$dashed" == ssh\ * && "$dashed" == *" example-workstation "* ]] || fail "afws-run rejected the short form with a leading --"
 
 # Outside a session the host is still positional and required.
 expect_rejected "a bare command with no session environment" \
@@ -701,6 +703,47 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
   # A dry run connects to nothing, so it has nothing to warn about.
   quiet="$(AFWS_STATE_DIR="$short_state" "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd 2>&1 >/dev/null)"
   [[ "$quiet" != *"no shared SSH connection"* ]] || fail "a dry run warned about a connection it never opens"
+
+  # ssh asks for a password on the controlling terminal. Where there is none --
+  # inside an agent session -- it cannot ask at all, so it must fail once and say
+  # how to recover. The terminal check is stubbed rather than inherited, so this
+  # holds whether or not the suite itself was started from a terminal.
+  fallback_options() {
+    zsh -c '
+      set -eu
+      AFWS_PROGRAM=test
+      AFWS_STATE_DIR='"$short_state"'
+      source '"$LIBRARY"'
+      afws_has_controlling_terminal() { return '"${1}"'; }
+      afws_control_ssh_options other-workstation
+      print -r -- "OPTIONS=${afws_ssh_control_options[*]}"
+    ' 2>&1
+  }
+
+  no_terminal="$(fallback_options 1)"
+  [[ "$no_terminal" == *"OPTIONS=-o BatchMode=yes"* ]] || \
+    fail "ssh was left to hunt for an askpass helper with no terminal to ask on (${no_terminal})"
+  [[ "$no_terminal" == *"ssh -M -S"* ]] || \
+    fail "the no-terminal message did not say how to reopen the shared connection"
+
+  with_terminal="$(fallback_options 0)"
+  [[ "$with_terminal" != *BatchMode* ]] || \
+    fail "a terminal that could answer a password prompt was denied the chance"
+  [[ "$with_terminal" == *"will ask again"* ]] || \
+    fail "the fallback on a terminal stopped saying a password may be asked for"
+
+  # A connection to reuse needs none of this.
+  reusing="$(zsh -c '
+    set -eu
+    AFWS_PROGRAM=test
+    AFWS_STATE_DIR='"$short_state"'
+    source '"$LIBRARY"'
+    afws_has_controlling_terminal() { return 1; }
+    afws_control_ssh_options example-workstation
+    print -r -- "OPTIONS=${afws_ssh_control_options[*]}"
+  ' 2>&1)"
+  [[ "$reusing" == *"-S ${socket_path}"* ]] || fail "the shared connection was not reused (${reusing})"
+  [[ "$reusing" != *BatchMode* ]] || fail "a reused connection was given BatchMode it does not need"
 
   # Asking for separate connections on purpose is not a thing to be warned about.
   opted_out="$(PATH="${STUB_BIN}:$PATH" AFWS_STATE_DIR="$short_state" AFWS_NO_CONTROL_MASTER=1 \
@@ -878,13 +921,14 @@ fi
 # --- afws-lock ------------------------------------------------------------
 
 lock_plan="$("$LOCK" acquire gpu0 --host example-workstation --dry-run)"
-[[ "$lock_plan" == ssh\ example-workstation* ]] || fail "afws-lock did not plan SSH execution"
+[[ "$lock_plan" == ssh\ * && "$lock_plan" == *" example-workstation "* ]] || \
+  fail "afws-lock did not plan SSH execution"
 [[ "$lock_plan" == *"--- remote script ---"* ]] || fail "afws-lock did not show the remote script"
 [[ "$lock_plan" == *'\~/.afws-locks'* ]] || \
   fail "afws-lock did not keep the remote lock root unexpanded for the remote shell"
 
 environment_lock="$(AFWS_SSH_HOST=example-workstation "$LOCK" status --dry-run)"
-[[ "$environment_lock" == ssh\ example-workstation* ]] || \
+[[ "$environment_lock" == ssh\ * && "$environment_lock" == *" example-workstation "* ]] || \
   fail "afws-lock did not take the host from the session environment"
 
 expect_rejected "an invalid lock name" "$LOCK" acquire 'bad name' --host example-workstation --dry-run
