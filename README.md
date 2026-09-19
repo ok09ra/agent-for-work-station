@@ -98,6 +98,54 @@ by name and reports a status, a Codex session cannot and does not, because Codex
 CLI offers no launch-time session name and no machine-readable session listing.
 [What each agent supports](docs/agents.md) sets out the whole difference and why.
 
+## What this is good for
+
+**A workstation you would rather not install an agent on.** Shared machines,
+machines holding sensitive data, machines you do not administer. The agent's
+credentials, permission rules and history stay on your Mac, and nothing
+accumulates on the workstation — no allowlist growing for months, no background
+process left behind by a session that ended.
+
+**Local material and remote compute in one session.** Papers and notes on your
+Mac, the project and the GPU on the workstation. `AFWS_ADD_DIR` brings the local
+directories into the same session, so reading a paper and running the job that
+follows from it happen in one conversation instead of two with a copy in between.
+
+**Several workstations from one place.** One Mac, one configuration, one session
+history. `afws-peers` lists every session across every host.
+
+**Several sessions on one workstation.** They share one mount and one
+authenticated connection, `afws-lock` serialises the GPU or a shared build
+directory between them, and Claude sessions can ask each other what they found.
+
+**A machine you cannot install on at all** — no permission, no outbound network
+for the agent to sign in with, a policy that forbids it.
+
+**Authoring with your own toolchain.** Your editor, your Python tooling, your IDE
+integration stay local; only the parts that need the remote environment go over.
+
+## What this is not good for
+
+**Work that is mostly file traffic.** SSHFS pays a network round trip per
+operation, so a large `grep`, a full build or `git status` over a big tree is
+slower than it would be on the machine itself. Send those through `afws-run`
+instead, or run the agent natively.
+
+**A machine that is yours alone and that you administer.** Installing the agent
+there is simpler and faster, and there is no shared state to keep off it.
+
+**Data that must not reach a model.** Mounting changes nothing here: a file the
+agent reads is a file the model is shown, wherever the agent runs. The answer is
+not to mount it.
+
+**Restricting what the agent may do on the workstation.** `afws-run` is an
+unrestricted remote shell as your SSH user, so the mount scopes convenience, not
+authority. That boundary belongs in `authorized_keys` on the workstation, with a
+separate key for the agent and a forced command; this repository does not set it
+up. [Security](docs/security.md) says what does and does not hold.
+
+**Anything but macOS on the client side.**
+
 ## Documentation
 
 | Topic | English | 日本語 |
