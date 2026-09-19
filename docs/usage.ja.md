@@ -88,10 +88,10 @@ Claude Codeの`!`は、そのセッション自身のシェル、つまりMac側
 !python train.py   → [local] /Library/Frameworks/Python.framework/.../python3
 !nvidia-smi        → [local] zsh:1: command not found: nvidia-smi
                      [local] not found on this Mac. for HOST, use: afws-run -- <command>
-!afws-run nvidia-smi → [remote] NVIDIA-SMI ...
+!afws-run nvidia-smi → [local] [remote] NVIDIA-SMI ...
 ```
 
-「どこで実行されたか」の答えが両方とも画面に出ます。これが要点で、片方しか無い印は役に立ちません。`[remote]`は`afws-run`自身が出すため、ラッパーはその前に割り込みません。一方、`afws-run`を含むだけの複合コマンドには`[local]`が付きます。シェルはここで始まっており、過少申告こそがこの仕組みが防ごうとしている失敗だからです。
+`[local]`はシェルがここで始まったこと、`[remote]`は処理がここを離れたことを示します。`afws-run`では両方が並ぶのが通常の読み方です — ここで始まり、あちらで動いた。`[local]`だけの行はこのMacから出ていないという意味で、これこそ見つけたいケースです。
 
 印は標準エラーへ出るため、コマンドの出力に混ざりません。また何も禁止しません。ワークステーションで実行すべきコマンドも、ここで実行されたうえで、そう表示されるだけです。「not found on this Mac」の行はMacにそのコマンドが存在しない場合にのみ出ます。印が不要な場合は、起動時に`AFWS_NO_SHELL_MARKER=1`を指定します。語そのものは`AFWS_MARKER`と`AFWS_REMOTE_MARKER`で変えられます。
 

@@ -986,14 +986,13 @@ no_hint="$(env -u AFWS_SSH_HOST "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 
 custom_marker="$(AFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
 [[ "$custom_marker" == '[laptop] ' ]] || fail "the shell wrapper ignored AFWS_MARKER"
 
-# afws-run labels itself, so the wrapper stepping in front of it would put the
-# less useful of the two answers first.
-deferred="$("$SHELL_WRAPPER" 'afws-run pwd' 2>&1 >/dev/null || true)"
-[[ "$deferred" != *'[local]'* ]] || \
-  fail "the wrapper labelled a command that afws-run labels itself (${deferred})"
+# The shell runs here whatever the command goes on to do, so every command is
+# labelled -- including one that hands its work to the workstation, which the
+# agent does not pass through as a bare command line anyway.
+bare="$("$SHELL_WRAPPER" 'afws-run pwd' 2>&1 >/dev/null || true)"
+[[ "$bare" == *'[local]'* ]] || \
+  fail "a command run through the wrapper was not labelled as starting here (${bare})"
 
-# Anything more than a bare afws-run did start here, and saying so matters more
-# than tidiness: under-reporting is what this labelling exists to prevent.
 compound="$("$SHELL_WRAPPER" 'true && afws-run pwd' 2>&1 >/dev/null || true)"
 [[ "$compound" == *'[local]'* ]] || \
   fail "a command that began locally was not labelled as such (${compound})"

@@ -18,20 +18,18 @@ fi
 # The shell itself always runs here, whatever the command goes on to do, so
 # this label is about where execution started. A command that hands work to the
 # workstation is labelled by afws-run, which knows that it did.
+# Always, for every command: the shell runs here whatever the command goes on
+# to do. afws-run adds [remote] when work leaves this Mac, so the pair reads
+# "started here, ran there" and a lone [local] means it never left.
+#
+# Suppressing [local] for a command that is only an afws-run invocation was
+# tried and removed: the agent does not hand this script a bare command line,
+# it hands over a wrapped one, so the test never matched anything real. Any
+# version of it that did would have to guess at that wrapping, and guessing
+# wrong labels a locally-run command as remote -- the one mistake this exists
+# to prevent.
 marker="${AFWS_MARKER:-local}"
-
-# A command that is nothing but an afws-run invocation runs on the workstation,
-# and afws-run labels it itself. Printing [local] in front of that would label
-# one command twice, leading with the answer that is not the interesting one.
-# Anything more involved keeps the [local] label: the shell did start here, and
-# under-reporting is the failure this labelling exists to prevent.
-case "$1" in
-  afws-run|afws-run\ *|*/afws-run|*/afws-run\ *) marker="" ;;
-esac
-
-if [ -n "$marker" ]; then
-  printf '[%s] ' "$marker" >&2
-fi
+printf '[%s] ' "$marker" >&2
 
 # AFWS_SHELL exists so an unusual setup can choose its shell; anything that is
 # not an executable file falls back rather than breaking every command.
