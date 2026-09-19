@@ -986,16 +986,22 @@ no_hint="$(env -u AFWS_SSH_HOST "$SHELL_WRAPPER" 'definitely-not-a-command-xyz' 
 custom_marker="$(AFWS_MARKER=laptop "$SHELL_WRAPPER" 'true' 2>&1 >/dev/null)"
 [[ "$custom_marker" == '[laptop] ' ]] || fail "the shell wrapper ignored AFWS_MARKER"
 
-# The shell runs here whatever the command goes on to do, so every command is
-# labelled -- including one that hands its work to the workstation, which the
-# agent does not pass through as a bare command line anyway.
+# A command that mentions afws-run is left to afws-run's own [remote] label.
+# The agent wraps the command line before the wrapper sees it, so this has to
+# match on a substring rather than on the first word.
 bare="$("$SHELL_WRAPPER" 'afws-run pwd' 2>&1 >/dev/null || true)"
-[[ "$bare" == *'[local]'* ]] || \
-  fail "a command run through the wrapper was not labelled as starting here (${bare})"
+[[ "$bare" != *'[local]'* ]] || \
+  fail "a command handed to afws-run was labelled twice (${bare})"
 
-compound="$("$SHELL_WRAPPER" 'true && afws-run pwd' 2>&1 >/dev/null || true)"
-[[ "$compound" == *'[local]'* ]] || \
-  fail "a command that began locally was not labelled as such (${compound})"
+wrapped="$("$SHELL_WRAPPER" "true && eval 'afws-run pwd'" 2>&1 >/dev/null || true)"
+[[ "$wrapped" != *'[local]'* ]] || \
+  fail "the wrapping the agent adds defeated the check (${wrapped})"
+
+# The mistake this labelling exists to catch is a command that never mentions
+# the workstation and runs here anyway. Those are always labelled.
+local_only="$("$SHELL_WRAPPER" 'python --version' 2>&1 >/dev/null || true)"
+[[ "$local_only" == *'[local]'* ]] || \
+  fail "a command that never leaves this Mac was not labelled (${local_only})"
 
 # If the single-argument contract ever changes, the wrapper must not eat the
 # command: it becomes a transparent shell instead.

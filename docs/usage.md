@@ -93,12 +93,17 @@ Because that is easy to miss, a `claudefws` session labels every command it runs
 !python train.py   → [local] /Library/Frameworks/Python.framework/.../python3
 !nvidia-smi        → [local] zsh:1: command not found: nvidia-smi
                      [local] not found on this Mac. for HOST, use: afws-run -- <command>
-!afws-run nvidia-smi → [local] [remote] NVIDIA-SMI ...
+!afws-run nvidia-smi → [remote] NVIDIA-SMI ...
 ```
 
-`[local]` says the shell started here; `[remote]` says the work left. Both on
-one line is the normal reading for `afws-run`: started here, ran there. A line
-with only `[local]` never left this Mac, which is the case worth spotting.
+`[local]` says the command ran on this Mac; `[remote]` says it ran on the
+workstation. A command that mentions `afws-run` anywhere is left to `afws-run`
+to label, so it reads as one answer rather than two.
+
+That last part is a trade-off worth knowing: in `python prep.py && afws-run
+train` the local half goes unlabelled. What stays covered is the mistake the
+labelling is for -- a command that never mentions the workstation and quietly
+runs here anyway. Those are always labelled `[local]`.
 
 The labels go to standard error, so they never mix into a command's output, and
 nothing is blocked — a command that belongs on the workstation still runs here,
