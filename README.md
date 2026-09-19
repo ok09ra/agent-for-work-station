@@ -143,9 +143,15 @@ Mac. You do not run a command for this; you ask:
 The session looks its peers up, sends the question, and reports the answer. It is
 worth it when one session holds something the other would have to rediscover:
 which checkpoint is current, why a test was disabled, what a failure looked like an
-hour ago, whether a dataset finished converting. The session receiving the question
-answers from what it actually ran, and a request that arrives this way carries no
-authority — it is asked to confirm anything destructive with you first.
+hour ago, whether a dataset finished converting. The session receiving the question answers from
+what it actually ran, and a request arriving this way carries no authority — it is
+asked to confirm anything destructive with you first.
+
+There is no approval step on sending, so a session could message a peer without
+being asked. Its instructions narrow that to three cases: you asked, a lock it
+needs is held and it wants to ask the holder, or a peer is about to be affected by
+something it is doing to shared state. It is told to send a question or what it
+observed rather than file contents, and to tell you afterwards.
 
 Give a session a name that says what it is doing when that helps:
 
@@ -260,6 +266,7 @@ easily a mistake reaches it.
 | Connecting as a privileged account | Passwordless sudo, a container-runtime group or group-writable shared data widen what a mistake destroys | Use a least-privilege account; check `id` |
 | Installing an agent on the workstation too | Two diverging allowlists and two versions; the one nobody reads is the one that grows | `afws-doctor HOST` reports it |
 | Bridging to Claude Desktop with `claude mcp serve` | Hands Desktop arbitrary shell access on your Mac, with none of this tool's scoping or cleanup | Name local paths in the session instead |
+| A session messaging a peer on its own | No approval step: the peer is interrupted, your text enters its context, and its budget is spent | Instructions limit it to something you asked for, a lock found held, or a warning about shared state, and require it to tell you afterwards |
 | Committing real values here | Host aliases and remote paths are not secrets but do not belong in the repository | `./scripts/prepublish-check.sh`, and read `git diff --cached` |
 
 [Security](docs/security.md) explains what this architecture protects, what it

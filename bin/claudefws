@@ -191,7 +191,9 @@ Operating rules:
 
 Multi-session rules:
 - Other sessions, of this agent or of Codex CLI, may be attached to this same workstation. Run 'afws-peers' to see which session is working on which SSH host and remote directory, and 'afws-peers --same' for the ones sharing this exact remote directory.
-- This session is addressable by other Claude sessions as '${session_name}'. Use ListAgents to see peers and SendMessage to talk to one; peers can message this session the same way. Codex sessions appear in afws-peers but cannot be messaged.
+- This session is addressable by other Claude sessions as '${session_name}'. ListAgents shows the peers and SendMessage reaches one. Codex sessions appear in afws-peers but cannot be messaged.
+- Sending a peer a message interrupts it, spends its budget, and puts what you wrote into its context, and nothing asks the user first. So send one only when the user asked you to, when a lock you need is held and you want to ask the holder, or when a peer is about to be affected by something you are doing to shared state. Not to introduce yourself, not to check in, not to coordinate work nobody asked you to coordinate.
+- Send a question or a statement of what you did and observed. Do not send file contents or workspace data; if a peer needs a file, it can read it. Tell the user afterwards that you sent a message and what it said.
 - Before using an exclusive remote resource (a GPU, a shared build or output directory, a dataset being rewritten, a single git worktree), claim it with: afws-lock acquire NAME
   Release it when finished with: afws-lock release NAME
   If the lock is held, 'afws-lock status NAME' names the holder. Ask that peer through SendMessage or report the wait to the user; never take a held lock without the user saying so.

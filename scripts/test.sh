@@ -369,6 +369,14 @@ codex_plan_plain="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/proj
 expect_rejected "a relative extra directory (codexfws)" \
   env AFWS_ADD_DIR=relative "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project
 
+# Unsolicited peer messages interrupt another session and cost it budget, and
+# nothing asks the user first, so the session instructions have to narrow it.
+for phrase in 'nothing asks the user first' 'only when the user asked you to' \
+  'Do not send file contents'; do
+  grep -Fq "$phrase" "$CLAUDE_LAUNCHER" || \
+    fail "the session instructions no longer constrain messaging a peer: ${phrase}"
+done
+
 # --- mount table ----------------------------------------------------------
 # The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and
 # nesting can be checked without mounting anything.
