@@ -35,6 +35,10 @@ usage() {
   print -r -- "Arguments are passed through literally, so shell metacharacters are not"
   print -r -- "interpreted on the remote host. Wrap a pipeline or a redirect in 'sh -c'"
   print -r -- "when the remote shell should see it, or pipe a whole script in instead."
+  print -r -- ""
+  print -r -- "Inside a mounted session, project inspection, file management and Git belong"
+  print -r -- "on the local mount. Common remote forms are refused. If the user explicitly"
+  print -r -- "requests a remote-side file operation, pass --allow-remote-files."
 }
 
 if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
@@ -85,6 +89,7 @@ afws_validate_host "$ssh_host"
 
 remote_cwd="${AFWS_REMOTE_DIR-}"
 dry_run=0
+allow_remote_files=0
 
 while (( $# > 0 )); do
   case "$1" in
@@ -94,6 +99,7 @@ while (( $# > 0 )); do
       shift 2
       ;;
     -n|--dry-run) dry_run=1; shift ;;
+    --allow-remote-files) allow_remote_files=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) break ;;
@@ -102,6 +108,125 @@ done
 
 [[ -n "$remote_cwd" ]] || afws_die "--cwd must be an absolute remote path"
 remote_cwd="$(afws_normalize_remote_dir "$remote_cwd")"
+
+# The mount exists so project files can be handled by the agent's ordinary
+# local tools. Running those same operations through SSH fragments the workflow
+# and makes alternate checkouts especially easy to create by accident. This is
+# a guardrail, not a remote sandbox: runtime programs can still read and write
+# files, and an explicit override remains available for a user-requested
+# remote-side operation.
+afws_reject_remote_project_operation() {
+  afws_die "$1 is a $2; use the mounted workspace (override: --allow-remote-files)"
+}
+
+afws_guard_remote_shell_text() {
+  local shell_label="$1" shell_text="$2"
+  local command_boundary='(^|[;&|(){}][;&|]?|then[[:space:]]+|do[[:space:]]+|else[[:space:]]+)'
+  local command_prefix='[[:space:]]*((env|command|builtin|exec|nice|nohup)[[:space:]]+|[^[:space:];&|(){}=]+=[^[:space:];&|(){}]+[[:space:]]+)*'
+
+  if print -r -- "$shell_text" | grep -Eq \
+       "${command_boundary}${command_prefix}([^[:space:];&|(){}]*/)?(git|ls|tree|find|fd|rg|cat|stat|file|du|readlink|realpath|diff|cmp|mkdir|rmdir|touch|cp|mv|rm|ln|install|truncate|tee|dd|chmod|chown|chgrp|xattr|rsync|scp|sftp|tar|zip|unzip)([[:space:];&|(){}]|$)"; then
+    afws_reject_remote_project_operation "$shell_label" \
+      "shell-wrapped project inspection, Git, or filesystem operation"
+  fi
+
+  # These commands are useful as filters for runtime output, so allow them
+  # after a pipe (for example, nvidia-smi | wc -l). At the start of a command
+  # segment they are overwhelmingly being used to inspect a project file and
+  # belong on the mount.
+  command_boundary='(^|;|&&|\|\||[(){}]|then[[:space:]]+|do[[:space:]]+|else[[:space:]]+)'
+  if print -r -- "$shell_text" | grep -Eq \
+       "${command_boundary}${command_prefix}([^[:space:];&|(){}]*/)?(grep|egrep|fgrep|head|tail|wc|sed|awk|cut|sort|uniq|jq|yq)([[:space:];&|(){}]|$)"; then
+    afws_reject_remote_project_operation "$shell_label" \
+      "shell-wrapped project inspection"
+  fi
+}
+
+afws_guard_remote_project_operation() {
+  local command_name="${1:t}" reason="" shell_text="" argument
+  local shell_has_script=0 shell_wants_command=0
+
+  case "$command_name" in
+    git)
+      reason="Git operation"
+      ;;
+    ls|tree|find|fd|rg|grep|egrep|fgrep|cat|head|tail|stat|file|du|wc|readlink|realpath|diff|cmp|sed|awk|cut|sort|uniq|jq|yq)
+      reason="project inspection"
+      ;;
+    mkdir|rmdir|touch|cp|mv|rm|ln|install|truncate|tee|dd|chmod|chown|chgrp|xattr|rsync|scp|sftp|tar|zip|unzip)
+      reason="filesystem operation"
+      ;;
+    sudo|doas)
+      reason="privileged remote operation"
+      ;;
+    env)
+      shift
+      while (( $# > 0 )); do
+        case "$1" in
+          --) shift; break ;;
+          -u|--unset|-C|--chdir|-S|--split-string)
+            shift
+            (( $# > 0 )) && shift
+            ;;
+          -*|*=*) shift ;;
+          *) break ;;
+        esac
+      done
+      (( $# == 0 )) || afws_guard_remote_project_operation "$@"
+      return
+      ;;
+    nice|nohup|timeout|stdbuf|time)
+      # Wrapper option grammars differ. Looking for a guarded command among
+      # their arguments covers normal forms without pretending to implement
+      # every wrapper's complete option parser.
+      shift
+      while (( $# > 0 )); do
+        case "${1:t}" in
+          git|ls|tree|find|fd|rg|grep|egrep|fgrep|cat|head|tail|stat|file|du|wc|readlink|realpath|diff|cmp|sed|awk|cut|sort|uniq|jq|yq|mkdir|rmdir|touch|cp|mv|rm|ln|install|truncate|tee|dd|chmod|chown|chgrp|xattr|rsync|scp|sftp|tar|zip|unzip|sudo|doas|env|sh|bash|zsh)
+            afws_guard_remote_project_operation "$@"
+            return
+            ;;
+        esac
+        shift
+      done
+      return
+      ;;
+    sh|bash|zsh)
+      shift
+      for argument in "$@"; do
+        if (( shell_wants_command )); then
+          shell_text="$argument"
+          break
+        fi
+        case "$argument" in
+          -c|-[^-]*c*) shell_wants_command=1 ;;
+          --) ;;
+          -*) ;;
+          *) shell_has_script=1; break ;;
+        esac
+      done
+      if [[ -n "$shell_text" ]]; then
+        afws_guard_remote_shell_text "$command_name" "$shell_text"
+      elif (( ! shell_has_script )); then
+        reason="generic remote shell"
+      fi
+      ;;
+  esac
+
+  [[ -z "$reason" ]] || afws_reject_remote_project_operation "$command_name" "$reason"
+}
+
+stdin_script=""
+stdin_script_captured=0
+if [[ -n "${AFWS_LOCAL_WORKSPACE-}" ]] && (( ! allow_remote_files )); then
+  if (( $# > 0 )); then
+    afws_guard_remote_project_operation "$@"
+  elif [[ ! -t 0 ]]; then
+    stdin_script="$(cat)"
+    stdin_script_captured=1
+    afws_guard_remote_shell_text "standard-input script" "$stdin_script"
+  fi
+fi
 
 remote_command="cd ${(q)remote_cwd} && exec"
 
@@ -142,8 +267,13 @@ fi
 # Not exec: a connection that had nowhere to ask for a password fails in a way
 # worth explaining, and that can only be said once ssh has come back.
 set +e
-ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
-session_status=$?
+if (( stdin_script_captured )); then
+  print -rn -- "$stdin_script" | ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
+  session_status=$?
+else
+  ssh "${ssh_options[@]}" "$ssh_host" "$remote_command"
+  session_status=$?
+fi
 set -e
 
 afws_report_control_fallback "$ssh_host" "$session_status"

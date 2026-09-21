@@ -48,9 +48,10 @@ fi
 
 check_command ssh "OpenSSH is included with macOS"
 check_command sshfs "install the signed SSHFS package linked from the macFUSE project"
+check_command diskutil "diskutil is included with macOS; failed mounts may need a forced detach"
 check_command plutil "plutil is included with macOS; Claude session status needs it"
 
-for command_name in afws-run afws-peers afws-lock afws-umount; do
+for command_name in afws-run afws-peers afws-lock afws-remount afws-umount; do
   check_command "$command_name" "run this repository's installer and start a new login shell"
 done
 

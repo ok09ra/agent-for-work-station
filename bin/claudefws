@@ -21,6 +21,8 @@ fi
 
 readonly PERMISSION_MODE="${AFWS_PERMISSION_MODE:-auto}"
 readonly PEERS="${SCRIPT_DIR}/afws-peers"
+readonly REMOUNT="${SCRIPT_DIR}/afws-remount"
+readonly UMOUNT="${SCRIPT_DIR}/afws-umount"
 readonly SHELL_MARKER="${SCRIPT_DIR}/afws-shell"
 dry_run=0
 background=0
@@ -99,7 +101,7 @@ if (( ! dry_run )); then
       afws_die "required command not found: ${dependency}; run afws-doctor"
   done
 
-  for helper in afws-run afws-peers afws-lock; do
+  for helper in afws-run afws-peers afws-lock afws-remount afws-umount; do
     [[ -x "${SCRIPT_DIR}/${helper}" ]] ||
       afws_die "${helper} is not installed next to claudefws"
   done
@@ -114,7 +116,7 @@ afws_session_name="$(afws_resolve_session_name fws "$ssh_host" "$remote_dir" "$P
 
 afws_open_session_connection "$ssh_host" "$dry_run"
 afws_establish_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
-  "$dry_run" "$afws_session_name"
+  "$dry_run" "$afws_session_name" "$REMOUNT"
 afws_warn_about_home_workspace "$afws_local_workspace" claude
 
 # --- session instructions -------------------------------------------------
@@ -229,14 +231,16 @@ fi
 
 # --- interactive session --------------------------------------------------
 # The launcher does not exec into the agent: it stays as the parent so the mount
-# and the shared SSH connection are released when the session ends. The recorded
-# PID is therefore this launcher, which lives exactly as long.
+# and the shared SSH connection are released when the session ends. The registry
+# records both this launcher and the agent so the watchdog can cover a crash.
 
 afws_write_session_record interactive "$$" ""
 afws_install_release_traps "$PEERS"
+afws_start_release_watchdog "$UMOUNT" "$$" || \
+  afws_die "could not start the cleanup watchdog"
 
 session_exit=0
-claude \
+afws_run_tracked_agent "$$" claude \
   --permission-mode "$PERMISSION_MODE" \
   --name "$afws_session_name" \
   "${add_dir_arguments[@]}" \

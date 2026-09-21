@@ -162,7 +162,10 @@ Exiting the agent releases the mount, unless another session is still working in
 
 While a session is running, the launcher reuses any existing SSHFS mount that already covers the requested host and path, because it looks at the system `mount` table rather than at its own records.
 
-A background session, or a session that was killed rather than exited, leaves its mount behind. Release it explicitly:
+An interactive session also has a detached watchdog: if its launcher is killed
+or crashes, cleanup runs after any surviving agent process exits. A background
+session still leaves its mount behind. A failed watchdog or an unmount refused
+by macOS can also leave one; release it explicitly:
 
 ```zsh
 afws-umount --list

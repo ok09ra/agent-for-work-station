@@ -27,8 +27,9 @@ Do not pass `bypassPermissions`. Every write in a session lands on the remote ho
 
 Each session receives instructions to:
 
-- Keep file operations inside the mounted workspace unless the user explicitly expands the scope.
-- Send environment-dependent commands through `afws-run`.
+- Treat the mount as the only project checkout; use it for project files and Git,
+  and never create a clone or worktree unless the user explicitly requests one.
+- Send only programs which need the workstation environment through `afws-run`.
 - Avoid changing remote packages, shell startup files, or the system or user environment without explicit user approval.
 - Ask before destructive, expensive, or long-running operations.
 - Claim an exclusive remote resource with `afws-lock` before using it, and never take a held lock without the user saying so.
@@ -39,7 +40,15 @@ SSH runs with the permissions of the configured remote user and does not obtain 
 
 Check more than the account's nominal sudo status. Existing server configuration may already give the account elevated capabilities through passwordless sudo, privileged groups such as a container-runtime group, set-user-ID programs, service-management permissions, or writable privileged automation. The effective security boundary is the complete set of permissions assigned to the remote account.
 
-`afws-run` is a remote-command runner by design. Its standard-input mode can execute arbitrary Bash code, and its argument mode can invoke any command available to the SSH user. The selected remote directory is an initial working directory, not a security boundary. Review commands before approval, especially scripts that leave that directory, delete files, install packages, start expensive jobs, or alter the remote environment.
+`afws-run` is a remote-command runner by design. In a mounted session it rejects
+common project inspection, filesystem, and Git commands unless
+`--allow-remote-files` is explicit. Direct commands, common shells, standard-input
+scripts, and common wrappers are inspected statically. That is a workflow guard,
+not a security boundary: ordinary programs can read and write files, and not
+every indirect or dynamic shell expression can be recognized. The selected remote directory is only an initial
+working directory. Review commands before approval, especially scripts that
+leave that directory, delete files, install packages, start expensive jobs, or
+alter the remote environment.
 
 ## What the session registry holds
 
@@ -108,9 +117,10 @@ permissions, place the socket on a shared filesystem, or point
 `AFWS_STATE_DIR` somewhere other users can read.
 
 The connection also expires on its own after `AFWS_CONTROL_PERSIST` seconds of
-inactivity, 600 by default, because a session killed with `SIGKILL` never gets
-to close it. `afws-umount --orphaned` closes any connection no live session is
-using, and `afws-doctor` reports one it finds.
+inactivity, 600 by default. Interactive launchers have detached watchdogs which
+close the connection after a launcher is killed, but expiry remains a fallback
+if both cleanup processes are stopped. `afws-umount --orphaned` closes any
+connection no live session is using, and `afws-doctor` reports one it finds.
 
 `AFWS_KEEP_CONTROL_MASTER=1` removes the first of those two bounds: the
 connection is no longer closed when the last session using the host exits, and

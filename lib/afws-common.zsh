@@ -15,8 +15,8 @@
 : ${AFWS_MOUNT_COMMAND:=mount}
 : ${AFWS_LOCK_TTL:=7200}
 # A pre-authenticated SSH channel should not outlive the sessions using it. The
-# launcher closes it when the last session exits, but a session killed with
-# SIGKILL never gets to, so the connection also expires on its own.
+# launcher or its detached watchdog closes it when the last session exits. The
+# connection also expires on its own in case neither cleanup process can run.
 # AFWS_KEEP_CONTROL_MASTER gives up the first of those two bounds: a host that
 # authenticates by password is otherwise asked again on every launch, and every
 # afws-run once the connection is gone. Expiry is then the only bound left, so
@@ -34,8 +34,13 @@ fi
 AFWS_SESSION_DIR="${AFWS_STATE_DIR}/sessions"
 AFWS_CONTROL_DIR="${AFWS_STATE_DIR}/control"
 AFWS_LOG_DIR="${AFWS_STATE_DIR}/logs"
+AFWS_WATCHDOG_DIR="${AFWS_STATE_DIR}/watchdogs"
 # Overridable: a slow link may need longer than this.
 : ${AFWS_MOUNT_TIMEOUT_SECONDS:=30}
+# A dead FUSE mount can leave umount itself waiting in the kernel. Recovery
+# must have a deadline of its own or the command intended to repair the mount
+# can become just as stuck as the mount it is replacing.
+: ${AFWS_UNMOUNT_TIMEOUT_SECONDS:=8}
 # How long a mount is given to answer its first read. A dead mount answers
 # immediately -- with an error -- so this bounds only the hung and the merely
 # cold, and a cold mount over a slow link is the common case of the two.
@@ -62,6 +67,35 @@ afws_pause_seconds() {
   else
     command sleep "$1" 2>/dev/null || true
   fi
+}
+
+# afws_run_with_timeout SECONDS COMMAND [ARG ...]
+# Returns 124 after terminating a command that exceeded its deadline. This is
+# deliberately implemented with zsh builtins so macOS does not need GNU
+# coreutils' timeout command.
+afws_run_with_timeout() {
+  local limit="$1" waited=0 child_pid result
+  shift
+
+  setopt local_options no_bg_nice
+  "$@" &
+  child_pid=$!
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if (( waited >= limit )); then
+      kill -TERM "$child_pid" 2>/dev/null || true
+      afws_pause_seconds 1
+      kill -KILL "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+      return 124
+    fi
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+
+  result=0
+  wait "$child_pid" || result=$?
+  return "$result"
 }
 
 # --- input validation -----------------------------------------------------
@@ -189,8 +223,11 @@ afws_find_existing_mount() {
 
   afws_local_workspace=""
   afws_mount_source=""
+  afws_mount_remote_root=""
   afws_mount_point=""
   afws_stale_mount=""
+  afws_stale_mount_source=""
+  afws_stale_mount_remote_root=""
   afws_stale_mount_reason=""
 
   while IFS= read -r mount_line; do
@@ -217,10 +254,13 @@ afws_find_existing_mount() {
       if afws_directory_responds "$candidate"; then
         afws_local_workspace="$candidate"
         afws_mount_source="$src"
+        afws_mount_remote_root="$remote_root"
         afws_mount_point="$mount_path"
         return 0
       fi
       afws_stale_mount="$mount_path"
+      afws_stale_mount_source="$src"
+      afws_stale_mount_remote_root="$remote_root"
       afws_stale_mount_reason="$afws_probe_outcome"
     fi
   done < <(${=AFWS_MOUNT_COMMAND})
@@ -258,7 +298,14 @@ afws_mount_is_present() {
 # cannot authenticate leaves the process running behind a mount that answers
 # nothing else. So look before saying which happened.
 afws_sshfs_pids_for() {
-  pgrep -f "sshfs.*${1}" 2>/dev/null | tr '\n' ' '
+  local target="$1" process_pid process_command executable
+
+  while read -r process_pid process_command; do
+    executable="${process_command%% *}"
+    [[ "$executable" == sshfs || "$executable" == */sshfs ]] || continue
+    [[ "$process_command" == *" ${target} "* ]] || continue
+    print -n -r -- "${process_pid} "
+  done < <(ps -axo pid=,command= 2>/dev/null)
 }
 
 # afws_stale_mount_message MOUNT_POINT [OUTCOME]
@@ -461,6 +508,11 @@ afws_mount() {
   chmod 700 "$AFWS_LOG_DIR" 2>/dev/null || true
 
   sshfs_options=(-o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3)
+  # SSHFS 3.7.x's directory-cache path can abort in cache_readdir and can also
+  # leave a mount answering successful readdir calls with a stale empty list
+  # after reconnection. Correct directory contents matter more than avoiding a
+  # round trip here; expensive tree scans should be narrowed by the agent.
+  sshfs_options+=(-o dir_cache=no)
   [[ -n "$socket" ]] && sshfs_options+=(-o "ControlPath=${socket}")
   # sshfs reconnects on its own after an interruption, and a reconnect that has
   # to authenticate has nobody to ask: this is a background mount. Left to
@@ -602,22 +654,23 @@ Remote working directory: ${afws_remote_dir}"
 }
 
 afws_shared_operating_rules() {
-  print -r -- "- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
-- An additional directory is local to this Mac and is reference material: read from it, and write conclusions into the remote project rather than into it, unless the user says otherwise.
-- Use local filesystem tools for inspection and editing; the workspace is the remote project itself, so every write lands on the remote host.
-- Run Python, tests, builds, GPU jobs, and other commands that depend on the remote environment through: afws-run COMMAND ARG...
-- To send a shell script through standard input, pipe it to: afws-run
+  print -r -- "- The local workspace and remote working directory are two paths to the same project tree; the mount is this session's only checkout.
+- Do all project reads, searches, edits, file management, and Git locally in the mount. Never copy, clone, synchronize, stage, or create a worktree or alternate checkout unless the user explicitly asks; a lock does not authorize one.
+- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
+- Additional directories are local reference material: read them, but write conclusions into the mounted project unless the user says otherwise.
+- Use afws-run only to execute programs that require the workstation's runtime, dependencies, hardware, or operating system: Python, tests, builds, and GPU jobs. Those programs may create their ordinary generated outputs in the project. Do not invoke ssh, scp, sftp, or rsync directly to bypass it.
+- Do not use afws-run for project inspection, file management, or Git. It rejects common cases; use --allow-remote-files only when the user explicitly requested a remote-side file operation. Piped scripts follow the same rule.
+- If the mounted workspace becomes unreadable, empty when the remote project is not, or reports ENXIO, do not switch project file work to afws-run. Use afws-remount to repair the mount; ask the user before adding --force for a timeout or a mount that still answers but has incorrect contents.
 - Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
-- Show the remote command and its relevant stdout and stderr to the user.
-- Ask before destructive operations or before starting expensive or long-running jobs.
-- SSHFS is a network filesystem: prefer one remote command over many small local file operations when scanning large trees."
+- Show the remote command and only its relevant stdout and stderr to the user; keep large logs and listings out of context unless they are needed.
+- Ask before destructive, expensive, or long-running operations. Narrow slow SSHFS searches to relevant paths rather than moving project inspection to the remote shell."
 }
 
 # The first multi-session rule is the same for both; the rest is not, because
 # only Claude sessions can be addressed.
 afws_shared_session_rules() {
   print -r -- "- Other sessions, of either agent, may be attached to this same workstation. Run 'afws-peers' to see which session is working on which SSH host and remote directory, and 'afws-peers --same' for the ones sharing this exact remote directory.
-- Before using an exclusive remote resource (a GPU, a shared build or output directory, a dataset being rewritten, a single git worktree), claim it with: afws-lock acquire NAME
+- Before using an exclusive remote resource (a GPU, a shared build or output directory, a dataset being rewritten, or the shared repository checkout), claim it with: afws-lock acquire NAME
   Release it when finished with: afws-lock release NAME
   If the lock is held, 'afws-lock status NAME' names the holder; never take a held lock without the user saying so.
 - Do not modify files another session is working on. Coordinate first."
@@ -666,12 +719,14 @@ afws_open_session_connection() {
   return 0
 }
 
-# afws_establish_mount HOST REMOTE_DIR SOCKET_OR_EMPTY DRY_RUN LOG_NAME
+# afws_establish_mount HOST REMOTE_DIR SOCKET_OR_EMPTY DRY_RUN LOG_NAME REMOUNT_COMMAND
 # Sets afws_local_workspace and afws_mount_point, reusing a mount that already
-# covers the directory, refusing one that no longer responds or that would hide
-# another, and otherwise mounting.
+# covers the directory, automatically repairing a confirmed disconnected mount,
+# refusing an ambiguous timeout or a mount that would hide another, and otherwise
+# mounting.
 afws_establish_mount() {
   local ssh_host="$1" remote_dir="$2" socket="$3" dry_run="$4" log_name="$5"
+  local remount_command="${6-}" stale_mount stale_remote_root suffix
 
   if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
     print -r -- "Reusing SSHFS mount: ${afws_mount_source}"
@@ -679,7 +734,37 @@ afws_establish_mount() {
   fi
 
   if [[ -n "$afws_stale_mount" ]]; then
-    afws_die "$(afws_stale_mount_message "$afws_stale_mount" "$afws_stale_mount_reason")"
+    if [[ "$afws_stale_mount_reason" == timeout ]]; then
+      afws_die "$(afws_stale_mount_message "$afws_stale_mount" "$afws_stale_mount_reason")"
+    fi
+
+    [[ -x "$remount_command" ]] ||
+      afws_die "the mount is disconnected and afws-remount is not installed next to the launcher"
+
+    stale_mount="$afws_stale_mount"
+    stale_remote_root="$afws_stale_mount_remote_root"
+    if [[ "$remote_dir" == "$stale_remote_root" ]]; then
+      suffix=""
+    elif [[ "$stale_remote_root" == / ]]; then
+      suffix="$remote_dir"
+    else
+      suffix="${remote_dir#${stale_remote_root}}"
+    fi
+
+    print -r -- "The existing SSHFS mount is disconnected; reconnecting it before launch."
+    if (( dry_run )); then
+      "$remount_command" --dry-run "$ssh_host" "$remote_dir" || exit 1
+      afws_mount_point="$stale_mount"
+      afws_local_workspace="${stale_mount%/}${suffix}"
+      return 0
+    fi
+
+    "$remount_command" "$ssh_host" "$remote_dir" || exit 1
+    if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
+      print -r -- "Reusing repaired SSHFS mount: ${afws_mount_source}"
+      return 0
+    fi
+    afws_die "afws-remount completed but the replacement mount is not usable"
   fi
 
   afws_local_workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
@@ -729,6 +814,9 @@ afws_print_session_header() {
 
 # What a session's own commands read to reach the same host without asking again.
 afws_export_session_environment() {
+  # A launcher and its helpers are one versioned unit. Put that exact set first
+  # so an older afws-run elsewhere on PATH cannot silently lose newer guards.
+  [[ -z "${SCRIPT_DIR-}" ]] || export PATH="${SCRIPT_DIR}:${PATH}"
   export AFWS_AGENT="$afws_agent"
   export AFWS_SESSION_NAME="$afws_session_name"
   export AFWS_SSH_HOST="$afws_ssh_host"
@@ -765,6 +853,68 @@ afws_install_release_traps() {
   trap '' INT
 }
 
+# A trap cannot run after SIGKILL or a launcher crash. A detached cleanup
+# process therefore watches each interactive launcher and releases the session
+# if its registry record is still present after both the launcher and its agent
+# have gone away. The ready-file handshake means a session is never started
+# unless its watchdog is actually running.
+afws_watchdog_ready_file() {
+  print -r -- "${AFWS_WATCHDOG_DIR}/${afws_session_name}.$1.ready"
+}
+
+# afws_start_release_watchdog UMOUNT_COMMAND LAUNCHER_PID
+afws_start_release_watchdog() {
+  local cleanup_command="$1" launcher_pid="$2" ready_file logfile waited=0
+
+  [[ -x "$cleanup_command" ]] || return 1
+
+  mkdir -p "$AFWS_WATCHDOG_DIR" "$AFWS_LOG_DIR"
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_WATCHDOG_DIR" "$AFWS_LOG_DIR" 2>/dev/null || true
+
+  ready_file="$(afws_watchdog_ready_file "$launcher_pid")"
+  logfile="${AFWS_LOG_DIR}/${afws_session_name}.watchdog.log"
+  rm -f "$ready_file"
+
+  afws_detached "$logfile" "$cleanup_command" \
+    --watch-launcher "$launcher_pid" "$afws_session_name"
+
+  while (( waited < 5 )); do
+    if [[ -s "$ready_file" ]]; then
+      rm -f "$ready_file"
+      return 0
+    fi
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+
+  print -u2 -r -- "${AFWS_PROGRAM}: the cleanup watchdog did not start"
+  [[ -s "$logfile" ]] && tail -n 20 "$logfile" >&2
+  rm -f "$ready_file"
+  return 1
+}
+
+# Run the agent in a foreground child which records its own PID immediately
+# before exec. The launcher remains in charge of the terminal and normal
+# cleanup; the detached watchdog can wait for this PID if the launcher itself
+# is killed while the agent is still running.
+# afws_run_tracked_agent LAUNCHER_PID COMMAND [ARG ...]
+afws_run_tracked_agent() {
+  local launcher_pid="$1" record_file
+  shift
+
+  record_file="${AFWS_SESSION_DIR}/${afws_session_name}.conf"
+  /bin/zsh -c '
+    set -eu
+    record_file="$1"
+    launcher_pid="$2"
+    shift 2
+    [[ -f "$record_file" ]] || exit 125
+    grep -Fqx "pid=${launcher_pid}" "$record_file" || exit 125
+    print -r -- "agent_pid=$$" >> "$record_file"
+    exec "$@"
+  ' afws-agent "$record_file" "$launcher_pid" "$@"
+}
+
 # --- session registry -----------------------------------------------------
 # The launchers set these before calling the functions below.
 #   afws_agent afws_session_name afws_ssh_host afws_remote_dir
@@ -788,6 +938,7 @@ afws_write_session_record() {
     print -r -- "agent=${afws_agent}"
     print -r -- "kind=${kind}"
     print -r -- "pid=${pid}"
+    print -r -- "agent_pid="
     print -r -- "bg_id=${bg_id}"
     print -r -- "ssh_host=${afws_ssh_host}"
     print -r -- "remote_dir=${afws_remote_dir}"
@@ -811,6 +962,7 @@ afws_read_record() {
   afws_record_agent=""
   afws_record_kind=""
   afws_record_pid=""
+  afws_record_agent_pid=""
   afws_record_bg_id=""
   afws_record_ssh_host=""
   afws_record_remote_dir=""
@@ -828,6 +980,7 @@ afws_read_record() {
       agent) afws_record_agent="$value" ;;
       kind) afws_record_kind="$value" ;;
       pid) afws_record_pid="$value" ;;
+      agent_pid) afws_record_agent_pid="$value" ;;
       bg_id) afws_record_bg_id="$value" ;;
       ssh_host) afws_record_ssh_host="$value" ;;
       remote_dir) afws_record_remote_dir="$value" ;;
@@ -885,29 +1038,56 @@ afws_validate_environment
 afws_released=0
 
 afws_release_session() {
-  local peers="$1" mount_users=1 host_users=1
+  local peers="$1" mount_users=1 host_users=1 record_file tracked_agent_pid=""
 
   # Reached from the EXIT trap and from the signal traps, so it must be safe to
   # call more than once.
   (( afws_released )) && return 0
   afws_released=1
 
-  afws_remove_session_record
+  # A signal aimed only at the launcher must not unmount underneath an agent
+  # which survived it. Leave the record as a handoff; the detached watchdog
+  # waits for this process before performing the same release below.
+  record_file="${AFWS_SESSION_DIR}/${afws_session_name}.conf"
+  if [[ -r "$record_file" ]] && afws_read_record "$record_file" &&
+     [[ "$afws_record_session_name" == "$afws_session_name" &&
+        "$afws_record_pid" == "$$" ]]; then
+    tracked_agent_pid="$afws_record_agent_pid"
+  fi
+  case "$tracked_agent_pid" in
+    ''|*[!0-9]*|0) ;;
+    *)
+      if kill -0 "$tracked_agent_pid" 2>/dev/null; then
+        print -r -- "Leaving cleanup to the watchdog after the agent exits."
+        return 0
+      fi
+      ;;
+  esac
 
-  [[ -n "${AFWS_KEEP_MOUNT-}" ]] && return 0
-  [[ -x "$peers" ]] || return 0
+  if [[ -n "${AFWS_KEEP_MOUNT-}" ]]; then
+    afws_remove_session_record
+    return 0
+  fi
+  if [[ ! -x "$peers" ]]; then
+    afws_remove_session_record
+    return 0
+  fi
 
-  mount_users="$("$peers" --users-of-mount "$afws_mount_point" 2>/dev/null)" || mount_users=1
-  host_users="$("$peers" --users-of-host "$afws_ssh_host" 2>/dev/null)" || host_users=1
+  mount_users="$(AFWS_SESSION_NAME="$afws_session_name" \
+    "$peers" --users-of-mount "$afws_mount_point" 2>/dev/null)" || mount_users=1
+  host_users="$(AFWS_SESSION_NAME="$afws_session_name" \
+    "$peers" --users-of-host "$afws_ssh_host" 2>/dev/null)" || host_users=1
 
   if [[ "$mount_users" == 0 && "$afws_mount_point" == "${AFWS_MOUNT_BASE}/"* ]]; then
-    print -r -- "Unmounting ${afws_mount_point}"
-    # A shell sitting inside the mount makes umount fail with "Resource busy",
-    # and claudefws necessarily cd'd into it because claude has no -C.
-    cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
-    if ! umount "$afws_mount_point" 2>/dev/null; then
-      print -u2 -r -- "${AFWS_PROGRAM}: could not unmount ${afws_mount_point}"
-      print -u2 -r -- "  release it with: diskutil unmount force ${(q)afws_mount_point}"
+    if afws_mount_is_present "$afws_mount_point"; then
+      print -r -- "Unmounting ${afws_mount_point}"
+      # A shell sitting inside the mount makes umount fail with "Resource busy",
+      # and claudefws necessarily cd'd into it because claude has no -C.
+      cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+      if ! umount "$afws_mount_point" 2>/dev/null; then
+        print -u2 -r -- "${AFWS_PROGRAM}: could not unmount ${afws_mount_point}"
+        print -u2 -r -- "  release it with: diskutil unmount force ${(q)afws_mount_point}"
+      fi
     fi
   elif [[ "$mount_users" != 0 ]]; then
     print -r -- "Leaving ${afws_mount_point} mounted for ${mount_users} other session(s)."
@@ -920,6 +1100,10 @@ afws_release_session() {
       afws_close_control_master "$afws_ssh_host" "$afws_control_socket_path"
     fi
   fi
+
+  # This is deliberately last. If the launcher is killed part-way through
+  # cleanup, the record remains as a handoff for its detached watchdog.
+  afws_remove_session_record
 
   return 0
 }

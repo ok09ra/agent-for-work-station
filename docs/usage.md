@@ -117,17 +117,36 @@ words themselves.
 ```zsh
 !afws-run -- nvidia-smi
 !afws-run -- python train.py
-!afws-run -- sh -c 'ls *.log | wc -l'
+!afws-run -- sh -c 'nvidia-smi | wc -l'
 ```
 
 Every argument is part of the remote command, so no `--` is needed. Shell
 metacharacters are passed through literally rather than interpreted on the
 remote host, which is why the pipeline above is wrapped in `sh -c`. A `|` typed
-after `!` is interpreted by the local shell, so `!afws-run -- ls | wc -l` runs `ls` on
-the workstation and `wc` on the Mac.
+after `!` is interpreted by the local shell, so `!afws-run -- nvidia-smi | wc
+-l` runs `nvidia-smi` on the workstation and `wc` on the Mac.
 
-This applies to what you type. Claude itself is instructed to use
-`afws-run` for anything that depends on the remote environment.
+The remote directory and the mounted local workspace are two paths to the same
+project tree. Project reads, searches, edits, file management, and Git therefore
+use ordinary local tools on the mount. Sessions are instructed never to create
+another clone, checkout, or Git worktree unless the user explicitly asks.
+
+Inside a mounted session, `afws-run` reinforces that division by rejecting
+common direct inspection, filesystem, and Git commands. Multiline shell
+commands, standard-input shell scripts, and common wrappers such as `env` are
+inspected too, rejecting obvious project scans, Git operations, and file
+mutations; a bare remote shell is also rejected. The diagnostic is one line so
+a corrected tool call costs little context. This is a workflow guard, not a
+security sandbox: arbitrary programs can still read and write files, and static
+inspection cannot understand every shell expression. When the user explicitly
+requests a remote-side file operation, use the escape hatch:
+
+```zsh
+afws-run --allow-remote-files COMMAND ARG...
+```
+
+This applies to what you type too. Claude and Codex receive the same instruction
+to reserve `afws-run` for programs that need the workstation's environment.
 
 ## Local material and remote compute in one session
 
@@ -194,10 +213,14 @@ it, and the shared SSH connection when no other session is on that host. A mount
 that another session is still using is kept, and so is any mount outside
 `~/afws-mounts`, which claudefws did not create.
 
-Two things are not covered automatically. A background session has no launcher
-process left to clean up after it, and a session killed outright (`kill -9`, a
-crash, a closed lid) never runs its cleanup. For both, release the mount
-explicitly:
+Interactive sessions also start a detached watchdog. If a `claudefws` or
+`codexfws` launcher is killed outright or crashes, the watchdog waits for any
+surviving agent process, then performs the same last-user checks and cleanup.
+It never unmounts a workspace another registered session is using.
+
+A background Claude session has no launcher watchdog and leaves its mount in
+place. A watchdog can also fail to clean up when it is killed too or when macOS
+refuses the unmount. Release leftovers explicitly:
 
 ```zsh
 afws-umount --list                                  # mounts and who uses each
@@ -205,6 +228,35 @@ afws-umount --orphaned                              # release the unused ones
 afws-umount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 afws-umount --orphaned --force                      # when a plain umount is refused
 ```
+
+If a live session's mount disconnects, repair it in place instead of moving
+project file work to the remote shell:
+
+```zsh
+afws-remount                                        # current session's mount
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+Both launchers perform the same check at startup and automatically repair a
+mount that returns a confirmed read error before starting the agent. A healthy
+mount is a no-op unless `--force` is explicit. A confirmed failed mount is recreated at the same
+mount point, including when the session uses a subdirectory of a broader mount.
+A probe timeout is ambiguous—it may only be a slow cold mount—so replacement in
+that case requires the user's approval and `afws-remount --force`. The same
+explicit option repairs a mount whose shallow read succeeds but whose contents
+are known to be wrong. A replacement uses a fresh independent SSH connection by
+default, so it cannot inherit a hung SFTP channel from the launcher's long-lived
+shared connection. Use `--reuse-connection` only when that shared connection is
+known to be healthy and password authentication requires it; use
+`--fresh-connection` when no old mount remains to identify as a replacement.
+If plain `umount` hangs, recovery stops only the SSHFS process for that mount and
+continues with a bounded forced detach. If a live
+agent retains the old working-directory handle and still reports `ENXIO`, exit
+and relaunch that agent after the repair. A mount shared by more than one live
+session may be repaired automatically once a read error confirms it is already
+unusable to all of them. Replacing a responding or merely timed-out shared mount
+is refused unless the user explicitly approves interrupting all sessions with
+`--force-shared`.
 
 To keep the mount after the session ends, for example because you are about to
 start another session on it, set `AFWS_KEEP_MOUNT=1` for that launch.
@@ -215,6 +267,7 @@ Use dry-run mode to print the planned operation without mounting SSHFS, writing 
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+afws-remount --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 The remote runner and the lock support the same pattern:

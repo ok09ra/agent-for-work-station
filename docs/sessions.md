@@ -69,9 +69,11 @@ Three cases are worth knowing:
 
 A shared mount is released by whichever session leaves last: a session that
 exits while others are still working inside the same mount leaves it in place
-and says so. A background session leaves its mount behind entirely, because no
-launcher process remains to clean up after it — `afws-umount --orphaned`
-releases those.
+and says so. Each interactive launcher also starts a detached watchdog, which
+does the same last-user cleanup if the launcher is killed or crashes. It waits
+for a surviving Claude or Codex process before releasing anything. A background
+session leaves its mount behind entirely — `afws-umount --orphaned` releases
+those.
 
 A lock, by contrast, is per **host**, not per directory: the lock directory lives
 in the remote user's home. That is deliberate — a GPU is shared by every session

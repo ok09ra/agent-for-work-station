@@ -1,0 +1,284 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-remount"
+readonly SCRIPT_DIR="${0:A:h}"
+
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+
+if ! typeset -f afws_die >/dev/null; then
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+fi
+
+readonly PEERS="${SCRIPT_DIR}/afws-peers"
+dry_run=0
+force=0
+force_shared=0
+connection_mode=auto
+ssh_host=""
+remote_dir=""
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-remount"
+  print -r -- "  afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY"
+  print -r -- ""
+  print -r -- "With no arguments inside claudefws or codexfws, repairs that session's"
+  print -r -- "mount. Outside a session, name the SSH host and remote directory. A healthy"
+  print -r -- "mount is normally left alone. A confirmed failed mount is recreated on the"
+  print -r -- "same path; --force also replaces a timeout or a healthy-looking wrong mount."
+  print -r -- ""
+  print -r -- "Options:"
+  print -r -- "  --force        Replace even after a timeout or successful shallow probe."
+  print -r -- "  --force-shared Also interrupt other live sessions using the same mount."
+  print -r -- "  --fresh-connection  Do not reuse the launcher's shared SSH connection."
+  print -r -- "  --reuse-connection  Reuse it even for a replacement mount."
+  print -r -- "  -n, --dry-run  Print what would change, change nothing."
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    --force) force=1; shift ;;
+    --force-shared) force_shared=1; shift ;;
+    --fresh-connection)
+      [[ "$connection_mode" != reuse ]] ||
+        afws_die "--fresh-connection and --reuse-connection cannot be combined"
+      connection_mode=fresh
+      shift
+      ;;
+    --reuse-connection)
+      [[ "$connection_mode" != fresh ]] ||
+        afws_die "--fresh-connection and --reuse-connection cannot be combined"
+      connection_mode=reuse
+      shift
+      ;;
+    -*) afws_die "unknown option: $1" ;;
+    *)
+      if [[ -z "$ssh_host" ]]; then
+        ssh_host="$1"
+      elif [[ -z "$remote_dir" ]]; then
+        remote_dir="$1"
+      else
+        afws_die "unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$ssh_host" && -z "$remote_dir" ]]; then
+  ssh_host="${AFWS_SSH_HOST-}"
+  remote_dir="${AFWS_REMOTE_DIR-}"
+  [[ -n "$ssh_host" && -n "$remote_dir" ]] || {
+    usage >&2
+    exit 2
+  }
+elif [[ -z "$ssh_host" || -z "$remote_dir" ]]; then
+  usage >&2
+  exit 2
+fi
+
+afws_validate_host "$ssh_host"
+remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
+
+if (( ! dry_run )); then
+  for dependency in ssh sshfs diskutil; do
+    command -v "$dependency" >/dev/null 2>&1 ||
+      afws_die "required command not found: ${dependency}; run afws-doctor"
+  done
+fi
+
+remount_lock="${AFWS_STATE_DIR}/remount.lock"
+remount_lock_held=0
+
+release_remount_lock() {
+  (( remount_lock_held )) || return 0
+  rm -f "${remount_lock}/pid" 2>/dev/null || true
+  rmdir "$remount_lock" 2>/dev/null || true
+  remount_lock_held=0
+}
+
+acquire_remount_lock() {
+  local recorded_pid=""
+
+  mkdir -p "$AFWS_STATE_DIR"
+  chmod 700 "$AFWS_STATE_DIR" 2>/dev/null || true
+  if ! mkdir "$remount_lock" 2>/dev/null; then
+    [[ -r "${remount_lock}/pid" ]] && recorded_pid="$(<"${remount_lock}/pid")"
+    case "$recorded_pid" in
+      ''|*[!0-9]*|0) ;;
+      *)
+        kill -0 "$recorded_pid" 2>/dev/null &&
+          afws_die "another afws-remount is already running (PID ${recorded_pid})"
+        ;;
+    esac
+    rm -f "${remount_lock}/pid" 2>/dev/null || true
+    rmdir "$remount_lock" 2>/dev/null ||
+      afws_die "a stale remount lock could not be removed: ${remount_lock}"
+    mkdir "$remount_lock" 2>/dev/null ||
+      afws_die "could not acquire the remount lock"
+  fi
+
+  print -r -- "$$" > "${remount_lock}/pid"
+  remount_lock_held=1
+}
+
+if (( ! dry_run )); then
+  acquire_remount_lock
+  trap 'release_remount_lock' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
+
+mount_point=""
+mount_remote_dir="$remote_dir"
+probe_reason=""
+
+if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
+  if (( ! force )); then
+    print -r -- "Mount is healthy: ${afws_mount_point}"
+    exit 0
+  fi
+  mount_point="$afws_mount_point"
+  mount_remote_dir="$afws_mount_remote_root"
+  probe_reason="forced"
+  print -r -- "Replacing a healthy-looking mount because --force was requested."
+fi
+
+if [[ -z "$probe_reason" ]]; then
+  if [[ -n "$afws_stale_mount" ]]; then
+    mount_point="$afws_stale_mount"
+    mount_remote_dir="$afws_stale_mount_remote_root"
+    probe_reason="$afws_stale_mount_reason"
+
+    if [[ "$probe_reason" == timeout ]] && (( ! force )); then
+      afws_die "the mount at ${mount_point} timed out, which does not prove it is disconnected
+Retry with a longer probe first:
+  AFWS_PROBE_TIMEOUT_SECONDS=60 afws-remount ${(q)ssh_host} ${(q)remote_dir}
+If it is definitely stuck, ask before using:
+  afws-remount --force ${(q)ssh_host} ${(q)remote_dir}"
+    fi
+  else
+    mount_point="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+    if afws_find_nested_mount "$mount_point"; then
+      afws_die "refusing to mount over another work-station mount: ${afws_nested_mount}"
+    fi
+  fi
+fi
+
+[[ "$mount_point" == "${AFWS_MOUNT_BASE}/"* ]] ||
+  afws_die "refusing to remount outside AFWS_MOUNT_BASE: ${mount_point}"
+mount_remote_dir="$(afws_normalize_remote_dir "$mount_remote_dir")"
+
+users=0
+if [[ -x "$PEERS" ]]; then
+  users="$(env -u AFWS_SESSION_NAME "$PEERS" --users-of-mount "$mount_point" 2>/dev/null)" || users=0
+fi
+
+if (( users > 0 )); then
+  print -r -- "Remounting a workspace used by ${users} live session(s)."
+fi
+if (( users > 1 && ! force_shared )) && [[ "$probe_reason" != error ]]; then
+  afws_die "${users} live sessions use this mount; remounting interrupts all of them
+Coordinate or stop the other sessions first. If the user explicitly approves
+interrupting every session, retry with --force-shared."
+fi
+if (( users > 1 && ! force_shared )) && [[ "$probe_reason" == error ]]; then
+  print -r -- "The mount is confirmed disconnected; repairing it for all live sessions."
+fi
+
+# A replacement must not inherit the transport that made the old SSHFS mount
+# fail. In particular, OpenSSH can leave exec channels working while a long-
+# lived master's SFTP channel hangs. New mounts still use the launcher's shared
+# connection by default so password authentication can happen in the foreground.
+if [[ "$connection_mode" == auto ]]; then
+  if [[ -n "$probe_reason" ]]; then
+    connection_mode=fresh
+  else
+    connection_mode=reuse
+  fi
+fi
+
+if [[ "$connection_mode" == fresh ]]; then
+  afws_control_socket_path=""
+  print -r -- "Using a fresh SSH connection for the replacement mount."
+else
+  if [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]]; then
+    afws_die "--reuse-connection conflicts with AFWS_NO_CONTROL_MASTER"
+  fi
+  afws_open_session_connection "$ssh_host" "$dry_run"
+fi
+
+if [[ -n "$probe_reason" ]]; then
+  if (( dry_run )); then
+    print -r -- "Would unmount ${mount_point}"
+  else
+    # This process must not hold the FUSE mount busy itself. Other live agents
+    # may still have it as their cwd, so a confirmed failed mount falls back to
+    # a forced detach. A mere timeout reaches this point only with --force.
+    cd "$HOME" 2>/dev/null || cd / || afws_die "cannot leave the failed mount"
+    if [[ "$probe_reason" == forced ]]; then
+      print -r -- "Unmounting ${mount_point}"
+    else
+      print -r -- "Unmounting disconnected mount ${mount_point}"
+    fi
+    if ! afws_run_with_timeout "$AFWS_UNMOUNT_TIMEOUT_SECONDS" \
+        umount "$mount_point" 2>/dev/null; then
+      # A wedged sshfs can keep both the mount and umount alive. This command
+      # has already established that replacement is safe (and, for a shared
+      # mount, explicitly approved), so stop only the daemon for this exact
+      # mount before asking Disk Arbitration to detach it.
+      sshfs_pids="$(afws_sshfs_pids_for "$mount_point")"
+      for sshfs_pid in ${(z)sshfs_pids}; do
+        kill -TERM "$sshfs_pid" 2>/dev/null || true
+      done
+      afws_pause_seconds 1
+      for sshfs_pid in ${(z)sshfs_pids}; do
+        kill -0 "$sshfs_pid" 2>/dev/null || continue
+        kill -KILL "$sshfs_pid" 2>/dev/null || true
+      done
+
+      if ! afws_run_with_timeout "$AFWS_UNMOUNT_TIMEOUT_SECONDS" \
+          diskutil unmount force "$mount_point" >/dev/null 2>&1; then
+        afws_die "could not unmount ${mount_point}; close processes using it and retry"
+      fi
+      print -r -- "  released with diskutil unmount force"
+    fi
+
+    afws_mount_is_present "$mount_point" &&
+      afws_die "the old mount is still present after unmount: ${mount_point}"
+  fi
+fi
+
+if (( dry_run )); then
+  print -r -- "Would mount ${ssh_host}:${mount_remote_dir}"
+  print -r -- "  on ${mount_point}"
+  [[ -n "$afws_control_socket_path" ]] &&
+    print -r -- "  over a shared SSH connection at ${afws_control_socket_path}"
+  exit 0
+fi
+
+log_name="remount-$(afws_sanitize_component "$ssh_host")-$(date +%s)"
+afws_mount "$ssh_host" "$mount_remote_dir" "$mount_point" \
+  "$afws_control_socket_path" "${AFWS_LOG_DIR}/${log_name}.sshfs.log" || exit 1
+
+if ! afws_directory_responds "$mount_point"; then
+  afws_die "the replacement mount appeared but did not answer (${afws_probe_outcome}): ${mount_point}"
+fi
+
+print -r -- "Mount is ready: ${mount_point}"
+if (( users > 0 )); then
+  print -r -- "If a live session still sees ENXIO, restart it so its working directory is reopened."
+fi

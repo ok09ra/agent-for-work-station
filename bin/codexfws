@@ -20,6 +20,8 @@ if ! typeset -f afws_die >/dev/null; then
 fi
 
 readonly PEERS="${SCRIPT_DIR}/afws-peers"
+readonly REMOUNT="${SCRIPT_DIR}/afws-remount"
+readonly UMOUNT="${SCRIPT_DIR}/afws-umount"
 dry_run=0
 
 usage() {
@@ -94,7 +96,7 @@ if (( ! dry_run )); then
       afws_die "required command not found: ${dependency}; run afws-doctor"
   done
 
-  for helper in afws-run afws-peers afws-lock; do
+  for helper in afws-run afws-peers afws-lock afws-remount afws-umount; do
     [[ -x "${SCRIPT_DIR}/${helper}" ]] ||
       afws_die "${helper} is not installed next to codexfws"
   done
@@ -112,7 +114,7 @@ afws_session_name="$(afws_resolve_session_name cx "$ssh_host" "$remote_dir" "$PE
 
 afws_open_session_connection "$ssh_host" "$dry_run"
 afws_establish_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
-  "$dry_run" "$afws_session_name"
+  "$dry_run" "$afws_session_name" "$REMOUNT"
 afws_warn_about_home_workspace "$afws_local_workspace" codex
 
 # --- session instructions -------------------------------------------------
@@ -144,9 +146,11 @@ afws_export_session_environment
 
 afws_write_session_record interactive "$$" ""
 afws_install_release_traps "$PEERS"
+afws_start_release_watchdog "$UMOUNT" "$$" || \
+  afws_die "could not start the cleanup watchdog"
 
 session_exit=0
-codex \
+afws_run_tracked_agent "$$" codex \
   --no-alt-screen \
   -C "$afws_local_workspace" \
   --sandbox workspace-write \

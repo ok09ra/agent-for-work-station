@@ -154,8 +154,16 @@ record_is_live() {
     fi
   fi
 
-  # The launcher stays alive for as long as the agent, so its PID is the check.
+  # Normally the launcher stays alive for as long as the agent, so its PID is
+  # the first process check.
   if [[ -n "$afws_record_pid" ]] && kill -0 "$afws_record_pid" 2>/dev/null; then
+    return 0
+  fi
+
+  # If the launcher itself was killed, its watchdog leaves the record in place
+  # until the agent process has also ended. This prevents another cleanup from
+  # unmounting a workspace underneath a surviving agent.
+  if [[ -n "$afws_record_agent_pid" ]] && kill -0 "$afws_record_agent_pid" 2>/dev/null; then
     return 0
   fi
 

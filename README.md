@@ -148,9 +148,15 @@ from the environment, so `afws-run` takes the command directly:
 ```zsh
 afws-run nvidia-smi
 afws-run python train.py
-afws-run sh -c 'ls *.log | wc -l'            # shell syntax needs a remote shell
+afws-run sh -c 'nvidia-smi | wc -l'           # shell syntax needs a remote shell
 printf 'set -eu\npytest -q\n' | afws-run     # a whole script
 ```
+
+The project itself is already available through the mount. Inspect and edit it,
+and run Git, with ordinary local tools in the mounted workspace. Inside a
+session, `afws-run` refuses common project inspection, filesystem, and Git
+commands. `--allow-remote-files` is the explicit escape hatch when the user
+actually requested a remote-side file operation.
 
 This matters for what you type yourself. Claude Code's `!` runs on your Mac, so
 `!nvidia-smi` fails here and `!python train.py` quietly uses the wrong
@@ -164,6 +170,18 @@ that is visible, and `afws-run` in front is the whole difference:
 
 Outside a session, name the host and directory:
 `afws-run my-workstation --cwd /remote/path -- nvidia-smi`.
+
+**Repair a disconnected mount.** Inside a session, the target is already known:
+
+```zsh
+afws-remount
+```
+
+Both launchers detect a confirmed disconnected mount at startup and recreate it
+before starting the agent. They leave a healthy mount alone and repair over a
+fresh, independent SSH connection. If a shallow probe succeeds
+but the contents are known to be wrong, `--force` replaces it after approval. Outside a session, use
+`afws-remount my-workstation /remote/path`.
 
 **Use local material** — papers, notes, a scratch analysis. Just name the path:
 
@@ -215,7 +233,9 @@ different Macs cannot reach each other either. [Multiple sessions](docs/sessions
 has the whole model.
 
 **After a session,** its mount and connection are released once no other session
-needs them. A background session, or one that was killed, leaves its mount:
+needs them. Interactive Claude and Codex sessions have a detached watchdog, so
+the same cleanup happens if their launcher is killed or crashes. A background
+Claude session still leaves its mount:
 
 ```zsh
 afws-umount --list          # mounts and connections, and who uses each
@@ -240,6 +260,7 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `afws-run` | Run a command, or a piped script, on the workstation |
 | `afws-peers` | Every session on this Mac, with the host and directory each works on |
 | `afws-lock` | Claim an exclusive remote resource so two sessions do not collide |
+| `afws-remount` | Repair a disconnected SSHFS mount in place |
 | `afws-umount` | Release a mount or connection left behind |
 | `afws-doctor` | Check the prerequisites |
 | `afws-shell` | Labels local shell commands `[local]`; used by `claudefws`, not run by hand |
@@ -288,11 +309,12 @@ easily a mistake reaches it.
 | --- | --- | --- |
 | Mounting a home directory | `~/.ssh`, credentials and every other project land in the workspace, and a `.claude/settings.json` there becomes this session's project settings | Mount the project directory; the launcher warns |
 | Piping a script to `afws-run`, or `afws-run sh -c …` | An unrestricted remote shell as your SSH user; `--cwd` is a starting point, not a sandbox | Review before approving; prefer one named command |
-| Leaving a shared connection open | A pre-authenticated channel any process of your user can reuse. A session killed with `SIGKILL` never closes it | It expires after `AFWS_CONTROL_PERSIST` seconds (600); `afws-umount --orphaned` closes one nothing uses |
+| Leaving a shared connection open | A pre-authenticated channel any process of your user can reuse. The launcher and its watchdog could both be stopped before closing it | It expires after `AFWS_CONTROL_PERSIST` seconds (600); `afws-umount --orphaned` closes one nothing uses |
 | `AFWS_PERMISSION_MODE=bypassPermissions` | Every write lands on the remote host, so there is no local-only blast radius | `manual` or `plan` for sensitive work |
 | An `allow` rule with `*` before the end of the command | `*` spans spaces, so options inserted there are approved too; a rule with `;` or a pipe approves a compound command | Name the exact value, or put `*` only after the subcommand |
 | Reading data that must not leave the machine | A file the agent reads is shown to the model | Do not mount it |
 | `afws-lock steal` | Takes a lock someone holds — how two jobs end up on one GPU | Ask the holder; hours-long locks are normal |
+| `afws-remount --force` | A timeout can be a slow healthy mount; replacing it interrupts sessions using it | Extend the probe first; more than one live session also requires explicit `--force-shared` |
 | `afws-umount --force` | Forces an unmount another session may be writing in | Check `afws-umount --list` first |
 | Connecting as a privileged account | Passwordless sudo, a container-runtime group or group-writable shared data widen what a mistake destroys | Use a least-privilege account; check `id` |
 | Installing an agent on the workstation too | Two diverging allowlists and two versions; the one nobody reads is the one that grows | `afws-doctor HOST` reports it |

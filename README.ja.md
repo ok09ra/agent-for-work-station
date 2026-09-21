@@ -108,9 +108,11 @@ claudefws my-workstation /remote/path/to/project
 ```zsh
 afws-run nvidia-smi
 afws-run python train.py
-afws-run sh -c 'ls *.log | wc -l'            # シェル構文にはリモートシェルが必要
+afws-run sh -c 'nvidia-smi | wc -l'           # シェル構文にはリモートシェルが必要
 printf 'set -eu\npytest -q\n' | afws-run     # スクリプトまるごと
 ```
+
+プロジェクト自体はすでにマウント経由で利用できます。確認・編集・Git操作は、マウント済みワークスペース上で通常のローカルツールを使います。セッション内の`afws-run`は、典型的なプロジェクト探索・ファイル操作・Gitコマンドを拒否します。利用者がリモート側のファイル操作を明示的に求めた場合だけ、`--allow-remote-files`で解除できます。
 
 これは**自分で打つとき**に効きます。Claude Codeの`!`はMacで動くので、`!nvidia-smi`はここで失敗し、`!python train.py`は黙って間違ったインタプリタで動きます。`claudefws`のセッションはローカル実行に`[local]`の印を付けて可視化し、違いは`afws-run`を前に置くかどうかだけです。
 
@@ -121,6 +123,14 @@ printf 'set -eu\npytest -q\n' | afws-run     # スクリプトまるごと
 
 セッション外では接続名とディレクトリを指定します。
 `afws-run my-workstation --cwd /remote/path -- nvidia-smi`
+
+**切断されたマウントを修復する。** セッション内では対象が環境に入っているため、引数は不要です。
+
+```zsh
+afws-remount
+```
+
+`codexfws`と`claudefws`は起動時に切断が確定した既存マウントを検出し、エージェントを始める前に自動で張り直します。正常なマウントには触れず、交換時は壊れた経路を引き継がない独立したSSH接続が既定です。簡易probeは成功しても内容が明らかに誤っている場合は、承認後に`--force`で交換できます。セッション外では`afws-remount my-workstation /remote/path`と指定します。
 
 **ローカルの資料を使う** — 論文、ノート、手元の試し計算。パスを言えば済みます。
 
@@ -153,7 +163,7 @@ AFWS_SESSION_NAME=bug-1204    claudefws my-workstation /remote/path/to/project
 
 Claudeセッション間のみです。Codexセッションは`afws-peers`に現れロックも取得しますが、宛先にはできません。起動時のセッション名がないためです。別のMac上のセッション同士も届きません。全体像は[複数セッション](docs/sessions.ja.md)にあります。
 
-**セッション終了後。** 他に必要としているセッションがなければ、マウントと接続は解放されます。バックグラウンドセッションや強制終了されたセッションはマウントを残します。
+**セッション終了後。** 他に必要としているセッションがなければ、マウントと接続は解放されます。対話型のClaude・Codexセッションには独立したwatchdogが付くため、launcherが強制終了・クラッシュした場合も同じ後片付けを行います。バックグラウンドClaudeセッションはマウントを残します。
 
 ```zsh
 afws-umount --list          # マウントと接続、それぞれの利用者数
@@ -178,6 +188,7 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `afws-run` | コマンド、または標準入力のスクリプトをワークステーションで実行する |
 | `afws-peers` | このMac上の全セッションと、それぞれの担当ホスト・ディレクトリ |
 | `afws-lock` | リモートの排他資源を確保し、複数セッションの衝突を防ぐ |
+| `afws-remount` | 切断されたSSHFSマウントを同じ場所へ張り直す |
 | `afws-umount` | 残されたマウントや接続を解放する |
 | `afws-doctor` | 前提条件を確認する |
 | `afws-shell` | ローカル実行に`[local]`の印を付ける。`claudefws`が使うもので、手で実行しない |
@@ -212,11 +223,12 @@ cx-workstation-project-1   codex   interactive  -        workstation   /remote/p
 | --- | --- | --- |
 | ホームディレクトリをマウントする | `~/.ssh`、資格情報、他のすべてのプロジェクトがワークスペースに入る。そこの`.claude/settings.json`はこのセッションのプロジェクト設定になる | プロジェクトディレクトリをマウントする。ランチャーが警告する |
 | `afws-run`にスクリプトを流す、`afws-run sh -c …` | SSHユーザーとしての無制限なリモートシェル。`--cwd`は開始位置でありサンドボックスではない | 承認前に確認する。名前付きコマンド1つを優先する |
-| 共有接続を開いたまま放置する | 認証済みの経路を同ユーザーの任意プロセスが再利用できる。`SIGKILL`で終了したセッションは閉じられない | `AFWS_CONTROL_PERSIST`秒（600）で失効。`afws-umount --orphaned`が未使用のものを閉じる |
+| 共有接続を開いたまま放置する | 認証済みの経路を同ユーザーの任意プロセスが再利用できる。launcherとwatchdogが両方とも接続を閉じる前に停止する可能性がある | `AFWS_CONTROL_PERSIST`秒（600）で失効。`afws-umount --orphaned`が未使用のものを閉じる |
 | `AFWS_PERMISSION_MODE=bypassPermissions` | すべての書き込みがリモートへ届き、ローカルだけで済む影響範囲が存在しない | 機密作業では`manual`か`plan` |
 | コマンド末尾より前に`*`がある`allow`ルール | `*`は空白をまたぐため差し込まれたオプションも承認される。`;`やパイプを含むルールは複合コマンドごと承認する | 正確な値を書く、または`*`はサブコマンドより後だけに置く |
 | 外部に出せないデータを読ませる | エージェントが読んだファイルはモデルに渡る | マウントしない |
 | `afws-lock steal` | 他者が保持しているロックを奪う。2つのジョブが1つのGPUに乗る原因 | 保持者に確認する。数時間の保持は正常 |
+| `afws-remount --force` | タイムアウトは低速な正常マウントかもしれず、交換すると利用中のセッションを中断する | 先にprobe時間を延ばす。生存セッションが複数なら明示的な`--force-shared`も必要 |
 | `afws-umount --force` | 他のセッションが書き込み中かもしれないマウントを強制的に外す | 先に`afws-umount --list`で確認する |
 | 権限の大きいアカウントで接続する | パスワードなしsudo、コンテナランタイムのグループ、group-writableな共有データは、壊せる範囲を広げる | 最小権限のアカウントを使う。`id`を確認する |
 | ワークステーション側にもエージェントを入れる | 許可ルールとバージョンが2系統に分かれ、誰も読まない側が育つ | `afws-doctor HOST`が検出する |

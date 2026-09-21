@@ -91,9 +91,40 @@ not re-establish. Neither recovers on its own.
 The mount cannot re-authenticate for itself: it runs with `BatchMode`, in a
 session of its own, precisely so that it can never interrupt the agent's
 terminal to ask. On a host that authenticates by password, that means a
-connection lost for long enough is a mount you remount by hand.
+connection lost for long enough needs a fresh authenticated connection.
 
-SSHFS attempts to reconnect after a network interruption, but recovery is not always possible. Exit Claude Code, eject the corresponding volume in Finder, and start again. Before forcing a process to stop or unmounting, confirm that no write operation is still in progress.
+SSHFS attempts to reconnect after a network interruption, but recovery is not
+always possible. Use the supported recovery command rather than composing
+`umount` and `sshfs` by hand:
+
+```zsh
+afws-remount                                        # inside the affected session
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+Both launchers run the same check at startup and automatically repair a mount
+that returns a confirmed read error before starting the agent. The command
+leaves a healthy mount alone and recreates a confirmed failed mount in place.
+A replacement uses a fresh independent SSH connection by default, so it does
+not inherit a hung SFTP channel from a long-lived shared connection. Use
+`--reuse-connection` only if that connection is known to be healthy and password
+authentication requires it. A timeout alone is not proof
+of failure; first increase `AFWS_PROBE_TIMEOUT_SECONDS`, or obtain approval
+before `afws-remount --force`. Rarely, a damaged SSHFS directory cache can make
+the mount answer successfully with empty or incorrect contents; after comparing
+with the remote directory, the same `--force` option replaces that
+healthy-looking mount. Before forcing a remount, confirm that no write
+operation is still in progress. If the live agent still sees `ENXIO` afterward,
+exit and relaunch it so its working directory is reopened.
+
+If plain `umount` itself hangs, recovery gives it a fixed deadline, stops only
+the SSHFS process for that mount, and continues with a forced detach.
+
+The launcher disables SSHFS's directory-name cache. This costs a network round
+trip for directory reads, but avoids the observed `cache_readdir` abort and the
+stale empty listings it can leave behind after reconnecting. If more than one
+live session uses the mount, recovery stops unless interruption of all sessions
+was explicitly approved with `--force-shared`.
 
 Increase the keepalive values in your SSH configuration if this happens during long sessions:
 
@@ -147,9 +178,11 @@ a killed connection is removed automatically at the next launch.
 
 ## A mount is left over after the session ended
 
-A background session has no launcher process to clean up after it, and a session
-that was killed rather than exited never ran its cleanup. List what is left and
-release it:
+Interactive sessions have a detached watchdog, so killing or crashing their
+launcher normally still releases the mount after any surviving agent exits. A
+background session leaves its mount in place, and a watchdog that was also
+killed or an unmount refused by macOS can leave one behind. List what is left
+and release it:
 
 ```zsh
 afws-umount --list

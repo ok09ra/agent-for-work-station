@@ -9,7 +9,7 @@ the workstation — the mount, the shared SSH connection, the registry, the lock
 | | `claudefws` (Claude Code) | `codexfws` (Codex CLI) |
 | --- | --- | --- |
 | Mount, shared SSH connection, release on exit | yes | yes |
-| `afws-run`, `afws-lock`, `afws-umount` | yes | yes |
+| `afws-run`, `afws-lock`, `afws-remount`, `afws-umount` | yes | yes |
 | Listed in `afws-peers` with its host and directory | yes | yes |
 | Session name the agent itself knows | yes, via `--name` | no |
 | Status column in `afws-peers` (`busy` / `idle` / `waiting`) | yes | no, shows `-` |

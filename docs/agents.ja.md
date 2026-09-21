@@ -7,7 +7,7 @@
 | | `claudefws`（Claude Code） | `codexfws`（Codex CLI） |
 | --- | --- | --- |
 | マウント・共有SSH接続・終了時の解放 | あり | あり |
-| `afws-run`・`afws-lock`・`afws-umount` | あり | あり |
+| `afws-run`・`afws-lock`・`afws-remount`・`afws-umount` | あり | あり |
 | `afws-peers`にホストとディレクトリが並ぶ | あり | あり |
 | エージェント自身が知っているセッション名 | あり（`--name`） | なし |
 | `afws-peers`の状態列（`busy`/`idle`/`waiting`） | あり | なし（`-`） |

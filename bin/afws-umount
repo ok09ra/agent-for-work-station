@@ -27,6 +27,8 @@ orphaned=0
 list_only=0
 ssh_host=""
 remote_dir=""
+watch_launcher_pid=""
+watch_session_name=""
 
 usage() {
   print -r -- "Usage:"
@@ -39,7 +41,7 @@ usage() {
   print -r -- ""
   print -r -- "Releases mounts created under the mount base. A session normally unmounts"
   print -r -- "its own workspace when it exits; this command is for a mount left behind by"
-  print -r -- "a background session, by a session that was killed, or by a dead sshfs."
+  print -r -- "a background session, a failed cleanup watchdog, or a dead sshfs."
   print -r -- ""
   print -r -- "Options:"
   print -r -- "  --orphaned     Release every mount no live session is using."
@@ -55,6 +57,9 @@ while (( $# > 0 )); do
     --list) list_only=1; shift ;;
     --force) force=1; shift ;;
     -n|--dry-run) dry_run=1; shift ;;
+    --watch-launcher)
+      (( $# >= 3 )) || afws_die "--watch-launcher requires a PID and session name"
+      watch_launcher_pid="$2"; watch_session_name="$3"; shift 3 ;;
     -*) afws_die "unknown option: $1" ;;
     *)
       if [[ -z "$ssh_host" ]]; then
@@ -69,12 +74,104 @@ while (( $# > 0 )); do
   esac
 done
 
-if (( list_only )) || (( orphaned )); then
+if [[ -n "$watch_launcher_pid" ]]; then
+  (( ! force && ! dry_run && ! orphaned && ! list_only )) ||
+    afws_die "--watch-launcher cannot be combined with other options"
+  [[ -z "$ssh_host" ]] || afws_die "--watch-launcher takes no host or directory"
+elif (( list_only )) || (( orphaned )); then
   [[ -z "$ssh_host" ]] || afws_die "--orphaned and --list take no host or directory"
 else
   [[ -n "$ssh_host" && -n "$remote_dir" ]] || { usage >&2; exit 2; }
   afws_validate_host "$ssh_host"
   remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
+fi
+
+# Internal mode used by both interactive launchers. It is deliberately part of
+# the cleanup command rather than either agent integration, so Claude and Codex
+# have exactly the same crash behavior.
+watch_launcher() {
+  local launcher_pid="$1" session_name="$2" record_file ready_file agent_pid
+
+  case "$launcher_pid" in
+    ''|*[!0-9]*|0) afws_die "invalid launcher PID" ;;
+  esac
+  afws_validate_session_name "$session_name"
+
+  record_file="${AFWS_SESSION_DIR}/${session_name}.conf"
+  if [[ ! -r "$record_file" ]] || ! afws_read_record "$record_file" ||
+     [[ "$afws_record_session_name" != "$session_name" ||
+        "$afws_record_kind" != interactive ||
+        "$afws_record_pid" != "$launcher_pid" ]]; then
+    afws_die "the watched session record does not match its launcher"
+  fi
+
+  afws_session_name="$session_name"
+  ready_file="$(afws_watchdog_ready_file "$launcher_pid")"
+  mkdir -p "$AFWS_WATCHDOG_DIR"
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_WATCHDOG_DIR" 2>/dev/null || true
+  print -r -- "$$" > "$ready_file"
+
+  while kill -0 "$launcher_pid" 2>/dev/null; do
+    afws_pause_seconds 1
+  done
+  rm -f "$ready_file"
+
+  # A normal EXIT/TERM/HUP cleanup removes the record last. Its absence means
+  # there is nothing for the watchdog to do and, importantly, avoids touching a
+  # newly started session which has already reused the old name.
+  if [[ ! -r "$record_file" ]] || ! afws_read_record "$record_file" ||
+     [[ "$afws_record_session_name" != "$session_name" ||
+        "$afws_record_pid" != "$launcher_pid" ]]; then
+    return 0
+  fi
+
+  # The tracked-agent shim normally appends this before exec. Give it one
+  # polling interval to finish that handoff if the launcher died at exactly
+  # the same time the agent was starting.
+  if [[ -z "$afws_record_agent_pid" ]]; then
+    afws_pause_seconds 1
+    if [[ ! -r "$record_file" ]] || ! afws_read_record "$record_file" ||
+       [[ "$afws_record_session_name" != "$session_name" ||
+          "$afws_record_pid" != "$launcher_pid" ]]; then
+      return 0
+    fi
+  fi
+
+  agent_pid="$afws_record_agent_pid"
+  case "$agent_pid" in
+    ''|*[!0-9]*|0) ;;
+    *)
+      while kill -0 "$agent_pid" 2>/dev/null; do
+        afws_pause_seconds 1
+      done
+      ;;
+  esac
+
+  # Re-read immediately before release. Another command may have pruned or
+  # replaced the record while the surviving agent was winding down.
+  if [[ ! -r "$record_file" ]] || ! afws_read_record "$record_file" ||
+     [[ "$afws_record_session_name" != "$session_name" ||
+        "$afws_record_pid" != "$launcher_pid" ]]; then
+    return 0
+  fi
+
+  afws_session_name="$afws_record_session_name"
+  afws_ssh_host="$afws_record_ssh_host"
+  afws_remote_dir="$afws_record_remote_dir"
+  afws_local_workspace="$afws_record_local_workspace"
+  afws_mount_point="$afws_record_mount_point"
+  afws_control_socket_path=""
+  if [[ -z "${AFWS_NO_CONTROL_MASTER-}" ]]; then
+    afws_control_socket_path="$(afws_control_socket "$afws_ssh_host")"
+    [[ -S "$afws_control_socket_path" ]] || afws_control_socket_path=""
+  fi
+
+  afws_release_session "$PEERS"
+}
+
+if [[ -n "$watch_launcher_pid" ]]; then
+  watch_launcher "$watch_launcher_pid" "$watch_session_name"
+  exit 0
 fi
 
 typeset -a afws_mounts

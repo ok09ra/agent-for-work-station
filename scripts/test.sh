@@ -9,6 +9,7 @@ readonly CODEX_LAUNCHER="${REPOSITORY_ROOT}/bin/codexfws"
 readonly RUNNER="${REPOSITORY_ROOT}/bin/afws-run"
 readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
 readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
+readonly REMOUNT="${REPOSITORY_ROOT}/bin/afws-remount"
 readonly UMOUNT="${REPOSITORY_ROOT}/bin/afws-umount"
 readonly SHELL_WRAPPER="${REPOSITORY_ROOT}/bin/afws-shell"
 
@@ -33,7 +34,7 @@ chmod +x "${STUB_BIN}/ssh"
 export AFWS_STATE_DIR="${SANDBOX}/state"
 export AFWS_MOUNT_BASE="${SANDBOX}/mounts"
 unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
-  AFWS_AGENT AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
+  AFWS_AGENT AFWS_LOCAL_WORKSPACE AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
   AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND AFWS_KEEP_CONTROL_MASTER \
   AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
 unset SSH_ASKPASS 2>/dev/null || true
@@ -56,11 +57,12 @@ reset_state() {
   mkdir -p "${AFWS_STATE_DIR}/sessions"
 }
 
-# write_record NAME AGENT PID HOST REMOTE_DIR EPOCH [WORKSPACE] [MOUNT_POINT]
+# write_record NAME AGENT PID HOST REMOTE_DIR EPOCH [WORKSPACE] [MOUNT_POINT] [AGENT_PID]
 write_record() {
   local name="$1" agent="$2" pid="$3" host="$4" remote="$5" epoch="$6"
   local workspace="${7:-${AFWS_MOUNT_BASE}/${4}${5}}"
   local point="${8:-$workspace}"
+  local agent_pid="${9:-}"
 
   mkdir -p "${AFWS_STATE_DIR}/sessions"
   {
@@ -68,6 +70,7 @@ write_record() {
     print -r -- "agent=${agent}"
     print -r -- "kind=interactive"
     print -r -- "pid=${pid}"
+    print -r -- "agent_pid=${agent_pid}"
     print -r -- "bg_id="
     print -r -- "ssh_host=${host}"
     print -r -- "remote_dir=${remote}"
@@ -87,6 +90,7 @@ for script in \
   "$RUNNER" \
   "$PEERS" \
   "$LOCK" \
+  "$REMOUNT" \
   "$UMOUNT" \
   "${REPOSITORY_ROOT}/scripts/install.sh" \
   "${REPOSITORY_ROOT}/bin/afws-doctor" \
@@ -103,12 +107,28 @@ special_parameter_hits=""
 for name in path status cdpath fpath manpath module_path argv options signals \
   psvar mailpath watch histchars prompt SECONDS RANDOM LINES COLUMNS pipestatus dirstack; do
   hits="$(grep -nE "(^|[[:space:];(&|]|local |readonly |typeset |integer |export )${name}=" \
-    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$UMOUNT" \
+    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT" \
     "${REPOSITORY_ROOT}/scripts/"*.sh 2>/dev/null || true)"
   [[ -n "$hits" ]] && special_parameter_hits+="${name}: ${hits}"$'\n'
 done
 [[ -z "$special_parameter_hits" ]] || \
   fail "assignment to a zsh special parameter:"$'\n'"$special_parameter_hits"
+
+# macOS has no system timeout command. The shared helper must preserve an
+# ordinary failure and bound a command that never returns.
+timeout_probe="$(zsh -c '
+  set -u
+  AFWS_PROGRAM=test
+  source '"$LIBRARY"'
+  result=0
+  afws_run_with_timeout 1 /bin/sh -c "exit 7" || result=$?
+  print -r -- "failure=${result}"
+  result=0
+  afws_run_with_timeout 1 /bin/sleep 10 || result=$?
+  print -r -- "timeout=${result}"
+')"
+[[ "$timeout_probe" == $'failure=7\ntimeout=124' ]] || \
+  fail "the bounded-command helper returned the wrong result (${timeout_probe})"
 
 # --- documentation --------------------------------------------------------
 
@@ -146,7 +166,7 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$UMOUNT"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
@@ -157,7 +177,7 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-peers afws-lock afws-umount afws-shell afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-peers afws-lock afws-remount afws-umount afws-shell afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
@@ -197,6 +217,24 @@ record_mode="$(stat -f '%Sp' "${AFWS_STATE_DIR}/sessions/umask-probe.conf")"
 [[ "$record_mode" == -rw------- ]] || fail "a session record is not owner-only (${record_mode})"
 rm -f "${AFWS_STATE_DIR}/sessions/umask-probe.conf"
 
+# The foreground shim records the process that actually becomes the agent. A
+# watchdog needs this to avoid unmounting underneath an agent whose launcher
+# alone was killed.
+zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+  AFWS_MOUNT_BASE='"$AFWS_MOUNT_BASE"'
+  source '"$LIBRARY"'
+  afws_agent=codex afws_session_name=tracked-agent afws_ssh_host=h
+  afws_remote_dir=/d afws_local_workspace=/w afws_mount_point=/w
+  afws_write_session_record interactive "$$" ""
+  afws_run_tracked_agent "$$" /bin/zsh -c '\''
+    grep -Fqx "agent_pid=$$" "$1"
+  '\'' tracked-agent-check '"$AFWS_STATE_DIR"'/sessions/tracked-agent.conf
+' || fail "the foreground agent process was not recorded"
+rm -f "${AFWS_STATE_DIR}/sessions/tracked-agent.conf"
+
 # Release runs from the EXIT trap and from the signal traps, so calling it more
 # than once must not unmount or close anything twice.
 release_probe="$(zsh -c '
@@ -214,8 +252,33 @@ release_probe="$(zsh -c '
 ')"
 [[ "$release_probe" == "released=1" ]] || fail "release is not idempotent (${release_probe})"
 
+# A TERM/HUP sent only to the launcher can leave its child agent alive. Normal
+# trap cleanup must hand that case to the watchdog instead of unmounting under
+# the surviving process.
+deferred_release_probe="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$AFWS_STATE_DIR"'
+  AFWS_MOUNT_BASE='"$AFWS_MOUNT_BASE"'
+  source '"$LIBRARY"'
+  afws_agent=codex afws_session_name=deferred-release afws_ssh_host=h
+  afws_remote_dir=/d afws_local_workspace=/w afws_mount_point=/w
+  afws_control_socket_path=""
+  afws_write_session_record interactive "$$" ""
+  /bin/sleep 30 &
+  agent_pid=$!
+  print -r -- "agent_pid=${agent_pid}" >> '"$AFWS_STATE_DIR"'/sessions/deferred-release.conf
+  afws_release_session /nonexistent-peers
+  [[ -e '"$AFWS_STATE_DIR"'/sessions/deferred-release.conf ]] && print -r -- DEFERRED
+  kill -9 "$agent_pid" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
+  rm -f '"$AFWS_STATE_DIR"'/sessions/deferred-release.conf
+')"
+[[ "$deferred_release_probe" == *DEFERRED* ]] || \
+  fail "cleanup did not defer to the watchdog for a surviving agent (${deferred_release_probe})"
+
 # A pre-authenticated SSH channel must expire on its own, because a session
-# killed with SIGKILL never closes it.
+# may still outlive both of its cleanup processes.
 grep -q 'AFWS_CONTROL_PERSIST:=[1-9]' "$LIBRARY" || \
   fail "the shared SSH connection has no finite ControlPersist"
 grep -q 'ControlPersist=\${AFWS_CONTROL_PERSIST}' "$LIBRARY" || \
@@ -313,6 +376,10 @@ grep -q "trap 'afws_release_for_traps; exit 129' HUP" "$LIBRARY" || \
 for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
   grep -q 'afws_install_release_traps' "$launcher" || \
     fail "${launcher:t} does not install the release traps"
+  grep -q 'afws_start_release_watchdog' "$launcher" || \
+    fail "${launcher:t} does not start the crash-cleanup watchdog"
+  grep -q 'afws_run_tracked_agent' "$launcher" || \
+    fail "${launcher:t} does not record its agent process"
 done
 
 # A function defined inside another is global in zsh, so the trap cannot see a
@@ -343,6 +410,18 @@ AFWS_MOUNT_COMMAND="cat ${SANDBOX}/empty-table" "$PEERS" --count >/dev/null || \
   fail "'cat FILE' was rejected as the mount-table source"
 
 # --- launchers: dry run ---------------------------------------------------
+
+operating_rules="$(zsh -c 'source '"$LIBRARY"'; afws_shared_operating_rules')"
+[[ "$operating_rules" == *"two paths to the same project tree"* ]] || \
+  fail "the session instructions do not explain that the mount is the remote project"
+[[ "$operating_rules" == *"create a worktree or alternate checkout unless the user explicitly asks"* ]] || \
+  fail "the session instructions allow unsolicited Git worktrees"
+[[ "$operating_rules" == *"Use afws-run only"* ]] || \
+  fail "the session instructions do not limit afws-run to remote execution needs"
+[[ "$operating_rules" == *"Use afws-remount to repair the mount"* ]] || \
+  fail "the session instructions do not name the supported mount recovery command"
+[[ "$operating_rules" != *"prefer one remote command over many small local file operations"* ]] || \
+  fail "the session instructions still push project inspection through the remote shell"
 
 reset_state
 claude_plan="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
@@ -563,13 +642,18 @@ mkdir -p "$unreadable"
 chmod 000 "$unreadable"
 if ! ls -1 "$unreadable" >/dev/null 2>&1; then
   print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
-  stale="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
-  [[ "$stale" == *"present but not responding"* ]] || \
-    fail "a mount that does not respond to a directory read was reused"
-  [[ "$stale" == *"diskutil unmount force"* ]] || \
-    fail "the stale-mount message did not offer a way out"
-  [[ "$stale" == *ENXIO* ]] || \
-    fail "a mount that failed its read was not diagnosed as dead"
+  for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+    stale="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+      "$launcher" --dry-run example-workstation /remote/dead)"
+    [[ "$stale" == *"disconnected; reconnecting it before launch"* ]] || \
+      fail "${launcher:t} did not automatically repair a disconnected mount"
+    [[ "$stale" == *"Using a fresh SSH connection"* ]] || \
+      fail "${launcher:t} planned reconnection over the failed transport"
+    [[ "$stale" == *"Would unmount ${unreadable}"* ]] || \
+      fail "${launcher:t} did not plan to replace the disconnected mount"
+    [[ "$stale" == *"Would start "* ]] || \
+      fail "${launcher:t} stopped instead of continuing after planned repair"
+  done
 fi
 chmod 755 "$unreadable"
 
@@ -598,6 +682,15 @@ probe_elapsed=$(( SECONDS - probe_started ))
   fail "a mount that answered nothing was not reported as a timeout (${slow_probe})"
 (( probe_elapsed < 5 )) || \
   fail "AFWS_PROBE_TIMEOUT_SECONDS was ignored; the probe took ${probe_elapsed}s"
+
+print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
+slow_launch="$(PATH="${SLOW_BIN}:$PATH" AFWS_PROBE_TIMEOUT_SECONDS=1 \
+  AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
+[[ "$slow_launch" == *"did not answer within 1 seconds"* ]] || \
+  fail "a launcher did not report an ambiguous mount timeout"
+[[ "$slow_launch" != *"reconnecting it before launch"* ]] || \
+  fail "a launcher automatically replaced a mount on timeout alone"
 
 healthy_probe="$(zsh -c '
   set -eu
@@ -628,6 +721,8 @@ timeout_message="$(zsh -c '
 # be able to ask nor be able to reach the terminal the agent is drawing on.
 grep -q 'sshfs_options+=(-o BatchMode=yes)' "$LIBRARY" || \
   fail "sshfs was left able to ask for a password it has nobody to hear from"
+grep -q 'sshfs_options+=(-o dir_cache=no)' "$LIBRARY" || \
+  fail "sshfs directory caching can repeat the observed stale-empty readdir failure"
 grep -q 'afws_detached "$logfile" sshfs' "$LIBRARY" || \
   fail "sshfs was started without taking its controlling terminal away"
 
@@ -677,6 +772,113 @@ enxio_dead="$(zsh -c '
 [[ "$enxio_dead" == *"diskutil unmount force"* ]] || \
   fail "the dead-mount message stopped offering a way out"
 
+# --- afws-remount --------------------------------------------------------
+
+: > "$FAKE_MOUNTS"
+remount_new="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --dry-run example-workstation /remote/project)"
+[[ "$remount_new" == *"Would mount example-workstation:/remote/project"* ]] || \
+  fail "afws-remount did not plan a missing mount"
+
+remount_new_fresh="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --fresh-connection --dry-run example-workstation /remote/project)"
+[[ "$remount_new_fresh" == *"Using a fresh SSH connection"* ]] || \
+  fail "afws-remount could not request a fresh connection for a missing mount"
+[[ "$remount_new_fresh" != *"over a shared SSH connection"* ]] || \
+  fail "afws-remount mixed fresh and shared connection modes"
+
+remount_from_session="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$REMOUNT" --dry-run)"
+[[ "$remount_from_session" == *"Would mount example-workstation:/remote/project"* ]] || \
+  fail "afws-remount did not use the current session target"
+
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse)" > "$FAKE_MOUNTS"
+remount_healthy="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --dry-run example-workstation /remote/project)"
+[[ "$remount_healthy" == *"Mount is healthy: ${FAKE_ROOT}"* ]] || \
+  fail "afws-remount offered to replace a healthy mount"
+
+remount_forced="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --force --dry-run example-workstation /remote/project)"
+[[ "$remount_forced" == *"Would unmount ${FAKE_ROOT}"* ]] || \
+  fail "afws-remount --force could not replace a healthy-looking wrong mount"
+[[ "$remount_forced" == *"Would mount example-workstation:/remote/project"* ]] || \
+  fail "afws-remount --force lost the source of a healthy-looking mount"
+[[ "$remount_forced" == *"Using a fresh SSH connection"* ]] || \
+  fail "afws-remount reused the possibly broken transport of a replacement mount"
+[[ "$remount_forced" != *"over a shared SSH connection"* ]] || \
+  fail "afws-remount attached a replacement to the old shared connection"
+
+remount_reused="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --force --reuse-connection --dry-run example-workstation /remote/project)"
+[[ "$remount_reused" == *"over a shared SSH connection"* ]] || \
+  fail "afws-remount --reuse-connection did not keep password-auth recovery available"
+
+expect_rejected "conflicting afws-remount connection modes" \
+  "$REMOUNT" --fresh-connection --reuse-connection --dry-run \
+  example-workstation /remote/project
+
+write_record remount-user-1 codex "$$" example-workstation /remote/project \
+  "$(date +%s)" "$FAKE_ROOT" "$FAKE_ROOT"
+write_record remount-user-2 codex "$$" example-workstation /remote/project \
+  "$(date +%s)" "$FAKE_ROOT" "$FAKE_ROOT"
+expect_rejected "remounting a workspace shared by live sessions without explicit approval" \
+  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --force --dry-run example-workstation /remote/project
+remount_shared="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --force --force-shared --dry-run example-workstation /remote/project)"
+[[ "$remount_shared" == *"Would unmount ${FAKE_ROOT}"* ]] || \
+  fail "afws-remount --force-shared did not acknowledge a shared replacement"
+rm -f "${AFWS_STATE_DIR}/sessions/remount-user-1.conf" \
+  "${AFWS_STATE_DIR}/sessions/remount-user-2.conf"
+
+readonly FAIL_BIN="${SANDBOX}/fail-bin"
+mkdir -p "$FAIL_BIN"
+cat >| "${FAIL_BIN}/ls" <<'STUB_LS_FAIL'
+#!/bin/zsh
+exit 1
+STUB_LS_FAIL
+chmod +x "${FAIL_BIN}/ls"
+
+# A confirmed disconnected mount is already unusable to every attached
+# session. Startup repair may restore it for all of them without treating that
+# restorative action like a forced replacement of a responding mount.
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse)" > "$FAKE_MOUNTS"
+write_record remount-dead-user-1 codex "$$" example-workstation /remote/project \
+  "$(date +%s)" "$FAKE_ROOT" "$FAKE_ROOT"
+write_record remount-dead-user-2 claude "$$" example-workstation /remote/project \
+  "$(date +%s)" "$FAKE_ROOT" "$FAKE_ROOT"
+remount_confirmed_shared="$(PATH="${FAIL_BIN}:$PATH" \
+  AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --dry-run example-workstation /remote/project)"
+[[ "$remount_confirmed_shared" == *"confirmed disconnected; repairing it for all"* ]] || \
+  fail "afws-remount refused automatic repair of a confirmed dead shared mount"
+rm -f "${AFWS_STATE_DIR}/sessions/remount-dead-user-1.conf" \
+  "${AFWS_STATE_DIR}/sessions/remount-dead-user-2.conf"
+
+# A subdirectory session may be using a broader mount. Recovery must recreate
+# the original source and mount point, not put a second mount inside it.
+remount_failed="$(PATH="${FAIL_BIN}:$PATH" AFWS_PROBE_TIMEOUT_SECONDS=1 \
+  AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --dry-run example-workstation /remote/project/inner)"
+[[ "$remount_failed" == *"Would unmount ${FAKE_ROOT}"* ]] || \
+  fail "afws-remount did not release a confirmed failed mount"
+[[ "$remount_failed" == *"Would mount example-workstation:/remote/project"* ]] || \
+  fail "afws-remount lost the root of a reused parent mount"
+[[ "$remount_failed" != *"example-workstation:/remote/project/inner"* ]] || \
+  fail "afws-remount planned a nested replacement mount"
+
+print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse)" > "$FAKE_MOUNTS"
+expect_rejected "remounting over a nested work-station mount" \
+  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$REMOUNT" --dry-run example-workstation /remote/project
+
+expect_rejected "afws-remount without a target outside a session" \
+  env -u AFWS_SSH_HOST -u AFWS_REMOTE_DIR "$REMOUNT" --dry-run
+expect_rejected "a relative afws-remount directory" \
+  "$REMOUNT" --dry-run example-workstation relative
+
 # --- afws-run -------------------------------------------------------------
 
 runner_plan="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"
@@ -698,6 +900,107 @@ environment_stdin="$(print -r -- 'echo remote-script' | \
   AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project "$RUNNER" --dry-run)"
 [[ "$environment_stdin" == *"bash\\ -s"* ]] || \
   fail "afws-run did not accept a piped script using the session environment"
+
+# Inside a mounted session, project files and Git belong on the mount. The
+# guard's diagnostic stays on one line so one corrected tool call does not add
+# an explanation-sized chunk to the agent's context.
+guard_status=0
+guard_output="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run git status 2>&1)" || guard_status=$?
+(( guard_status != 0 )) || fail "afws-run allowed Git through the remote shell in a mounted session"
+[[ "$guard_output" == *"use the mounted workspace"* ]] || \
+  fail "the remote-file guard did not explain the local route (${guard_output})"
+[[ "$guard_output" != *$'\n'* ]] || \
+  fail "the remote-file guard wastes context with a multi-line diagnostic (${guard_output})"
+
+for guarded_command in rg mkdir /usr/bin/git; do
+  expect_rejected "remote project command ${guarded_command} in a mounted session" \
+    env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+    AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+    "$RUNNER" --dry-run "$guarded_command" probe
+done
+
+expect_rejected "a shell-wrapped remote Git worktree" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run sh -c 'cd src && git worktree add ../copy'
+expect_rejected "a shell-wrapped remote directory creation" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash -lc 'mkdir generated'
+expect_rejected "a multiline shell-wrapped remote project scan" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash -lc $'printf "TRUTH_FILES\\n"\nfind datasets results reports configs -maxdepth 5 -type f | sort\nprintf "DONE\\n"'
+expect_rejected "a later shell-wrapped remote project scan" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash -lc 'nvidia-smi; grep pattern logs/job.log'
+expect_rejected "a project scan behind env" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run env RUN_KIND=probe find .
+expect_rejected "a project scan behind extra shell options" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash --noprofile -lc 'find .'
+expect_rejected "a project scan after a shell control keyword" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash -lc 'if true; then find .; fi'
+expect_rejected "a generic remote shell" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run bash
+
+stdin_guard_status=0
+stdin_guard_output="$(print -r -- 'find .' | \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run 2>&1)" || stdin_guard_status=$?
+(( stdin_guard_status != 0 )) || \
+  fail "afws-run allowed a project scan in a standard-input script"
+[[ "$stdin_guard_output" != *$'\n'* ]] || \
+  fail "the standard-input guard wastes context with a multi-line diagnostic"
+
+stdin_runtime="$(print -r -- 'pytest -q' | \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run)"
+[[ "$stdin_runtime" == *"bash\\ -s"* ]] || \
+  fail "the standard-input guard rejected a runtime script"
+
+allowed_remote_files="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run --allow-remote-files git status)"
+[[ "$allowed_remote_files" == *"git\\ status"* ]] || \
+  fail "--allow-remote-files did not allow an explicit remote-side operation"
+
+outside_mount_git="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- git status)"
+[[ "$outside_mount_git" == *"git\\ status"* ]] || \
+  fail "the mounted-session guard changed afws-run outside a mounted session"
+
+remote_pipeline="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \
+  "$RUNNER" --dry-run sh -c 'nvidia-smi | wc -l')"
+[[ "$remote_pipeline" == *nvidia-smi* ]] || \
+  fail "the remote-file guard rejected a shell-wrapped environment command"
+
+# The launcher's own helper directory wins over stale installations elsewhere
+# on PATH, keeping the injected instructions and the executable guard in sync.
+exported_path="$(zsh -c '
+  set -eu
+  SCRIPT_DIR=/current/afws/bin
+  source '"$LIBRARY"'
+  afws_agent=codex afws_session_name=s afws_ssh_host=h
+  afws_remote_dir=/d afws_local_workspace=/w afws_control_socket_path=""
+  PATH=/stale/bin:/usr/bin
+  afws_export_session_environment
+  print -r -- "$PATH"
+')"
+[[ "$exported_path" == /current/afws/bin:* ]] || \
+  fail "a session can resolve a stale afws-run before its launcher's helper"
 
 # Inside a session everything given is the remote command, so no '--' and no
 # host: short enough to type after Claude Code's '!'.
@@ -925,6 +1228,12 @@ write_record cx-release-2 codex "$$" example-workstation /remote/project "$(date
 [[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 2 ]] || \
   fail "a session of the other agent sharing the mount was not counted"
 
+write_record cx-agent-only codex 999999 example-workstation /remote/project 1000000000 \
+  "$RELEASE_POINT" "$RELEASE_POINT" "$$"
+[[ "$("$PEERS" --users-of-mount "$RELEASE_POINT")" == 3 ]] || \
+  fail "a surviving agent with a dead launcher was not counted"
+rm -f "${AFWS_STATE_DIR}/sessions/cx-agent-only.conf"
+
 [[ "$(AFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-mount "$RELEASE_POINT")" == 1 ]] || \
   fail "--users-of-mount did not exclude the current session"
 [[ "$(AFWS_SESSION_NAME=fws-release-1 "$PEERS" --users-of-host example-workstation)" == 1 ]] || \
@@ -958,6 +1267,61 @@ not_mounted="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$UMOUNT" example-worksta
 expect_rejected "an invalid host for afws-umount" "$UMOUNT" 'invalid host' /remote/project
 expect_rejected "a relative directory for afws-umount" "$UMOUNT" example-workstation relative
 expect_rejected "--orphaned combined with a host" "$UMOUNT" --orphaned example-workstation /remote/project
+
+# SIGKILL cannot run a shell trap. The detached watchdog waits for a surviving
+# agent, then removes the record and releases the mount after that agent ends.
+watch_umount_marker="${SANDBOX}/watchdog-umount"
+watch_log="${SANDBOX}/watchdog.log"
+watch_name=cx-watchdog-probe
+: > "$watch_umount_marker"
+
+apply_umount_stub="${STUB_BIN}/umount"
+cat >| "$apply_umount_stub" <<'STUB_UMOUNT'
+#!/bin/zsh
+print -r -- "$1" >> "$STUB_UMOUNT_MARKER"
+STUB_UMOUNT
+chmod +x "$apply_umount_stub"
+
+/bin/sleep 30 &
+watch_launcher_pid=$!
+/bin/sleep 30 &
+watch_agent_pid=$!
+write_record "$watch_name" codex "$watch_launcher_pid" example-workstation \
+  /remote/project 1000000000 "$RELEASE_POINT" "$RELEASE_POINT" "$watch_agent_pid"
+
+PATH="${STUB_BIN}:$PATH" STUB_UMOUNT_MARKER="$watch_umount_marker" \
+  AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$UMOUNT" --watch-launcher "$watch_launcher_pid" "$watch_name" \
+  >"$watch_log" 2>&1 &
+watchdog_pid=$!
+watch_ready="${AFWS_STATE_DIR}/watchdogs/${watch_name}.${watch_launcher_pid}.ready"
+watch_waited=0
+while (( watch_waited < 10 )) && [[ ! -s "$watch_ready" ]]; do
+  sleep 1
+  watch_waited=$(( watch_waited + 1 ))
+done
+[[ -s "$watch_ready" ]] || fail "the cleanup watchdog did not become ready"
+
+kill -9 "$watch_launcher_pid" 2>/dev/null || true
+wait "$watch_launcher_pid" 2>/dev/null || true
+sleep 2
+[[ -e "${AFWS_STATE_DIR}/sessions/${watch_name}.conf" ]] || \
+  fail "the watchdog removed a session whose agent was still alive"
+[[ ! -s "$watch_umount_marker" ]] || \
+  fail "the watchdog unmounted a workspace underneath a surviving agent"
+
+kill -9 "$watch_agent_pid" 2>/dev/null || true
+wait "$watch_agent_pid" 2>/dev/null || true
+watch_waited=0
+while (( watch_waited < 10 )) && kill -0 "$watchdog_pid" 2>/dev/null; do
+  sleep 1
+  watch_waited=$(( watch_waited + 1 ))
+done
+wait "$watchdog_pid" 2>/dev/null || fail "the cleanup watchdog failed: $(cat "$watch_log")"
+[[ ! -e "${AFWS_STATE_DIR}/sessions/${watch_name}.conf" ]] || \
+  fail "the cleanup watchdog left its dead session registered"
+[[ "$(cat "$watch_umount_marker")" == "$RELEASE_POINT" ]] || \
+  fail "the cleanup watchdog did not unmount the dead session"
 
 reset_state
 
