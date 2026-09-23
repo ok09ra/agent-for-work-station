@@ -16,22 +16,24 @@ claudefws
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
-`codexfws`もまったく同じ2つの引数を取ります。エージェントの追加引数はその後ろへ続けられます。
+`codexfws`も同じ2つの引数を取ります。Codexからローカル資料を使う場合だけ、許可するディレクトリを起動前に指定します。
 
 ```zsh
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY --model MODEL_NAME
+codexfws --allow-local-files /LOCAL/DATA SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 ## 起動時の動作
 
-1. 指定した接続先とリモートディレクトリに対応する既存のSSHFSマウントを探します。
-2. 見つかれば再利用し、なければユーザーのホームディレクトリ配下へ新しくマウントします。
+1. ClaudeではSSHFS作業ツリー、CodexではFinder/VS Code用rclone NFSビューを探します。
+2. Codex自身は空のローカル制御ディレクトリで起動し、リモートプロジェクトを正本として扱います。
 3. 接続先への認証済みSSH接続を1本だけ開きます。パスワードや鍵のパスフレーズを求められる場合は、ここで入力します。
 4. `fws-HOST-PROJECT-N`形式の未使用のセッション名を決めます。
 5. `~/.afws/sessions/`へセッションを登録し、他のセッションから担当範囲が見えるようにします。
-6. マウントポイントを作業ディレクトリとして、リモート作業用の指示を与えてエージェントを起動します。`claudefws`はセッション名と`--permission-mode auto`を、`codexfws`は`--sandbox workspace-write`と`--ask-for-approval on-request`を渡します。
+6. `claudefws`はマウント内、`codexfws`は制御ディレクトリ内で起動します。Codexのプロジェクト操作はすべて`afws-run`経由です。
 
-エージェントはローカルで動き、マウントしたワークスペース上でファイルを確認・編集します。Python、テスト、ビルド、GPU確認などリモート環境に依存する処理は、SSH接続先で実行します。
+どちらのエージェントもMacで動きます。Codexでは読み取り・編集・Git・実行を含む全プロジェクト操作がSSH接続先で動きます。表示用ビューが切れてもCodexの作業は継続できます。
 
 ## リモートコマンドを手動で実行する
 
@@ -118,6 +120,15 @@ afws-run --allow-remote-files COMMAND ARG...
 これは利用者が自分で打つ場合にも適用されます。ClaudeとCodexには同じ指示が渡り、`afws-run`をワークステーションの環境が必要なプログラムだけに使います。
 
 ## ローカルの資料とリモートの計算を1つのセッションで
+
+Codexでは明示的に許可し、必要ならプロジェクトへ直接ストリーム転送します。
+
+```zsh
+codexfws --allow-local-files ~/Documents/input SSH_CONFIG_HOST /remote/project
+afws-push ~/Documents/input data
+```
+
+この例は`/remote/project/data/input`へ転送します。中間コピーは作らず、許可範囲外のローカルパスと`..`や絶対パスによるリモートプロジェクト外への転送を拒否します。
 
 プロジェクトはリモートにありますが、**作業の材料**はローカルにあることが多いはずです。論文、ノート、手元の試し計算。多くの場合、事前の準備は要りません。両側ともMac上のただのパスであり、シェルコマンドはワークスペースに限定されず、ファイルツールもワークスペース外の絶対パスを受け付けるため、会話の中でパスを言えば足ります。
 

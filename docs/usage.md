@@ -16,22 +16,24 @@ To skip the prompts, pass an SSH configuration alias and the remote project's ab
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
-`codexfws` takes exactly the same two arguments. Append any additional agent arguments after them:
+`codexfws` takes the same two target arguments. Explicitly allow a local input directory before them when Codex needs local material:
 
 ```zsh
 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY --model MODEL_NAME
+codexfws --allow-local-files /LOCAL/DATA SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 
 ## What happens at startup
 
-1. The launcher looks for an existing SSHFS mount that covers the selected host and remote directory.
-2. It reuses that mount when found, or creates a new mount under the user's home directory.
+1. Claude looks for an SSHFS working tree; Codex looks for a Finder/VS Code rclone NFS view.
+2. Codex itself starts in an empty local control directory and treats the remote project as authoritative.
 3. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
 4. It picks an unused session name of the form `fws-HOST-PROJECT-N`.
 5. It records the session in `~/.afws/sessions/` so other sessions can see what this one is working on.
-6. It starts the agent in the mount, with instructions for working against a remote host. `claudefws` passes the session name and `--permission-mode auto`; `codexfws` passes `--sandbox workspace-write` and `--ask-for-approval on-request`.
+6. Claude starts in its mount; Codex starts in the control directory and performs every project operation through `afws-run`.
 
-The agent runs locally and inspects and edits files through the mounted workspace. Python, tests, builds, GPU checks, and other remote-environment operations run on the SSH host.
+Both agents run on the Mac. Under Codex, project reads, edits, Git, tests and builds all run on the SSH host. Its work continues if the visibility mount drops.
 
 ## Run a remote command manually
 
@@ -149,6 +151,15 @@ This applies to what you type too. Claude and Codex receive the same instruction
 to reserve `afws-run` for programs that need the workstation's environment.
 
 ## Local material and remote compute in one session
+
+For Codex, opt in to local material and stream it directly into the remote project when needed:
+
+```zsh
+codexfws --allow-local-files ~/Documents/input SSH_CONFIG_HOST /remote/project
+afws-push ~/Documents/input data
+```
+
+This creates `/remote/project/data/input`, without an intermediate copy. Sources outside the allowed local roots and destinations outside the remote project are rejected.
 
 The project is remote, but what you are working *from* is often local: papers, a
 notes directory, a scratch analysis. Usually nothing has to be arranged. Both

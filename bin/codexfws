@@ -23,6 +23,9 @@ readonly PEERS="${SCRIPT_DIR}/afws-peers"
 readonly REMOUNT="${SCRIPT_DIR}/afws-remount"
 readonly UMOUNT="${SCRIPT_DIR}/afws-umount"
 dry_run=0
+resume_mode=0
+typeset -a local_directory_flags
+local_directory_flags=()
 
 usage() {
   print -r -- "Codex CLI for Work Station"
@@ -30,10 +33,14 @@ usage() {
   print -r -- "Usage:"
   print -r -- "  codexfws"
   print -r -- "  codexfws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY [CODEX_ARGS ...]"
+  print -r -- "  codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY"
   print -r -- "  codexfws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY"
   print -r -- ""
   print -r -- "Options:"
   print -r -- "  -n, --dry-run       Print the planned mount and launch, change nothing."
+  print -r -- "  --allow-local-files PATH"
+  print -r -- "                      Allow one local directory in this session (repeatable)."
+  print -r -- "  --resume            Open the Codex session picker across previous workspaces."
   print -r -- ""
   print -r -- "With no arguments, codexfws prompts for the SSH host and remote directory."
   print -r -- ""
@@ -45,8 +52,7 @@ usage() {
   print -r -- "  AFWS_KEEP_CONTROL_MASTER Keep that connection open after the last session"
   print -r -- "                           exits, so a password host is not asked again"
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
-  print -r -- "  AFWS_ADD_DIR             Extra local directories, colon-separated, that the"
-  print -r -- "                           session may also write to"
+  print -r -- "  AFWS_ADD_DIR             Legacy colon-separated form of --allow-local-files"
   print -r -- ""
   print -r -- "Codex CLI cannot be given a session name at launch, cannot report its"
   print -r -- "sessions in machine-readable form, and has no shell wrapper, so a Codex"
@@ -58,6 +64,12 @@ while (( $# > 0 )); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -n|--dry-run) dry_run=1; shift ;;
+    --resume) resume_mode=1; shift ;;
+    --allow-local-files)
+      (( $# >= 2 )) || afws_die "--allow-local-files requires a directory"
+      local_directory_flags+=("$2")
+      shift 2
+      ;;
     *) break ;;
   esac
 done
@@ -75,6 +87,29 @@ else
   exit 2
 fi
 
+# Launcher options are also accepted after HOST and REMOTE_DIR. This matches
+# the natural command-line form people use while still preserving every
+# unrecognized argument, in order, for Codex itself.
+typeset -a codex_arguments
+codex_arguments=()
+while (( $# > 0 )); do
+  case "$1" in
+    --resume) resume_mode=1; shift ;;
+    --allow-local-files)
+      (( $# >= 2 )) || afws_die "--allow-local-files requires a directory"
+      local_directory_flags+=("$2")
+      shift 2
+      ;;
+    --)
+      shift
+      codex_arguments+=("$@")
+      break
+      ;;
+    *) codex_arguments+=("$1"); shift ;;
+  esac
+done
+set -- "${codex_arguments[@]}"
+
 afws_validate_host "$ssh_host"
 remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
 
@@ -83,6 +118,15 @@ remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
 # list with --add-dir; a caller sets one variable either way.
 typeset -a extra_directories
 extra_directories=(${(f)"$(afws_extra_directories)"})
+for local_directory in "${local_directory_flags[@]}"; do
+  [[ "$local_directory" == /* ]] ||
+    afws_die "--allow-local-files requires an absolute directory: ${local_directory}"
+  [[ "$local_directory" != *[[:cntrl:]]* ]] ||
+    afws_die "--allow-local-files does not accept control characters"
+  [[ -d "$local_directory" ]] ||
+    afws_die "--allow-local-files names a directory that does not exist: ${local_directory}"
+  extra_directories+=("$local_directory")
+done
 
 typeset -a extra_arguments
 extra_arguments=()
@@ -91,12 +135,12 @@ if (( ${#extra_directories} > 0 )); then
 fi
 
 if (( ! dry_run )); then
-  for dependency in ssh sshfs codex; do
+  for dependency in ssh rclone diskutil codex; do
     command -v "$dependency" >/dev/null 2>&1 ||
       afws_die "required command not found: ${dependency}; run afws-doctor"
   done
 
-  for helper in afws-run afws-peers afws-lock afws-remount afws-umount; do
+  for helper in afws-run afws-push afws-peers afws-lock afws-remount afws-umount; do
     [[ -x "${SCRIPT_DIR}/${helper}" ]] ||
       afws_die "${helper} is not installed next to codexfws"
   done
@@ -108,22 +152,33 @@ fi
 # does not know it. The cx- prefix says the name is ours, not the agent's.
 
 afws_agent=codex
+afws_remote_first=1
 afws_ssh_host="$ssh_host"
 afws_remote_dir="$remote_dir"
 afws_session_name="$(afws_resolve_session_name cx "$ssh_host" "$remote_dir" "$PEERS" "$dry_run")"
 
 afws_open_session_connection "$ssh_host" "$dry_run"
-afws_establish_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
-  "$dry_run" "$afws_session_name" "$REMOUNT"
-afws_warn_about_home_workspace "$afws_local_workspace" codex
+afws_establish_visibility_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
+  "$dry_run" "$afws_session_name" "$PEERS"
+afws_visibility_workspace="$afws_mount_point"
+afws_local_workspace="${AFWS_CONTROL_WORKSPACE_DIR}/${ssh_host}${remote_dir}"
+afws_allowed_local_dirs="${(j.:.)extra_directories}"
+if (( ! dry_run )); then
+  mkdir -p "$afws_local_workspace"
+  chmod 700 "$AFWS_CONTROL_WORKSPACE_DIR" "$afws_local_workspace" 2>/dev/null || true
+fi
 
 # --- session instructions -------------------------------------------------
 
-developer_instructions="$(afws_session_preamble)
+developer_instructions="This is a remote-first agent-for-work-station session.
+Session name: ${afws_session_name}
+SSH config host: ${afws_ssh_host}
+Remote working directory: ${afws_remote_dir}
+Local control workspace: ${afws_local_workspace}
+Finder/VS Code view: ${afws_visibility_workspace}
 
 Operating rules:
-$(afws_shared_operating_rules)
-- Commands you run with the ordinary shell run on this Mac, not on the workstation, even though the files are the workstation's. Only afws-run reaches the workstation.
+$(afws_remote_first_operating_rules)
 
 Multi-session rules:
 $(afws_shared_session_rules)
@@ -134,7 +189,11 @@ afws_print_session_header "Codex CLI for Work Station" "$PEERS" "$dry_run" \
 
 if (( dry_run )); then
   print -r -- "Would start Codex with:"
-  print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions>"
+  if (( resume_mode )); then
+    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions> resume --all"
+  else
+    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}} --config developer_instructions=<session instructions>"
+  fi
   print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${afws_session_name}.conf"
   exit 0
 fi
@@ -149,6 +208,10 @@ afws_install_release_traps "$PEERS"
 afws_start_release_watchdog "$UMOUNT" "$$" || \
   afws_die "could not start the cleanup watchdog"
 
+typeset -a resume_arguments
+resume_arguments=()
+(( resume_mode )) && resume_arguments=(resume --all)
+
 session_exit=0
 afws_run_tracked_agent "$$" codex \
   --no-alt-screen \
@@ -157,6 +220,7 @@ afws_run_tracked_agent "$$" codex \
   --ask-for-approval on-request \
   "${extra_arguments[@]}" \
   --config "developer_instructions=${developer_instructions}" \
+  "${resume_arguments[@]}" \
   "$@" || session_exit=$?
 
 exit "$session_exit"

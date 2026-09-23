@@ -35,6 +35,9 @@ AFWS_SESSION_DIR="${AFWS_STATE_DIR}/sessions"
 AFWS_CONTROL_DIR="${AFWS_STATE_DIR}/control"
 AFWS_LOG_DIR="${AFWS_STATE_DIR}/logs"
 AFWS_WATCHDOG_DIR="${AFWS_STATE_DIR}/watchdogs"
+AFWS_MOUNT_RECORD_DIR="${AFWS_STATE_DIR}/mounts"
+AFWS_RCLONE_CACHE_DIR="${AFWS_STATE_DIR}/rclone-cache"
+AFWS_CONTROL_WORKSPACE_DIR="${AFWS_STATE_DIR}/workspaces"
 # Overridable: a slow link may need longer than this.
 : ${AFWS_MOUNT_TIMEOUT_SECONDS:=30}
 # A dead FUSE mount can leave umount itself waiting in the kernel. Recovery
@@ -291,6 +294,263 @@ afws_find_nested_mount() {
 
 afws_mount_is_present() {
   ${=AFWS_MOUNT_COMMAND} | grep -Fq " on $1 ("
+}
+
+# Codex works on the remote tree through afws-run. This separate rclone/NFS
+# mount exists only so Finder and VS Code can display the project.
+afws_visibility_record() {
+  print -r -- "${AFWS_MOUNT_RECORD_DIR}/$1$2.conf"
+}
+
+afws_read_visibility_record() {
+  local record="$1" line key value
+
+  afws_visibility_host=""
+  afws_visibility_remote=""
+  afws_visibility_mount=""
+  afws_visibility_pid=""
+  [[ -r "$record" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      ssh_host) afws_visibility_host="$value" ;;
+      remote_dir) afws_visibility_remote="$value" ;;
+      mount_point) afws_visibility_mount="$value" ;;
+      pid) afws_visibility_pid="$value" ;;
+    esac
+  done < "$record"
+  [[ -n "$afws_visibility_host" && -n "$afws_visibility_remote" &&
+     -n "$afws_visibility_mount" ]]
+}
+
+afws_visibility_process_is_alive() {
+  local pid="$1"
+  case "$pid" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+afws_stop_visibility_process() {
+  local pid="$1" waited=0
+
+  afws_visibility_process_is_alive "$pid" || return 0
+  kill -TERM "$pid" 2>/dev/null || return 0
+  while afws_visibility_process_is_alive "$pid"; do
+    if (( waited >= AFWS_UNMOUNT_TIMEOUT_SECONDS )); then
+      kill -KILL "$pid" 2>/dev/null || true
+      return 0
+    fi
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+}
+
+# macOS can briefly keep an NFS mount in the mount table after umount returns.
+# Two consecutive absent observations prevent that retiring mount from being
+# mistaken for the replacement that rclone has not created yet.
+afws_wait_for_mount_absence() {
+  local workspace="$1" waited=0 absent_observations=0
+
+  while (( waited < AFWS_UNMOUNT_TIMEOUT_SECONDS )); do
+    if afws_mount_is_present "$workspace"; then
+      absent_observations=0
+    else
+      absent_observations=$(( absent_observations + 1 ))
+      (( absent_observations >= 2 )) && return 0
+    fi
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+  return 1
+}
+
+afws_unmount_visibility_mount() {
+  local workspace="$1"
+
+  if afws_mount_is_present "$workspace"; then
+    afws_run_with_timeout "$AFWS_UNMOUNT_TIMEOUT_SECONDS" umount "$workspace" 2>/dev/null ||
+      diskutil unmount force "$workspace" >/dev/null 2>&1 || return 1
+  fi
+  afws_wait_for_mount_absence "$workspace"
+}
+
+# A successful local readdir alone can hide a stale empty mount. Confirm that
+# one ordinary (non-symlink) remote entry is visible locally as well.
+afws_visibility_mount_is_healthy() {
+  local ssh_host="$1" remote_dir="$2" workspace="$3" socket="$4"
+  local remote_entry local_entry remote_command
+  local -a ssh_options
+
+  afws_mount_is_present "$workspace" || return 1
+  afws_directory_responds "$workspace" || return 1
+  ssh_options=(-o BatchMode=yes)
+  [[ -n "$socket" ]] && ssh_options+=(-S "$socket")
+  remote_command="cd ${(q)remote_dir} && find . -mindepth 1 -maxdepth 1 ! -type l -print -quit"
+  remote_entry="$(ssh "${ssh_options[@]}" "$ssh_host" "$remote_command" 2>/dev/null)" || return 1
+  remote_entry="${remote_entry#./}"
+
+  if [[ -n "$remote_entry" ]]; then
+    [[ -e "${workspace}/${remote_entry}" || -L "${workspace}/${remote_entry}" ]]
+    return
+  fi
+  local_entry="$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"
+  [[ -z "$local_entry" ]]
+}
+
+# afws_visibility_mount HOST REMOTE_DIR WORKSPACE SOCKET LOGFILE
+afws_visibility_mount() {
+  local ssh_host="$1" remote_dir="$2" workspace="$3" socket="$4" logfile="$5"
+  local record pidfile cache_dir waited=0 ssh_command pid="" failure
+  local -a rclone_options
+
+  record="$(afws_visibility_record "$ssh_host" "$remote_dir")"
+  pidfile="${record}.pid"
+  cache_dir="${AFWS_RCLONE_CACHE_DIR}/${ssh_host}${remote_dir}"
+  mkdir -p "$workspace" "${record:h}" "$cache_dir" "${logfile:h}"
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_MOUNT_RECORD_DIR" "$AFWS_RCLONE_CACHE_DIR" \
+    "$cache_dir" "$AFWS_LOG_DIR" 2>/dev/null || true
+
+  ssh_command="ssh -o BatchMode=yes"
+  [[ -n "$socket" ]] && ssh_command+=" -S ${(q)socket}"
+  ssh_command+=" ${(q)ssh_host}"
+  rclone_options=(
+    --sftp-ssh "$ssh_command"
+    --sftp-disable-hashcheck
+    --sftp-shell-type unix
+    --sftp-skip-links
+    --vfs-cache-mode writes
+    --vfs-write-back 1s
+    --cache-dir "$cache_dir"
+    --dir-cache-time 5s
+    --poll-interval 0
+    --vfs-case-insensitive=false
+    --noapplexattr
+  )
+
+  print -r -- "Mounting a Finder/VS Code view of ${ssh_host}:${remote_dir}"
+  print -r -- "  on ${workspace}"
+  print -r -- "  (native remote symlinks are omitted; Codex works remotely)"
+  rm -f "$pidfile"
+  afws_detached "$logfile" /bin/zsh -c '
+    set -eu
+    pidfile="$1"
+    shift
+    print -r -- "$$" > "$pidfile"
+    exec "$@"
+  ' afws-rclone "$pidfile" rclone nfsmount ":sftp:${remote_dir}" "$workspace" \
+    "${rclone_options[@]}"
+
+  while (( waited < AFWS_MOUNT_TIMEOUT_SECONDS )); do
+    if [[ -z "$pid" && -s "$pidfile" ]]; then
+      IFS= read -r pid < "$pidfile" || pid=""
+      case "$pid" in
+        ''|*[!0-9]*|0) pid="" ;;
+      esac
+    fi
+    if [[ -n "$pid" ]] && ! afws_visibility_process_is_alive "$pid"; then
+      failure="the rclone process exited before its view became ready"
+      break
+    fi
+    if [[ -n "$pid" ]] && afws_visibility_mount_is_healthy \
+      "$ssh_host" "$remote_dir" "$workspace" "$socket"; then
+      afws_visibility_pid="$pid"
+      (
+        umask 077
+        {
+          print -r -- "ssh_host=${ssh_host}"
+          print -r -- "remote_dir=${remote_dir}"
+          print -r -- "mount_point=${workspace}"
+          print -r -- "pid=${afws_visibility_pid}"
+        } > "$record"
+      )
+      rm -f "$pidfile"
+      return 0
+    fi
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+
+  if [[ -z "$failure" ]]; then
+    if [[ -z "$pid" ]]; then
+      failure="rclone did not report its process ID within ${AFWS_MOUNT_TIMEOUT_SECONDS} seconds"
+    elif afws_mount_is_present "$workspace"; then
+      failure="the Finder/VS Code view did not pass its remote-content check within ${AFWS_MOUNT_TIMEOUT_SECONDS} seconds"
+    else
+      failure="the rclone NFS view did not appear within ${AFWS_MOUNT_TIMEOUT_SECONDS} seconds"
+    fi
+  fi
+  afws_unmount_visibility_mount "$workspace" 2>/dev/null || true
+  afws_stop_visibility_process "$pid"
+  rm -f "$pidfile" "$record" 2>/dev/null || true
+
+  print -u2 -r -- "${AFWS_PROGRAM}: ${failure}: ${workspace}"
+  [[ -s "$logfile" ]] && tail -n 20 "$logfile" >&2
+  return 1
+}
+
+# afws_establish_visibility_mount HOST REMOTE_DIR SOCKET DRY_RUN LOG_NAME [PEERS]
+afws_establish_visibility_mount() {
+  local ssh_host="$1" remote_dir="$2" socket="$3" dry_run="$4" log_name="$5"
+  local peers="${6-}" record workspace existing_record=0 users=0 old_pid=""
+
+  workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+  record="$(afws_visibility_record "$ssh_host" "$remote_dir")"
+  afws_mount_point="$workspace"
+  if (( dry_run )); then
+    print -r -- "Would mount a Finder/VS Code view of ${ssh_host}:${remote_dir}"
+    print -r -- "  on ${workspace} with rclone NFS (remote symlinks omitted)"
+    [[ -n "$socket" ]] && print -r -- "  over a shared SSH connection at ${socket}"
+    return 0
+  fi
+
+  if afws_read_visibility_record "$record"; then
+    existing_record=1
+    [[ "$afws_visibility_mount" == "$workspace" ]] && old_pid="$afws_visibility_pid"
+  fi
+  if (( existing_record )) && [[ "$afws_visibility_mount" == "$workspace" ]] &&
+     afws_visibility_process_is_alive "$afws_visibility_pid" &&
+     afws_visibility_mount_is_healthy "$ssh_host" "$remote_dir" "$workspace" "$socket"; then
+    print -r -- "Reusing healthy Finder/VS Code view: ${workspace}"
+    return 0
+  fi
+
+  if afws_mount_is_present "$workspace"; then
+    if (( ! existing_record )) && [[ -x "$peers" ]]; then
+      users="$(env -u AFWS_SESSION_NAME "$peers" --users-of-mount "$workspace" 2>/dev/null)" || users=1
+      if (( users > 0 )); then
+        afws_die "the legacy SSHFS mount is still used by ${users} live session(s): ${workspace}
+Close those sessions before the one-time switch to the rclone Finder/VS Code view."
+      fi
+    fi
+    print -r -- "Replacing an unhealthy Finder/VS Code view: ${workspace}"
+    afws_unmount_visibility_mount "$workspace" ||
+      afws_die "could not detach the unhealthy view: ${workspace}"
+  elif ! afws_wait_for_mount_absence "$workspace"; then
+    afws_die "the old Finder/VS Code view did not finish detaching: ${workspace}"
+  fi
+  afws_stop_visibility_process "$old_pid"
+  rm -f "$record" "${record}.pid" 2>/dev/null || true
+  afws_visibility_mount "$ssh_host" "$remote_dir" "$workspace" "$socket" \
+    "${AFWS_LOG_DIR}/${log_name}.rclone.log"
+}
+
+afws_release_managed_mount() {
+  local mount_point="$1" candidate record="" pid=""
+
+  for candidate in "$AFWS_MOUNT_RECORD_DIR"/**/*.conf(N); do
+    afws_read_visibility_record "$candidate" || continue
+    [[ "$afws_visibility_mount" == "$mount_point" ]] || continue
+    pid="$afws_visibility_pid"
+    record="$candidate"
+    break
+  done
+  afws_unmount_visibility_mount "$mount_point" || return 1
+  afws_stop_visibility_process "$pid"
+  [[ -z "$record" ]] || rm -f "$record" "${record}.pid" 2>/dev/null || true
+  return 0
 }
 
 # The mount answering with ENXIO used to be reported as the sshfs process having
@@ -666,6 +926,20 @@ afws_shared_operating_rules() {
 - Ask before destructive, expensive, or long-running operations. Narrow slow SSHFS searches to relevant paths rather than moving project inspection to the remote shell."
 }
 
+afws_remote_first_operating_rules() {
+  print -r -- "- The remote working directory is the authoritative project. The local mount is only a Finder/VS Code view; do not use it for Codex project work.
+- Run every project read, search, edit, file-management, and Git operation through afws-run. This includes rg, find, cat, sed, patch application, and git status/diff/commit.
+- Run tests, builds, Python, and other project commands through afws-run too. Commands start in the remote project directory.
+- Transfer explicitly allowed local input with afws-push. Its destination is confined to the remote project.
+- Ordinary local shell and file tools are only for the empty control workspace and the local directories explicitly listed for this session. Do not copy or synchronize the remote project into the control workspace.
+- The Finder/VS Code view omits native remote symlinks because rclone SFTP cannot represent them faithfully. Use afws-run to inspect or operate through those paths.
+- If the Finder/VS Code view is unavailable, continue project work through afws-run; the view is not Codex's data path. Use afws-remount to recreate the view when convenient.
+- Do not invoke ssh, scp, sftp, or rsync directly to bypass the helpers.
+- Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
+- Show the remote command and only its relevant stdout and stderr to the user; keep large logs and listings out of context unless needed.
+- Ask before destructive, expensive, or long-running operations."
+}
+
 # The first multi-session rule is the same for both; the rest is not, because
 # only Claude sessions can be addressed.
 afws_shared_session_rules() {
@@ -822,6 +1096,8 @@ afws_export_session_environment() {
   export AFWS_SSH_HOST="$afws_ssh_host"
   export AFWS_REMOTE_DIR="$afws_remote_dir"
   export AFWS_LOCAL_WORKSPACE="$afws_local_workspace"
+  [[ "${afws_remote_first-0}" == 1 ]] && export AFWS_REMOTE_FIRST=1
+  [[ -z "${afws_allowed_local_dirs-}" ]] || export AFWS_ALLOWED_LOCAL_DIRS="$afws_allowed_local_dirs"
 
   [[ -S "$afws_control_socket_path" ]] && export AFWS_CONTROL_PATH="$afws_control_socket_path"
 
@@ -1084,7 +1360,7 @@ afws_release_session() {
       # A shell sitting inside the mount makes umount fail with "Resource busy",
       # and claudefws necessarily cd'd into it because claude has no -C.
       cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
-      if ! umount "$afws_mount_point" 2>/dev/null; then
+      if ! afws_release_managed_mount "$afws_mount_point"; then
         print -u2 -r -- "${AFWS_PROGRAM}: could not unmount ${afws_mount_point}"
         print -u2 -r -- "  release it with: diskutil unmount force ${(q)afws_mount_point}"
       fi

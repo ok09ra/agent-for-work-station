@@ -7,6 +7,7 @@ readonly LIBRARY="${REPOSITORY_ROOT}/lib/afws-common.zsh"
 readonly CLAUDE_LAUNCHER="${REPOSITORY_ROOT}/bin/claudefws"
 readonly CODEX_LAUNCHER="${REPOSITORY_ROOT}/bin/codexfws"
 readonly RUNNER="${REPOSITORY_ROOT}/bin/afws-run"
+readonly PUSHER="${REPOSITORY_ROOT}/bin/afws-push"
 readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
 readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
 readonly REMOUNT="${REPOSITORY_ROOT}/bin/afws-remount"
@@ -35,6 +36,7 @@ export AFWS_STATE_DIR="${SANDBOX}/state"
 export AFWS_MOUNT_BASE="${SANDBOX}/mounts"
 unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
   AFWS_AGENT AFWS_LOCAL_WORKSPACE AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
+  AFWS_REMOTE_FIRST AFWS_ALLOWED_LOCAL_DIRS \
   AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND AFWS_KEEP_CONTROL_MASTER \
   AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
 unset SSH_ASKPASS 2>/dev/null || true
@@ -130,6 +132,85 @@ timeout_probe="$(zsh -c '
 [[ "$timeout_probe" == $'failure=7\ntimeout=124' ]] || \
   fail "the bounded-command helper returned the wrong result (${timeout_probe})"
 
+# The detached rclone wrapper and the macOS mount table become visible on
+# independent schedules. A mount-table entry must never make the parent read a
+# PID file that has not been created yet, and a cold view gets health retries.
+visibility_lifecycle="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$SANDBOX"'/visibility-state
+  AFWS_MOUNT_BASE='"$SANDBOX"'/visibility-mounts
+  AFWS_MOUNT_TIMEOUT_SECONDS=6
+  AFWS_UNMOUNT_TIMEOUT_SECONDS=2
+  mount_table='"$SANDBOX"'/visibility-mount-table
+  : > "$mount_table"
+  AFWS_MOUNT_COMMAND="cat ${mount_table}"
+  source '"$LIBRARY"'
+  fake_pid=""
+  health_attempts=0
+  afws_detached() {
+    local pidfile="$6"
+    /bin/sleep 30 &
+    fake_pid=$!
+    (
+      afws_pause_seconds 1
+      print -r -- "$fake_pid" > "$pidfile"
+      print -r -- "localhost:/ on '"$SANDBOX"'/visibility-mounts/host/project (nfs)" > "$mount_table"
+    ) &!
+  }
+  afws_visibility_mount_is_healthy() {
+    afws_mount_is_present "$3" || return 1
+    health_attempts=$(( health_attempts + 1 ))
+    (( health_attempts >= 3 ))
+  }
+  result=0
+  afws_visibility_mount host /project '"$SANDBOX"'/visibility-mounts/host/project "" \
+    '"$SANDBOX"'/visibility.log || result=$?
+  record="$(afws_visibility_record host /project)"
+  afws_read_visibility_record "$record"
+  print -r -- "result=${result} pid=${afws_visibility_pid} attempts=${health_attempts}"
+  kill -TERM "$fake_pid" 2>/dev/null || true
+  wait "$fake_pid" 2>/dev/null || true
+' 2>&1)"
+[[ "$visibility_lifecycle" == *"result=0 pid="*" attempts=3"* ]] || \
+  fail "the visibility mount did not wait for its PID and healthy contents (${visibility_lifecycle})"
+[[ "$visibility_lifecycle" != *"no such file or directory"* ]] || \
+  fail "the visibility mount raced its PID file (${visibility_lifecycle})"
+
+# A view that never becomes healthy must not leave either its NFS mount, its
+# rclone process, or a management record behind for the next launch to trip on.
+visibility_failure="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$SANDBOX"'/failed-visibility-state
+  AFWS_MOUNT_BASE='"$SANDBOX"'/failed-visibility-mounts
+  AFWS_MOUNT_TIMEOUT_SECONDS=2
+  AFWS_UNMOUNT_TIMEOUT_SECONDS=2
+  mount_table='"$SANDBOX"'/failed-visibility-mount-table
+  : > "$mount_table"
+  AFWS_MOUNT_COMMAND="cat ${mount_table}"
+  source '"$LIBRARY"'
+  fake_pid=""
+  afws_detached() {
+    local pidfile="$6"
+    /bin/sleep 30 &
+    fake_pid=$!
+    print -r -- "$fake_pid" > "$pidfile"
+    print -r -- "localhost:/ on '"$SANDBOX"'/failed-visibility-mounts/host/project (nfs)" > "$mount_table"
+  }
+  afws_visibility_mount_is_healthy() { return 1 }
+  umount() { : > "$mount_table" }
+  result=0
+  afws_visibility_mount host /project '"$SANDBOX"'/failed-visibility-mounts/host/project "" \
+    '"$SANDBOX"'/failed-visibility.log || result=$?
+  alive=0
+  afws_visibility_process_is_alive "$fake_pid" && alive=1
+  record="$(afws_visibility_record host /project)"
+  print -r -- "result=${result} alive=${alive} mounted=$(afws_mount_is_present '"$SANDBOX"'/failed-visibility-mounts/host/project && print 1 || print 0) record=$([[ -e "$record" || -e "${record}.pid" ]] && print 1 || print 0)"
+' 2>&1)"
+[[ "$visibility_failure" == *"result=1 alive=0 mounted=0 record=0"* ]] || \
+  fail "a failed visibility mount leaked state (${visibility_failure})"
+
 # --- documentation --------------------------------------------------------
 
 for document in \
@@ -166,7 +247,7 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
@@ -177,7 +258,7 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-peers afws-lock afws-remount afws-umount afws-shell afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-push afws-peers afws-lock afws-remount afws-umount afws-shell afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
@@ -373,7 +454,7 @@ grep -q "trap 'afws_release_for_traps; exit 143' TERM" "$LIBRARY" || \
   fail "the launchers do not release what they hold on SIGTERM"
 grep -q "trap 'afws_release_for_traps; exit 129' HUP" "$LIBRARY" || \
   fail "the launchers do not release what they hold on SIGHUP"
-for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+for launcher in "$CLAUDE_LAUNCHER"; do
   grep -q 'afws_install_release_traps' "$launcher" || \
     fail "${launcher:t} does not install the release traps"
   grep -q 'afws_start_release_watchdog' "$launcher" || \
@@ -446,6 +527,15 @@ codex_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
 [[ "$codex_plan" == *"--sandbox workspace-write"* ]] || fail "codexfws dry run lost the sandbox flag"
 [[ "$codex_plan" == *"--ask-for-approval on-request"* ]] || fail "codexfws dry run lost the approval flag"
 [[ "$codex_plan" == *"developer_instructions="* ]] || fail "codexfws dry run did not plan session instructions"
+[[ "$codex_plan" == *"with rclone NFS"* ]] || fail "codexfws did not plan the stable visibility mount"
+[[ "$codex_plan" == *"${AFWS_STATE_DIR}/workspaces/example-workstation/remote/project"* ]] || \
+  fail "codexfws did not use a separate local control workspace"
+codex_resume_plan="$("$CODEX_LAUNCHER" --dry-run --resume example-workstation /remote/project)"
+[[ "$codex_resume_plan" == *" resume --all"* ]] || \
+  fail "codexfws --resume did not disable Codex's cwd-only history filter"
+codex_trailing_resume_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/project --resume)"
+[[ "$codex_trailing_resume_plan" == *" resume --all"* ]] || \
+  fail "codexfws did not accept --resume after the project arguments"
 [[ "$codex_plan" == *"--name "* ]] && fail "codexfws planned a --name flag that Codex does not have"
 [[ "$codex_plan" == *"Would label locally-run shell commands"* ]] && \
   fail "codexfws planned a shell marker that Codex cannot use"
@@ -561,6 +651,13 @@ codex_plan_plain="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/proj
 expect_rejected "a relative extra directory (codexfws)" \
   env AFWS_ADD_DIR=relative "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project
 
+codex_flag_extra="$($CODEX_LAUNCHER --dry-run --allow-local-files "${SANDBOX}/papers" \
+  example-workstation /remote/project)"
+[[ "$codex_flag_extra" == *"also:    ${SANDBOX}/papers"* ]] || \
+  fail "codexfws ignored --allow-local-files"
+expect_rejected "a relative --allow-local-files directory" \
+  "$CODEX_LAUNCHER" --dry-run --allow-local-files relative example-workstation /remote/project
+
 # Unsolicited peer messages interrupt another session and cost it budget, and
 # nothing asks the user first, so the session instructions have to narrow it.
 for phrase in 'nothing asks the user first' 'only when the user asked you to' \
@@ -580,7 +677,7 @@ mkdir -p "${FAKE_ROOT}/inner"
 
 print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
-for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+for launcher in "$CLAUDE_LAUNCHER"; do
   reuse="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$launcher" --dry-run example-workstation /remote/project/inner)"
   [[ "$reuse" == *"Reusing SSHFS mount: example-workstation:/remote/project"* ]] || \
     fail "${launcher:t} did not reuse a mount that already covers the requested directory"
@@ -590,13 +687,13 @@ done
 
 # Mounting a home directory is allowed but must say what it costs.
 print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
-[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" == "" ]] || \
+[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" != *"looks like a home directory"* ]] || \
   fail "a plain project workspace was reported as a home directory"
 
 # A project keeps its own .claude next to .git, so that is not a home signal.
 mkdir -p "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
 print -r -- '{"permissions":{"allow":[]}}' > "${FAKE_ROOT}/.claude/settings.json"
-[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" == "" ]] || \
+[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" != *"looks like a home directory"* ]] || \
   fail "a project with its own .claude was mistaken for a home directory"
 
 mkdir -p "${FAKE_ROOT}/.ssh"
@@ -617,10 +714,8 @@ silenced="$(AFWS_ALLOW_HOME_MOUNT=1 AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
 
 codex_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
   "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$codex_warning" == *"looks like a home directory"* ]] || \
-  fail "codexfws did not flag a home directory"
-[[ "$codex_warning" != *"Claude Code loads"* ]] || \
-  fail "codexfws claimed Claude Code would load the settings file"
+[[ "$codex_warning" != *"looks like a home directory"* ]] || \
+  fail "codexfws inspected the visibility mount as its workspace"
 
 rm -rf "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
 
@@ -642,7 +737,7 @@ mkdir -p "$unreadable"
 chmod 000 "$unreadable"
 if ! ls -1 "$unreadable" >/dev/null 2>&1; then
   print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
-  for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  for launcher in "$CLAUDE_LAUNCHER"; do
     stale="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
       "$launcher" --dry-run example-workstation /remote/dead)"
     [[ "$stale" == *"disconnected; reconnecting it before launch"* ]] || \
@@ -686,7 +781,7 @@ probe_elapsed=$(( SECONDS - probe_started ))
 print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
 slow_launch="$(PATH="${SLOW_BIN}:$PATH" AFWS_PROBE_TIMEOUT_SECONDS=1 \
   AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
+  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
 [[ "$slow_launch" == *"did not answer within 1 seconds"* ]] || \
   fail "a launcher did not report an ambiguous mount timeout"
 [[ "$slow_launch" != *"reconnecting it before launch"* ]] || \
@@ -980,6 +1075,31 @@ allowed_remote_files="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remot
 outside_mount_git="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- git status)"
 [[ "$outside_mount_git" == *"git\\ status"* ]] || \
   fail "the mounted-session guard changed afws-run outside a mounted session"
+
+remote_first_git="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_STATE_DIR}/workspaces/session" AFWS_REMOTE_FIRST=1 \
+  "$RUNNER" --dry-run git status)"
+[[ "$remote_first_git" == *"git\\ status"* ]] || \
+  fail "a remote-first session did not allow project Git by default"
+expect_rejected "obsolete --allow-remote-files in a remote-first session" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_LOCAL_WORKSPACE="${AFWS_STATE_DIR}/workspaces/session" AFWS_REMOTE_FIRST=1 \
+  "$RUNNER" --dry-run --allow-remote-files git status
+
+# Local input is opt-in and the destination cannot escape the remote project.
+push_plan="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_REMOTE_FIRST=1 AFWS_ALLOWED_LOCAL_DIRS="${SANDBOX}/papers" \
+  "$PUSHER" --dry-run "${SANDBOX}/papers" inputs)"
+[[ "$push_plan" == *"/remote/project/inputs/papers"* ]] || \
+  fail "afws-push did not plan a project-confined transfer"
+expect_rejected "pushing an unapproved local path" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_REMOTE_FIRST=1 AFWS_ALLOWED_LOCAL_DIRS="${SANDBOX}/papers" \
+  "$PUSHER" --dry-run "${SANDBOX}/notes"
+expect_rejected "pushing outside the remote project" \
+  env AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_REMOTE_FIRST=1 AFWS_ALLOWED_LOCAL_DIRS="${SANDBOX}/papers" \
+  "$PUSHER" --dry-run "${SANDBOX}/papers" ../outside
 
 remote_pipeline="$(AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
   AFWS_LOCAL_WORKSPACE="${AFWS_MOUNT_BASE}/example-workstation/remote/project" \

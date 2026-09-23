@@ -93,7 +93,12 @@ afws_validate_host "$ssh_host"
 remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
 
 if (( ! dry_run )); then
-  for dependency in ssh sshfs diskutil; do
+  if [[ -n "${AFWS_REMOTE_FIRST-}" ]]; then
+    dependencies=(ssh rclone diskutil)
+  else
+    dependencies=(ssh sshfs diskutil)
+  fi
+  for dependency in "${dependencies[@]}"; do
     command -v "$dependency" >/dev/null 2>&1 ||
       afws_die "required command not found: ${dependency}; run afws-doctor"
   done
@@ -140,6 +145,40 @@ if (( ! dry_run )); then
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
+fi
+
+if [[ -n "${AFWS_REMOTE_FIRST-}" ]]; then
+  mount_point="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+  users=0
+  if [[ -x "$PEERS" ]]; then
+    users="$(env -u AFWS_SESSION_NAME "$PEERS" --users-of-mount "$mount_point" 2>/dev/null)" || users=0
+  fi
+  if (( users > 1 && force && ! force_shared )); then
+    afws_die "${users} live sessions use this Finder/VS Code view; retry with --force-shared after coordinating them"
+  fi
+
+  if [[ "$connection_mode" == fresh ]]; then
+    afws_control_socket_path=""
+  elif [[ -n "${AFWS_CONTROL_PATH-}" && -S "${AFWS_CONTROL_PATH}" ]]; then
+    afws_control_socket_path="$AFWS_CONTROL_PATH"
+  else
+    afws_open_session_connection "$ssh_host" "$dry_run"
+  fi
+
+  if (( force )) && afws_mount_is_present "$mount_point"; then
+    if (( dry_run )); then
+      print -r -- "Would unmount ${mount_point}"
+    else
+      afws_release_managed_mount "$mount_point" ||
+        diskutil unmount force "$mount_point" >/dev/null 2>&1 ||
+        afws_die "could not detach ${mount_point}"
+    fi
+  fi
+
+  afws_establish_visibility_mount "$ssh_host" "$remote_dir" "$afws_control_socket_path" \
+    "$dry_run" "remount-$(afws_sanitize_component "$ssh_host")-$(date +%s)" "$PEERS" || exit 1
+  (( dry_run )) || print -r -- "Finder/VS Code view is ready: ${afws_mount_point}"
+  exit 0
 fi
 
 mount_point=""

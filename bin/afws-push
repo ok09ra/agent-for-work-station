@@ -1,0 +1,86 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-push"
+readonly SCRIPT_DIR="${0:A:h}"
+
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_die >/dev/null || {
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+}
+
+usage() {
+  print -r -- "Usage: afws-push SOURCE [REMOTE_DIRECTORY]"
+  print -r -- ""
+  print -r -- "Copy an explicitly allowed local file or directory into the current remote"
+  print -r -- "project. REMOTE_DIRECTORY is relative to the project and defaults to '.'."
+  print -r -- "The source basename is created inside that directory."
+}
+
+dry_run=0
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -*) afws_die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+(( $# >= 1 && $# <= 2 )) || { usage >&2; exit 2; }
+[[ -n "${AFWS_REMOTE_FIRST-}" && -n "${AFWS_SSH_HOST-}" &&
+   -n "${AFWS_REMOTE_DIR-}" ]] ||
+  afws_die "run this inside a remote-first codexfws session"
+[[ -n "${AFWS_ALLOWED_LOCAL_DIRS-}" ]] ||
+  afws_die "this session has no local files; launch codexfws with --allow-local-files PATH"
+
+source_given="$1"
+destination="${2:-.}"
+[[ -e "$source_given" || -L "$source_given" ]] || afws_die "source does not exist: ${source_given}"
+source_absolute="${source_given:A}"
+
+allowed=0
+for allowed_root in ${(s.:.)AFWS_ALLOWED_LOCAL_DIRS}; do
+  allowed_absolute="${allowed_root:A}"
+  if [[ "$source_absolute" == "$allowed_absolute" ||
+        "$source_absolute" == "${allowed_absolute}/"* ]]; then
+    allowed=1
+    break
+  fi
+done
+(( allowed )) || afws_die "source is outside this session's --allow-local-files directories: ${source_absolute}"
+
+case "$destination" in
+  /*) afws_die "REMOTE_DIRECTORY must be relative to the remote project" ;;
+  *$'\n'*|*$'\r'*) afws_die "REMOTE_DIRECTORY must not contain control characters" ;;
+esac
+for component in ${(s:/:)destination}; do
+  [[ "$component" != .. ]] || afws_die "REMOTE_DIRECTORY must stay inside the remote project"
+done
+[[ -n "$destination" ]] || destination=.
+
+source_parent="${source_absolute:h}"
+source_name="${source_absolute:t}"
+remote_command="cd ${(q)AFWS_REMOTE_DIR} && mkdir -p -- ${(q)destination} && tar -xf - -C ${(q)destination}"
+afws_control_ssh_options "$AFWS_SSH_HOST"
+ssh_options=("${afws_ssh_control_options[@]}")
+
+if (( dry_run )); then
+  print -r -- "Would copy ${source_absolute}"
+  print -r -- "  to ${AFWS_SSH_HOST}:${AFWS_REMOTE_DIR}/${destination}/${source_name}"
+  exit 0
+fi
+
+print -r -- "Copying ${source_absolute}"
+print -r -- "  to ${AFWS_SSH_HOST}:${AFWS_REMOTE_DIR}/${destination}/${source_name}"
+COPYFILE_DISABLE=1 tar -cf - -C "$source_parent" -- "$source_name" |
+  ssh "${ssh_options[@]}" "$AFWS_SSH_HOST" "$remote_command"

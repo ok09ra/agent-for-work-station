@@ -27,6 +27,7 @@ executables=(
   bin/claudefws
   bin/codexfws
   bin/afws-run
+  bin/afws-push
   bin/afws-peers
   bin/afws-lock
   bin/afws-remount
@@ -77,7 +78,7 @@ stale_name_pattern+='|CLAUDEFWS'"_"'|CODEXFWS'"_"')'
 # the installer, which lists what is left over from the installations this
 # replaces. Everywhere else an old name is a leftover.
 renamed_scope=(lib/afws-common.zsh docs/*.md examples/*
-  bin/claudefws bin/codexfws bin/afws-run bin/afws-peers bin/afws-lock bin/afws-remount
+  bin/claudefws bin/codexfws bin/afws-run bin/afws-push bin/afws-peers bin/afws-lock bin/afws-remount
   bin/afws-umount bin/afws-shell bin/afws-doctor
   bin/afws-doctor scripts/test.sh scripts/prepublish-check.sh)
 scan "no leftover command or variable names from before the merge" "$stale_name_pattern" $renamed_scope

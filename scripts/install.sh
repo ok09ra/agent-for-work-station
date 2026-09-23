@@ -10,7 +10,7 @@ readonly PROFILE_BEGIN="# >>> agent-for-work-station >>>"
 readonly PROFILE_END="# <<< agent-for-work-station <<<"
 configure_shell=1
 
-readonly COMMANDS=(claudefws codexfws afws-run afws-peers afws-lock afws-remount afws-umount
+readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-lock afws-remount afws-umount
   afws-shell afws-doctor)
 
 usage() {

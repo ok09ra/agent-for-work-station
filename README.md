@@ -10,9 +10,10 @@ claudefws my-workstation /remote/path/to/project   # Claude Code
 codexfws  my-workstation /remote/path/to/project   # Codex CLI
 ```
 
-The project is mounted with SSHFS, so it is an ordinary local path. Commands that
-need the remote environment — Python, tests, builds, GPU work — go over with
-`afws-run`. One authenticated SSH connection per host is opened once and reused,
+Claude Code continues to use SSHFS as its working tree. Codex treats the remote
+tree as authoritative and sends every project read, edit, Git command, and
+execution through `afws-run`. It also creates a stable rclone NFS view for Finder
+and VS Code, but Codex does not depend on that mount. One authenticated SSH connection per host is opened once and reused,
 so a host that asks for a password asks once. Sessions on the same Mac are
 registered, see each other, take turns on a GPU instead of colliding, and — for
 Claude Code — can ask each other what they found. The
@@ -54,13 +55,20 @@ themselves when the last session using them exits.
 
 ## Installation
 
-**1. macFUSE and SSHFS.** The latest stable release from the
+**1. Mount commands.** Codex uses `rclone`; Claude Code uses macFUSE and SSHFS. The latest stable release from the
 [macFUSE website](https://macfuse.github.io/), then the macOS SSHFS package from
 the [macFUSE SSHFS page](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS).
 Allow macFUSE in System Settings if asked, and restart if prompted.
 
 ```zsh
 sshfs --version
+rclone version
+```
+
+Resume a previous Codex session without depending on the terminal's current directory:
+
+```zsh
+codexfws --resume my-workstation /remote/path/to/project
 ```
 
 **2. At least one agent.** Either, or both.

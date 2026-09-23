@@ -9,7 +9,7 @@ claudefws my-workstation /remote/path/to/project   # Claude Code
 codexfws  my-workstation /remote/path/to/project   # Codex CLI
 ```
 
-プロジェクトはSSHFSでマウントされるので、ただのローカルパスになります。リモート環境を必要とするコマンド（Python、テスト、ビルド、GPU）は`afws-run`で送ります。ホストごとに認証済みのSSH接続を1本だけ開いて再利用するので、パスワードを要求するホストでも聞かれるのは1回です。同じMac上のセッションは登録され、互いを認識し、GPUを衝突せずに順番に使い、Claude Codeなら互いに見つけたことを尋ね合えます。マウントと接続は、それを使う最後のセッションが終了した時点で解放されます。
+Claude Codeは従来どおりSSHFSを作業ツリーとして使います。Codexはリモート側を正本とし、プロジェクトの読み取り・編集・Git・実行をすべて`afws-run`経由で行います。Finder/VS Code用には安定したrclone NFSビューも作りますが、Codexの動作はそのマウントに依存しません。ホストごとに認証済みのSSH接続を1本だけ開いて再利用します。
 
 クライアントはmacOSのみ。実際のホスト名、アドレス、ユーザー名、パスはこのリポジトリに保存しません。
 
@@ -29,10 +29,11 @@ codexfws  my-workstation /remote/path/to/project   # Codex CLI
 
 ## Installation
 
-**1. macFUSE と SSHFS。** [macFUSE公式サイト](https://macfuse.github.io/)から最新の安定版、次に[macFUSE公式SSHFSページ](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS)からmacOS用SSHFSパッケージ。システム設定での許可を求められたら許可し、再起動を求められたら再起動します。
+**1. マウント用コマンド。** Codexには`rclone`、Claude CodeにはmacFUSEとSSHFSを使います。
 
 ```zsh
 sshfs --version
+rclone version
 ```
 
 **2. エージェントを少なくとも1つ。** 片方でも両方でも。
@@ -112,7 +113,15 @@ afws-run sh -c 'nvidia-smi | wc -l'           # シェル構文にはリモー�
 printf 'set -eu\npytest -q\n' | afws-run     # スクリプトまるごと
 ```
 
-プロジェクト自体はすでにマウント経由で利用できます。確認・編集・Git操作は、マウント済みワークスペース上で通常のローカルツールを使います。セッション内の`afws-run`は、典型的なプロジェクト探索・ファイル操作・Gitコマンドを拒否します。利用者がリモート側のファイル操作を明示的に求めた場合だけ、`--allow-remote-files`で解除できます。
+`codexfws`では`afws-run`が既定のプロジェクト経路です。確認・編集・Git・テストを含め、プロジェクト操作はリモートで行います。ローカル資料も使う場合は、起動時に許可してから転送できます。
+
+```zsh
+codexfws --allow-local-files ~/Documents/input my-workstation /remote/project
+afws-push ~/Documents/input data   # /remote/project/data/input へ直接転送
+codexfws --resume my-workstation /remote/project  # 過去のCodexセッションを再開
+```
+
+許可していないローカルパスと、リモートプロジェクト外への転送は拒否されます。
 
 これは**自分で打つとき**に効きます。Claude Codeの`!`はMacで動くので、`!nvidia-smi`はここで失敗し、`!python train.py`は黙って間違ったインタプリタで動きます。`claudefws`のセッションはローカル実行に`[local]`の印を付けて可視化し、違いは`afws-run`を前に置くかどうかだけです。
 

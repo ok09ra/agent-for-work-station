@@ -36,9 +36,9 @@ usage() {
   print -r -- "interpreted on the remote host. Wrap a pipeline or a redirect in 'sh -c'"
   print -r -- "when the remote shell should see it, or pipe a whole script in instead."
   print -r -- ""
-  print -r -- "Inside a mounted session, project inspection, file management and Git belong"
-  print -r -- "on the local mount. Common remote forms are refused. If the user explicitly"
-  print -r -- "requests a remote-side file operation, pass --allow-remote-files."
+  print -r -- "In a remote-first Codex session, all project operations run remotely by"
+  print -r -- "default. In a legacy mounted session they remain local unless explicitly"
+  print -r -- "overridden with --allow-remote-files."
 }
 
 if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
@@ -108,6 +108,10 @@ done
 
 [[ -n "$remote_cwd" ]] || afws_die "--cwd must be an absolute remote path"
 remote_cwd="$(afws_normalize_remote_dir "$remote_cwd")"
+
+if (( allow_remote_files )) && [[ -n "${AFWS_REMOTE_FIRST-}" ]]; then
+  afws_die "--allow-remote-files is obsolete in a remote-first session; retry without it"
+fi
 
 # The mount exists so project files can be handled by the agent's ordinary
 # local tools. Running those same operations through SSH fragments the workflow
@@ -218,7 +222,7 @@ afws_guard_remote_project_operation() {
 
 stdin_script=""
 stdin_script_captured=0
-if [[ -n "${AFWS_LOCAL_WORKSPACE-}" ]] && (( ! allow_remote_files )); then
+if [[ -n "${AFWS_LOCAL_WORKSPACE-}" && -z "${AFWS_REMOTE_FIRST-}" ]] && (( ! allow_remote_files )); then
   if (( $# > 0 )); then
     afws_guard_remote_project_operation "$@"
   elif [[ ! -t 0 ]]; then
