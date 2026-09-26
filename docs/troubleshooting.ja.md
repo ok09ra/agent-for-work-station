@@ -156,7 +156,7 @@ claude agents
 
 ## `afws-peers`のSTATUSが`unknown`や`-`になる
 
-Codexの行は常に`-`です。Codex CLIに機械可読なセッション一覧がないためです。Claudeの行のSTATUSは`claude agents --json`から取得しています。直接実行して原因を確認してください。多くの場合、Claude Codeへサインインしていないことが原因です。
+Codexの行は、最初のターンが始まり信頼済みのライフサイクルフックがスレッドIDと状態を記録するまで`-`です。このバージョンをインストールして`codexfws`から起動し直し、求められたらフックを信頼してください。Claudeの行のSTATUSは`claude agents --json`から取得しています。直接実行して原因を確認してください。多くの場合、Claude Codeへサインインしていないことが原因です。
 
 ```zsh
 claude agents --json

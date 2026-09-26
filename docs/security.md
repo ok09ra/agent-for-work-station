@@ -59,6 +59,16 @@ and no connection secrets. It does contain the real host alias and the real
 remote path, so treat it as you would your SSH configuration: keep it out of
 screenshots, logs, and issue reports, and do not copy it into this repository.
 
+For Codex, trusted lifecycle hooks also keep an owner-only thread ID, `busy`/
+`idle` state, and a short activity label under `~/.afws/session-meta/`. The
+fallback label is the first line of the latest user prompt (up to 160
+characters); `afws-status set` supplies a stable explicit label. Do not put
+secrets in a task label or in the first line of a prompt if peer listings must
+not expose them to other local sessions. Hooks emit no peer list into model
+context and run outside the Codex command sandbox, so inspect them before
+trusting Codex's startup prompt. A Codex agent may need sandbox approval to
+write the explicit label or invoke `codex queue` via `afws-message`.
+
 `afws-lock` writes the same kind of information — a session name, a
 timestamp, and a TTL — into a lock directory on the remote host under
 `~/.afws-locks`. Nothing is written inside the project tree, so a lock

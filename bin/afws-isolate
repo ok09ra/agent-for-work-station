@@ -1,0 +1,1021 @@
+#!/usr/bin/env python3
+"""Run a fresh Codex job against an explicitly staged input bundle."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+PROFILE = "afws-isolated"
+DOCKER_IMAGE = "afws-isolate-codex:0.157.0"
+DOCKER_AUTH_VOLUME = "afws-isolate-codex-auth-v1"
+FORBIDDEN_NAMES = {".codex", ".agents", ".git", "AGENTS.md", "AGENTS.override.md"}
+FORBIDDEN_NAMES_FOLDED = {name.casefold() for name in FORBIDDEN_NAMES}
+SAFE_BASE_CONFIG = {"model", "model_reasoning_effort", "model_reasoning_summary",
+                    "model_verbosity", "service_tier"}
+SAFE_REQUIREMENTS = {"allowedPermissionProfiles", "defaultPermissions",
+                     "allowedApprovalPolicies", "allowedSandboxModes",
+                     "allowedWebSearchModes", "allowedLoginMethods",
+                     "featureRequirements"}
+
+
+class JobError(Exception):
+    pass
+
+
+def die(message: str) -> None:
+    raise JobError(message)
+
+
+def codex_binary() -> str:
+    binary = os.environ.get("AFWS_ISOLATE_CODEX_BIN", "codex")
+    found = shutil.which(binary)
+    if not found:
+        die("Codex CLI was not found on PATH")
+    return found
+
+
+def auth_home() -> Path:
+    configured = os.environ.get("AFWS_ISOLATE_CODEX_HOME")
+    home = Path(configured).expanduser() if configured else Path.home() / ".afws" / "isolate-codex"
+    if not home.is_absolute():
+        die("AFWS_ISOLATE_CODEX_HOME must be absolute")
+    home = home.resolve()
+    if ".codex" in home.parts:
+        die("the isolated Codex home must not be inside .codex")
+    return home
+
+
+def prepare_auth_home(home: Path) -> None:
+    if home.exists() and (not home.is_dir() or home.is_symlink()):
+        die(f"isolated Codex home is not a regular directory: {home}")
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o077:
+        die(f"isolated Codex home must be owner-only (chmod 700): {home}")
+    for forbidden in ("config.toml", "AGENTS.md", "AGENTS.override.md"):
+        if (home / forbidden).exists() or (home / forbidden).is_symlink():
+            die(f"isolated Codex home contains inherited configuration: {home / forbidden}")
+    skills_dir = home / "skills"
+    if skills_dir.exists() or skills_dir.is_symlink():
+        if skills_dir.is_symlink() or not skills_dir.is_dir() or any(
+            child.name != ".system" or child.is_symlink() or not child.is_dir()
+            for child in skills_dir.iterdir()
+        ):
+            die(f"isolated Codex home contains non-system skills: {skills_dir}")
+    plugins_dir = home / "plugins"
+    if plugins_dir.exists() or plugins_dir.is_symlink():
+        if plugins_dir.is_symlink() or not plugins_dir.is_dir() or any(
+            child.name not in {"cache", ".remote-plugin-install-staging"}
+            or child.is_symlink() or not child.is_dir()
+            for child in plugins_dir.iterdir()
+        ):
+            die(f"isolated Codex home contains user plugins: {plugins_dir}")
+
+
+def run_auth(action: str) -> int:
+    home = auth_home()
+    prepare_auth_home(home)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home)
+    command = [codex_binary(), "login"]
+    if action == "status":
+        command.append("status")
+    return subprocess.call(command, env=env)
+
+
+def is_within(candidate: Path, parent: Path) -> bool:
+    return candidate == parent or parent in candidate.parents
+
+
+def hash_file(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_input_name(name: str) -> None:
+    if name.casefold() in FORBIDDEN_NAMES_FOLDED:
+        die(f"reserved agent configuration in input: {name}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        die(f"control character in input filename: {name!r}")
+
+
+def copy_entry(parent_fd: int | None, name: str, destination: Path,
+               byte_count: list[int], max_bytes: int,
+               entry_count: list[int], max_entries: int,
+               input_file: bool) -> tuple[int, int]:
+    """Copy an opened tree without following links or special files."""
+    entry_count[0] += 1
+    if entry_count[0] > max_entries:
+        die(f"copied files exceed the entry limit ({max_entries})")
+    if input_file:
+        check_input_name(Path(name).name)
+    elif any(ord(char) < 32 or ord(char) == 127 for char in name):
+        die(f"control character in child output filename: {name!r}")
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
+        die(f"symbolic link or special file is not allowed: {name}")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if stat.S_ISDIR(before.st_mode):
+        flags |= os.O_DIRECTORY
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            die(f"source changed while staging: {name}")
+        if stat.S_ISDIR(opened.st_mode):
+            destination.mkdir(mode=0o700)
+            with os.scandir(fd) as children:
+                for child in children:
+                    copy_entry(fd, child.name, destination / child.name,
+                               byte_count, max_bytes, entry_count,
+                               max_entries, input_file)
+        elif stat.S_ISREG(opened.st_mode):
+            if byte_count[0] + opened.st_size > max_bytes:
+                die(f"copied files exceed the size limit ({max_bytes} bytes)")
+            with destination.open("xb") as target:
+                while chunk := os.read(fd, 1024 * 1024):
+                    byte_count[0] += len(chunk)
+                    if byte_count[0] > max_bytes:
+                        die(f"copied files exceed the size limit ({max_bytes} bytes)")
+                    target.write(chunk)
+            if input_file:
+                destination.chmod(0o500 if opened.st_mode & 0o111 else 0o400)
+        else:
+            die(f"symbolic link or special file is not allowed: {name}")
+        after = os.fstat(fd)
+        if (after.st_size, after.st_mtime_ns) != (opened.st_size, opened.st_mtime_ns):
+            die(f"source changed while staging: {name}")
+        path_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (path_after.st_dev, path_after.st_ino, path_after.st_size,
+                path_after.st_mtime_ns) != (opened.st_dev, opened.st_ino,
+                                           opened.st_size, opened.st_mtime_ns):
+            die(f"source path changed while staging: {name}")
+        return opened.st_dev, opened.st_ino
+    finally:
+        os.close(fd)
+
+
+def copy_input(source: Path, destination: Path,
+               byte_count: list[int], max_bytes: int,
+               entry_count: list[int], max_entries: int) -> None:
+    copied_identity = copy_entry(None, str(source), destination,
+                                 byte_count, max_bytes,
+                                 entry_count, max_entries, True)
+    after = source.lstat()
+    if (after.st_dev, after.st_ino) != copied_identity:
+        die(f"source changed while staging: {source}")
+
+
+def staged_manifest(root: Path) -> list[dict[str, object]]:
+    result = []
+    for file_path in sorted(root.rglob("*")):
+        if file_path.is_file():
+            result.append({
+                "path": str(file_path.relative_to(root)),
+                "bytes": file_path.stat().st_size,
+                "sha256": hash_file(file_path),
+            })
+    return result
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def profile_text(job_root: Path, input_dir: Path, output_dir: Path,
+                 scratch_dir: Path, home: Path) -> str:
+    # The auth home is available to the Codex harness, never to model-run commands.
+    return "\n".join([
+        f'default_permissions = {toml_string(PROFILE)}',
+        'approval_policy = "never"',
+        'web_search = "disabled"',
+        'allow_login_shell = false',
+        '[features]',
+        'apps = false',
+        'plugins = false',
+        'remote_plugin = false',
+        'browser_use = false',
+        'browser_use_external = false',
+        'browser_use_full_cdp_access = false',
+        'computer_use = false',
+        'in_app_browser = false',
+        'multi_agent = false',
+        'memories = false',
+        'shell_snapshot = false',
+        'skill_search = false',
+        '[skills]',
+        'include_instructions = false',
+        '[skills.bundled]',
+        'enabled = false',
+        f'[permissions.{PROFILE}.filesystem]',
+        '":root" = "deny"',
+        '":minimal" = "read"',
+        f'{toml_string(str(job_root))} = "read"',
+        f'{toml_string(str(input_dir))} = "read"',
+        f'{toml_string(str(output_dir))} = "write"',
+        f'{toml_string(str(scratch_dir))} = "write"',
+        f'{toml_string(str(home))} = "deny"',
+        f'[permissions.{PROFILE}.network]',
+        'enabled = false',
+        '',
+    ])
+
+
+def stage_codex(codex_path: str, runtime_dir: Path) -> Path:
+    """Keep Codex's sandbox helper inside the job's readable tree."""
+    runtime_dir.mkdir()
+    source = Path(codex_path).resolve()
+    staged = runtime_dir / "codex"
+    for companion, target in (
+        (source, staged),
+        (source.with_name("codex-code-mode-host"), runtime_dir / "codex-code-mode-host"),
+    ):
+        if not companion.is_file():
+            continue
+        try:
+            os.link(companion, target)
+        except OSError:
+            shutil.copyfile(companion, target)
+            target.chmod(0o500)
+    return staged
+
+
+def child_env(home: Path, scratch_dir: Path, staged_codex: Path) -> dict[str, str]:
+    # Do not pass AFWS session variables, SSH agent sockets, API keys, or shell hooks.
+    return {
+        "CODEX_HOME": str(home),
+        "HOME": str(scratch_dir),
+        "TMPDIR": str(scratch_dir),
+        "PATH": f"{staged_codex.parent}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def read_codex_config(codex_path: str, env: dict[str, str],
+                      job_root: Path, home: Path) -> tuple[dict, dict | None]:
+    """Query Codex's own config loader before starting an agent session."""
+    requests = [
+        {"method": "initialize", "id": 0, "params": {
+            "clientInfo": {"name": "afws_isolate", "title": "AFWS Isolate",
+                           "version": "1.0.0"}}},
+        {"method": "initialized", "params": {}},
+        {"method": "config/read", "id": 1,
+         "params": {"cwd": str(job_root), "includeLayers": True}},
+        {"method": "configRequirements/read", "id": 2, "params": {}},
+    ]
+    process = subprocess.Popen(
+        [codex_path, "app-server", "--strict-config"], cwd=job_root, env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    replies: dict[int, dict] = {}
+    stderr = bytearray()
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        process.stdin.write(b"".join((json.dumps(request) + "\n").encode()
+                                     for request in requests))
+        process.stdin.flush()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        deadline = time.monotonic() + 60
+        while len(replies) < 3 and time.monotonic() < deadline and selector.get_map():
+            for key, _ in selector.select(max(0, deadline - time.monotonic())):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.fileobj is process.stderr:
+                    stderr.extend(chunk)
+                    if len(stderr) > 65536:
+                        die("Codex configuration check produced excessive stderr")
+                    continue
+                output.extend(chunk)
+                if len(output) > 4 * 1024 * 1024:
+                    die("Codex configuration check produced excessive output")
+                while b"\n" in output:
+                    line, _, rest = output.partition(b"\n")
+                    output = bytearray(rest)
+                    try:
+                        message = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        die("Codex configuration check returned invalid JSON")
+                    if isinstance(message, dict) and message.get("id") in (0, 1, 2):
+                        replies[message["id"]] = message
+        if len(replies) < 3:
+            detail = stderr.decode(errors="replace").strip()[:300]
+            received = ",".join(str(request_id) for request_id in sorted(replies)) or "none"
+            die("Codex configuration check did not complete "
+                f"(responses: {received}): {detail or 'timeout or missing response'}")
+        for request_id in (0, 1, 2):
+            if "error" in replies[request_id] or not isinstance(replies[request_id].get("result"), dict):
+                die(f"Codex configuration check rejected request {request_id}")
+        reported_home = replies[0]["result"].get("codexHome")
+        if not isinstance(reported_home, str) or Path(reported_home).resolve() != home:
+            die("Codex configuration check used a different Codex home")
+        if "requirements" not in replies[2]["result"]:
+            die("Codex configuration check omitted managed requirements")
+        return replies[1]["result"], replies[2]["result"].get("requirements")
+    finally:
+        selector.close()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def check_codex_config(config_result: dict, requirements: dict | None) -> dict:
+    """Reject config layers that could replace or widen the job profile."""
+    config = config_result.get("config")
+    layers = config_result.get("layers")
+    if (not isinstance(config, dict) or not isinstance(layers, list) or not layers
+            or not {"sandbox_mode", "default_permissions", "approval_policy",
+                    "permissions"}.issubset(config)):
+        die("Codex configuration check returned an unrecognized response")
+    if config.get("sandbox_mode") is not None or config.get("sandbox_workspace_write"):
+        die("loaded Codex configuration uses legacy sandbox settings")
+    if config.get("default_permissions") not in (None, PROFILE):
+        die("loaded Codex configuration selects another permission profile")
+    if config.get("approval_policy") not in (None, "never"):
+        die("loaded Codex configuration uses a conflicting approval policy")
+    permissions = config.get("permissions")
+    if permissions is not None and (not isinstance(permissions, dict) or PROFILE in permissions):
+        die("loaded Codex configuration redefines the isolated permission profile")
+    for layer in layers:
+        if not isinstance(layer, dict) or not isinstance(layer.get("config"), dict):
+            die("Codex configuration check returned an unrecognized layer")
+        for key, value in layer["config"].items():
+            if key in SAFE_BASE_CONFIG:
+                continue
+            if key == "default_permissions" and value == PROFILE:
+                continue
+            if key == "approval_policy" and value == "never":
+                continue
+            if key == "web_search" and value == "disabled":
+                continue
+            if key == "allow_login_shell" and value is False:
+                continue
+            if key == "permissions" and isinstance(value, dict) and PROFILE not in value:
+                continue
+            if key == "features" and isinstance(value, dict) and all(
+                flag is False for flag in value.values()
+            ):
+                continue
+            die(f"loaded Codex configuration contains unsupported setting: {key}")
+    if requirements is not None:
+        if not isinstance(requirements, dict):
+            die("Codex configuration check returned unrecognized requirements")
+        for key, value in requirements.items():
+            if value is not None and key not in SAFE_REQUIREMENTS:
+                die(f"managed Codex requirements contain unsupported setting: {key}")
+        allowed = requirements.get("allowedPermissionProfiles")
+        if allowed is not None and (not isinstance(allowed, dict) or allowed.get(PROFILE) is not True):
+            die(f"managed Codex requirements do not allow profile {PROFILE}")
+        if requirements.get("defaultPermissions") not in (None, PROFILE):
+            die("managed Codex requirements select another permission profile")
+        approvals = requirements.get("allowedApprovalPolicies")
+        if approvals is not None and (not isinstance(approvals, list) or "never" not in approvals):
+            die("managed Codex requirements do not allow approval policy never")
+        features = requirements.get("featureRequirements")
+        if features is not None and (not isinstance(features, dict) or any(features.values())):
+            die("managed Codex requirements force a feature on")
+        if requirements.get("allowedSandboxModes") is not None and allowed is None:
+            die("managed Codex requirements allow only legacy sandbox modes")
+    return {"status": "passed", "layers_checked": len(layers),
+            "managed_requirements": requirements is not None}
+
+
+def sandbox_probe(codex_path: str, profile_name: str, env: dict[str, str],
+                  input_dir: Path, output_dir: Path, denied_file: Path,
+                  staged_codex: Path) -> None:
+    prefix = [codex_path, "sandbox", "--profile", profile_name,
+              "--permission-profile", PROFILE, "--include-managed-config"]
+    good = subprocess.run(
+        prefix + ["/bin/sh", "-c", 'test -r "$1" && : > "$2"', "probe",
+                  str(input_dir / ".afws-probe"), str(output_dir / ".afws-probe")],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    if good.returncode:
+        detail = (good.stderr or good.stdout).strip()
+        die(f"Codex sandbox could not enforce the isolated profile: {detail}")
+    helper = subprocess.run(prefix + [str(staged_codex), "--version"],
+                            env=env, capture_output=True, text=True, timeout=30)
+    if helper.returncode:
+        detail = (helper.stderr or helper.stdout).strip()
+        die(f"Codex sandbox could not start its isolated helper: {detail}")
+    bad = subprocess.run(
+        prefix + ["/bin/sh", "-c", 'IFS= read -r line < "$1"', "probe", str(denied_file)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    if bad.returncode == 0:
+        die("Codex sandbox allowed reading outside the input bundle")
+    write_probe = input_dir / ".afws-write-probe"
+    wrote_input = subprocess.run(
+        prefix + ["/bin/sh", "-c", ': > "$1"', "probe", str(write_probe)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    if wrote_input.returncode == 0:
+        write_probe.unlink(missing_ok=True)
+        die("Codex sandbox allowed modifying the input bundle")
+    (output_dir / ".afws-probe").unlink()
+
+
+def prompt_text(guide_relative: Path, note: str | None) -> str:
+    extra = f"\nAdditional request from the parent: {note}\n" if note else ""
+    guide_name = json.dumps(f"./input/{guide_relative.as_posix()}", ensure_ascii=False)
+    return f"""You are a fresh, single-use execution worker. The only task data is in ./input.
+Read the Markdown guide at {guide_name} and follow its processing instructions using
+only the staged scripts, source data, and settings in ./input. Keep all inputs
+unchanged. Place every generated deliverable under ./output. Do not read other
+files, access the network, install dependencies, request broader permissions,
+spawn other agents, or use external tools. If an instruction needs an unavailable
+file, dependency, or permission, report the blockage instead of improvising.
+Write ./output/HANDOFF.md with: what ran, output files, counts or checks you
+observed, deviations, errors, and any unfinished work. Do not claim that the
+result meets the parent's expectations; the parent will evaluate it.
+{extra}"""
+
+
+def copy_outputs(source: Path, destination: Path,
+                 max_bytes: int, max_entries: int) -> list[dict[str, object]]:
+    staging = Path(tempfile.mkdtemp(prefix=".artifacts-", dir=destination.parent))
+    try:
+        total = [0]
+        entries = [0]
+        root_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(root_fd)
+            with os.scandir(root_fd) as children:
+                for child in children:
+                    copy_entry(root_fd, child.name, staging / child.name,
+                               total, max_bytes, entries, max_entries, False)
+            after = os.fstat(root_fd)
+            if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+                die("child output changed while copying")
+        finally:
+            os.close(root_fd)
+        staging.rename(destination)
+        return staged_manifest(destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def verify_artifacts(result_dir: Path, manifest: object) -> None:
+    artifact_dir = result_dir / "artifacts"
+    if manifest is None and not artifact_dir.exists() and not artifact_dir.is_symlink():
+        return
+    if not isinstance(manifest, list):
+        die("result.json has no artifact manifest")
+    if artifact_dir.is_symlink() or not artifact_dir.is_dir():
+        die("artifact directory is missing or is a symbolic link")
+    observed: set[str] = set()
+    for path in artifact_dir.rglob("*"):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            die("artifact directory contains a symbolic link or special file")
+        if path.is_file():
+            observed.add(path.relative_to(artifact_dir).as_posix())
+    expected: set[str] = set()
+    for item in manifest:
+        if not isinstance(item, dict):
+            die("artifact manifest contains an invalid entry")
+        relative = item.get("path")
+        if (not isinstance(relative, str) or not relative
+                or Path(relative).is_absolute() or ".." in Path(relative).parts
+                or relative in expected):
+            die("artifact manifest contains an unsafe path")
+        expected.add(relative)
+        target = artifact_dir / relative
+        if not target.is_file() or target.is_symlink():
+            die(f"artifact is missing or is not a regular file: {relative}")
+        if target.stat().st_size != item.get("bytes") or hash_file(target) != item.get("sha256"):
+            die(f"artifact changed after the child run: {relative}")
+    if observed != expected:
+        die("artifact directory and manifest contain different files")
+
+
+def record_evaluation(args: argparse.Namespace) -> int:
+    result_dir = Path(args.result).expanduser().absolute()
+    if result_dir.is_symlink() or not result_dir.is_dir():
+        die("--result must be an existing non-symlink result directory")
+    result_file = result_dir / "result.json"
+    if result_file.is_symlink() or not result_file.is_file():
+        die("result.json is missing or is a symbolic link")
+    evidence = Path(args.evidence_file).read_text() if args.evidence_file else args.evidence
+    if not evidence or not evidence.strip() or len(evidence.encode()) > 20_000:
+        die("parent evaluation evidence must contain 1 to 20000 bytes")
+    try:
+        report = json.loads(result_file.read_text())
+    except (ValueError, UnicodeDecodeError):
+        die("result.json is not valid JSON")
+    if not isinstance(report, dict):
+        die("result.json is not a JSON object")
+    if report.get("parent_evaluation") != "pending" and not args.replace:
+        die("parent evaluation is already recorded; use --replace to revise it")
+    if args.verdict == "match" and report.get("status") != "child_completed":
+        die("a successful parent evaluation requires child_completed")
+    verify_artifacts(result_dir, report.get("artifacts"))
+    report["parent_evaluation"] = {
+        "verdict": args.verdict,
+        "evidence": evidence.strip(),
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary = result_dir / f".result-{uuid.uuid4().hex}.json"
+    try:
+        with temporary.open("x") as stream:
+            json.dump(report, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(result_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(str(result_file))
+    return 0
+
+
+def selected_job_paths(args: argparse.Namespace,
+                       home: Path | None) -> tuple[Path, list[Path], Path]:
+    guide_path = Path(args.guide).expanduser().absolute()
+    source_paths = [Path(raw).expanduser().absolute() for raw in args.input]
+    if guide_path.is_symlink() or any(source.is_symlink() for source in source_paths):
+        die("symbolic links are not allowed as inputs")
+    guide = guide_path.resolve()
+    sources = [source.resolve() for source in source_paths]
+    if not guide.is_file() or guide.suffix.lower() != ".md":
+        die("--guide must name a readable Markdown file")
+    if not sources:
+        die("specify at least one --input file or directory")
+    result_dir = Path(args.result).expanduser().absolute().resolve()
+    if result_dir.exists() or result_dir.is_symlink():
+        die(f"result directory already exists: {result_dir}")
+    if home is not None and (is_within(result_dir, home) or is_within(home, result_dir)):
+        die("result directory must be separate from the isolated Codex home")
+
+    # Existing source directories keep their relative layout in the staged tree.
+    selected = []
+    for source in sources:
+        if source.is_symlink() or not source.exists():
+            die(f"input does not exist or is a symbolic link: {source}")
+        if home is not None and (is_within(source, home) or is_within(home, source)):
+            die("the isolated Codex home cannot be an input")
+        if is_within(result_dir, source) or is_within(source, result_dir):
+            die("result directory and inputs must not contain each other")
+        if any(is_within(source, earlier) or is_within(earlier, source) for earlier in selected):
+            die("input paths must not overlap")
+        selected.append(source)
+    if not any(is_within(guide, source) for source in selected):
+        if any(source.name == guide.name for source in selected):
+            die("guide filename collides with an input")
+        selected.append(guide)
+    names = [source.name for source in selected]
+    if len(set(names)) != len(names):
+        die("input filenames collide in the staged bundle")
+    for source in selected:
+        if any(part.casefold() in FORBIDDEN_NAMES_FOLDED for part in source.parts):
+            die(f"input is inside reserved agent configuration: {source}")
+    return guide, selected, result_dir
+
+
+def staged_guide(guide: Path, selected: list[Path]) -> Path:
+    if guide in selected:
+        return Path(guide.name)
+    parent_source = next(source for source in selected if is_within(guide, source))
+    return Path(parent_source.name) / guide.relative_to(parent_source)
+
+
+def docker_binary() -> str:
+    found = shutil.which("docker")
+    if not found:
+        die("Docker CLI was not found; install Docker Desktop")
+    if sys.platform != "darwin":
+        die("Docker isolation currently requires Docker Desktop on macOS")
+    endpoint = subprocess.run(
+        [found, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if endpoint.returncode or not endpoint.stdout.strip().startswith("unix://"):
+        die("Docker isolation requires a local Unix-socket Docker context")
+    server = subprocess.run(
+        [found, "info", "--format", "{{.OperatingSystem}}"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if server.returncode or server.stdout.strip() != "Docker Desktop":
+        die("Docker Desktop VM is not running or is unavailable")
+    return found
+
+
+def docker_image_id(docker: str) -> str:
+    inspected = subprocess.run(
+        [docker, "image", "inspect", DOCKER_IMAGE, "--format", "{{.Id}}"],
+        capture_output=True, text=True, timeout=20,
+    )
+    image_id = inspected.stdout.strip()
+    if inspected.returncode or not image_id.startswith("sha256:"):
+        die("Docker isolation image is missing; run: afws-isolate docker build")
+    return image_id
+
+
+def docker_context_dir() -> Path:
+    source = Path(__file__).resolve()
+    candidates = [source.parent.parent / "docker" / "isolate",
+                  source.parent.parent / "share" / "afws" / "docker" / "isolate"]
+    for candidate in candidates:
+        if (candidate / "Dockerfile").is_file() and (candidate / "child.py").is_file():
+            return candidate
+    die("Docker image sources are missing from this installation")
+
+
+def docker_auth_args(docker: str, image_id: str, interactive: bool) -> list[str]:
+    command = [docker, "run", "--rm", "--read-only", "--cap-drop=ALL",
+               "--security-opt", "no-new-privileges", "--network", "bridge"]
+    if interactive:
+        command.append("-i")
+        if sys.stdin.isatty():
+            command.append("-t")
+    command.extend([
+        "--mount", f"type=volume,source={DOCKER_AUTH_VOLUME},target=/auth",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m,uid=10001,gid=10001",
+        "--tmpfs", "/home/afws:rw,nosuid,nodev,size=64m,uid=10001,gid=10001",
+        image_id, "codex", "login",
+    ])
+    return command
+
+
+def docker_volume_exists(docker: str) -> bool:
+    volume = subprocess.run([docker, "volume", "inspect", DOCKER_AUTH_VOLUME],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=20)
+    return volume.returncode == 0
+
+
+def docker_remove(docker: str, container_name: str) -> None:
+    try:
+        subprocess.run([docker, "rm", "--force", container_name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_docker_action(action: str) -> int:
+    docker = docker_binary()
+    if action == "build":
+        context = docker_context_dir()
+        return subprocess.call([docker, "build", "--tag", DOCKER_IMAGE,
+                                "--file", str(context / "Dockerfile"), str(context)])
+    image_id = docker_image_id(docker)
+    if action == "doctor":
+        with tempfile.TemporaryDirectory(prefix="afws-docker-doctor-") as raw:
+            root = Path(raw)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            (input_dir / "guide.md").write_text("# Sandbox probe\n")
+            container_name = "afws-isolate-doctor-" + uuid.uuid4().hex
+            command = docker_job_command(docker, image_id, input_dir, output_dir,
+                                         container_name, "guide.md",
+                                         auth_volume=False, network="bridge")
+            command.append("--probe")
+            try:
+                checked = subprocess.run(command, capture_output=True, text=True, timeout=90)
+            finally:
+                docker_remove(docker, container_name)
+            if checked.returncode or checked.stdout.strip() != "sandbox-ok":
+                die("Docker sandbox probe failed: "
+                    + (checked.stderr or checked.stdout).strip()[:300])
+            print(json.dumps({"status": "passed", "backend": "docker-desktop-vm",
+                              "image_id": image_id}))
+            return 0
+    if action == "login":
+        subprocess.run([docker, "volume", "create", DOCKER_AUTH_VOLUME],
+                       check=True, stdout=subprocess.DEVNULL, timeout=20)
+        return subprocess.call(docker_auth_args(docker, image_id, True) + ["--device-auth"])
+    if not docker_volume_exists(docker):
+        die("Docker login volume is missing; run: afws-isolate docker login")
+    return subprocess.call(docker_auth_args(docker, image_id, False) + ["status"])
+
+
+def docker_job_command(docker: str, image_id: str, input_dir: Path,
+                       output_dir: Path, container_name: str,
+                       guide_relative: str, auth_volume: bool,
+                       network: str = "bridge") -> list[str]:
+    command = [docker, "run", "--rm", "--init", "--name", container_name,
+               "--read-only", "--cap-drop=ALL", "--security-opt", "no-new-privileges",
+               "--pids-limit", "128", "--memory", "2g", "--cpus", "2",
+               "--network", network, "-i", "--env", f"AFWS_GUIDE={guide_relative}",
+               "--mount", f"type=bind,source={input_dir},target=/job/input,readonly",
+               "--mount", f"type=bind,source={output_dir},target=/job/output",
+               "--mount", (f"type=volume,source={DOCKER_AUTH_VOLUME},target=/auth"
+                            if auth_volume else "type=volume,target=/auth"),
+               "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,uid=10001,gid=10001",
+               "--tmpfs", "/home/afws:rw,nosuid,nodev,size=64m,uid=10001,gid=10001",
+               "--tmpfs", "/job/scratch:rw,nosuid,nodev,size=512m,uid=10001,gid=10001",
+               image_id, "python3", "/opt/afws/child.py"]
+    return command
+
+
+def run_docker_job(args: argparse.Namespace) -> int:
+    docker = docker_binary()
+    image_id = docker_image_id(docker)
+    if not docker_volume_exists(docker):
+        die("Docker login volume is missing; run: afws-isolate docker login")
+    auth = subprocess.run(docker_auth_args(docker, image_id, False) + ["status"],
+                          capture_output=True, text=True, timeout=45)
+    if auth.returncode:
+        die("Docker Codex login is missing; run: afws-isolate docker login")
+    guide, selected, result_dir = selected_job_paths(args, None)
+    result_dir.parent.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(mode=0o700)
+    outcome: dict[str, object] = {"status": "setup_failed", "result_dir": str(result_dir),
+                                  "backend": "docker-desktop-vm", "image_id": image_id}
+    started = time.time()
+    container_name: str | None = None
+    interrupted_signal: int | None = None
+    previous_signals = {number: signal.getsignal(number)
+                        for number in (signal.SIGTERM, signal.SIGHUP)}
+
+    def interrupt(number: int, _frame: object) -> None:
+        nonlocal interrupted_signal
+        interrupted_signal = number
+        raise KeyboardInterrupt
+
+    for number in previous_signals:
+        signal.signal(number, interrupt)
+    try:
+        with tempfile.TemporaryDirectory(prefix="afws-isolate-docker-") as raw:
+            root = Path(raw).resolve()
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            copied_bytes = [0]
+            copied_entries = [0]
+            for source in selected:
+                copy_input(source, input_dir / source.name, copied_bytes,
+                           args.max_input_mb * 1024 * 1024,
+                           copied_entries, args.max_entries)
+            guide_relative = staged_guide(guide, selected)
+            (result_dir / "input-manifest.json").write_text(
+                json.dumps(staged_manifest(input_dir), indent=2) + "\n")
+            container_name = "afws-isolate-job-" + uuid.uuid4().hex
+            command = docker_job_command(docker, image_id, input_dir, output_dir,
+                                         container_name, guide_relative.as_posix(), True)
+            with (result_dir / "events.jsonl").open("wb") as stdout, \
+                    (result_dir / "stderr.log").open("wb") as stderr:
+                child = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                         stdout=stdout, stderr=stderr,
+                                         start_new_session=True)
+                try:
+                    child.communicate(input=prompt_text(guide_relative, args.note).encode(),
+                                      timeout=args.timeout)
+                    returncode = child.returncode
+                except subprocess.TimeoutExpired:
+                    returncode = 124
+                finally:
+                    docker_remove(docker, container_name)
+                    if child.poll() is None:
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    child.wait()
+            outcome.update({"status": "artifact_validation_failed",
+                            "child_exit_code": returncode})
+            artifacts = copy_outputs(output_dir, result_dir / "artifacts",
+                                     args.max_output_mb * 1024 * 1024,
+                                     args.max_entries)
+            handoff = result_dir / "artifacts" / "HANDOFF.md"
+            handoff_present = handoff.is_file()
+            if not handoff_present:
+                handoff.write_text("The child did not produce HANDOFF.md. Inspect events.jsonl and stderr.log.\n")
+                artifacts = staged_manifest(result_dir / "artifacts")
+            completed = returncode == 0 and handoff_present
+            outcome.update({"status": "child_completed" if completed else "child_failed",
+                            "child_exit_code": returncode,
+                            "guide": guide_relative.as_posix(),
+                            "artifacts": artifacts, "parent_evaluation": "pending"})
+            if not handoff_present:
+                outcome["error"] = "child did not produce HANDOFF.md"
+            return 0 if completed else 1
+    except KeyboardInterrupt:
+        outcome["status"] = "interrupted"
+        outcome["error"] = "job interrupted"
+        return 128 + interrupted_signal if interrupted_signal is not None else 130
+    except (OSError, subprocess.SubprocessError, JobError) as exc:
+        outcome["error"] = str(exc)
+        print(f"afws-isolate: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if container_name is not None:
+            docker_remove(docker, container_name)
+        for number, previous in previous_signals.items():
+            signal.signal(number, previous)
+        outcome["elapsed_seconds"] = round(time.time() - started, 3)
+        (result_dir / "result.json").write_text(json.dumps(outcome, indent=2) + "\n")
+        print(str(result_dir))
+
+
+def run_job(args: argparse.Namespace) -> int:
+    if sys.platform != "darwin":
+        die("isolated runs currently require macOS")
+    codex_path = codex_binary()
+    home = auth_home()
+    prepare_auth_home(home)
+    env_for_auth = os.environ.copy()
+    env_for_auth["CODEX_HOME"] = str(home)
+    auth = subprocess.run([codex_path, "login", "status"], env=env_for_auth,
+                          capture_output=True, text=True, timeout=30)
+    if auth.returncode:
+        die("isolated Codex login is missing; run: afws-isolate auth login")
+    guide, selected, result_dir = selected_job_paths(args, home)
+
+    result_dir.parent.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(mode=0o700)
+    outcome: dict[str, object] = {"status": "setup_failed", "result_dir": str(result_dir)}
+    started = time.time()
+    profile_file: Path | None = None
+    denied_file: Path | None = None
+    interrupted_signal: int | None = None
+    previous_signals = {number: signal.getsignal(number)
+                        for number in (signal.SIGTERM, signal.SIGHUP)}
+
+    def interrupt(number: int, _frame: object) -> None:
+        nonlocal interrupted_signal
+        interrupted_signal = number
+        raise KeyboardInterrupt
+
+    for number in previous_signals:
+        signal.signal(number, interrupt)
+    try:
+        with tempfile.TemporaryDirectory(prefix="afws-isolate-") as job_root_raw:
+            job_root = Path(job_root_raw).resolve()
+            input_dir = job_root / "input"
+            output_dir = job_root / "output"
+            scratch_dir = job_root / "scratch"
+            runtime_dir = job_root / "runtime"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            scratch_dir.mkdir()
+            staged_codex = stage_codex(codex_path, runtime_dir)
+            copied_bytes = [0]
+            copied_entries = [0]
+            for source in selected:
+                copy_input(source, input_dir / source.name, copied_bytes,
+                           args.max_input_mb * 1024 * 1024,
+                           copied_entries, args.max_entries)
+            guide_relative = staged_guide(guide, selected)
+            (input_dir / ".afws-probe").write_text("input access probe\n")
+            denied_file = result_dir / ".afws-denied-probe"
+            denied_file.write_text("outside input\n")
+            profile_name = f"afws-job-{uuid.uuid4().hex}"
+            profile_file = home / f"{profile_name}.config.toml"
+            profile_file.write_text(profile_text(job_root, input_dir, output_dir, scratch_dir, home))
+            profile_file.chmod(0o600)
+            child_environment = child_env(home, scratch_dir, staged_codex)
+            outcome["config_guard"] = {"status": "failed"}
+            config_result, requirements = read_codex_config(
+                codex_path, child_environment, job_root, home)
+            outcome["config_guard"] = check_codex_config(config_result, requirements)
+            sandbox_probe(codex_path, profile_name, child_environment,
+                          input_dir, output_dir, denied_file, staged_codex)
+            denied_file.unlink()
+            (input_dir / ".afws-probe").unlink()
+            (result_dir / "input-manifest.json").write_text(
+                json.dumps(staged_manifest(input_dir), indent=2) + "\n"
+            )
+            command = [str(staged_codex), "exec", "--profile", profile_name,
+                       "--strict-config", "--ignore-rules", "--ephemeral",
+                       "--skip-git-repo-check", "--json", "-C", str(job_root),
+                       prompt_text(guide_relative, args.note)]
+            with (result_dir / "events.jsonl").open("wb") as stdout, \
+                    (result_dir / "stderr.log").open("wb") as stderr:
+                child = subprocess.Popen(command, env=child_environment,
+                                         stdin=subprocess.DEVNULL,
+                                         stdout=stdout, stderr=stderr,
+                                         start_new_session=True)
+                try:
+                    returncode = child.wait(timeout=args.timeout)
+                except subprocess.TimeoutExpired:
+                    returncode = 124
+                finally:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+            outcome.update({"status": "artifact_validation_failed",
+                            "child_exit_code": returncode})
+            artifacts = copy_outputs(output_dir, result_dir / "artifacts",
+                                     args.max_output_mb * 1024 * 1024,
+                                     args.max_entries)
+            handoff = result_dir / "artifacts" / "HANDOFF.md"
+            handoff_present = handoff.is_file()
+            if not handoff_present:
+                handoff.write_text("The child did not produce HANDOFF.md. Inspect events.jsonl and stderr.log.\n")
+                artifacts = staged_manifest(result_dir / "artifacts")
+            completed = returncode == 0 and handoff_present
+            outcome.update({
+                "status": "child_completed" if completed else "child_failed",
+                "child_exit_code": returncode,
+                "guide": guide_relative.as_posix(),
+                "artifacts": artifacts,
+                "parent_evaluation": "pending",
+            })
+            if not handoff_present:
+                outcome["error"] = "child did not produce HANDOFF.md"
+            return 0 if completed else 1
+    except KeyboardInterrupt:
+        outcome["status"] = "interrupted"
+        outcome["error"] = "job interrupted"
+        return 128 + interrupted_signal if interrupted_signal is not None else 130
+    except (OSError, subprocess.SubprocessError, JobError) as exc:
+        outcome["error"] = str(exc)
+        print(f"afws-isolate: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        for number, previous in previous_signals.items():
+            signal.signal(number, previous)
+        if profile_file is not None:
+            profile_file.unlink(missing_ok=True)
+        if denied_file is not None:
+            denied_file.unlink(missing_ok=True)
+        outcome["elapsed_seconds"] = round(time.time() - started, 3)
+        (result_dir / "result.json").write_text(json.dumps(outcome, indent=2) + "\n")
+        print(str(result_dir))
+
+
+def main() -> int:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description="Run an isolated, single-use Codex processing job")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    auth_parser = subcommands.add_parser("auth", help="use a dedicated Codex login, never ~/.codex")
+    auth_parser.add_argument("action", choices=["login", "status"])
+    docker_parser = subcommands.add_parser("docker", help="manage the Docker Desktop VM backend")
+    docker_parser.add_argument("action", choices=["build", "doctor", "login", "status"])
+    evaluation_parser = subcommands.add_parser("evaluate", help="record the parent's independent verdict")
+    evaluation_parser.add_argument("--result", required=True, help="completed result directory")
+    evaluation_parser.add_argument("--verdict", required=True,
+                                   choices=["match", "mismatch", "undetermined"])
+    evidence_source = evaluation_parser.add_mutually_exclusive_group(required=True)
+    evidence_source.add_argument("--evidence", help="parent's comparison and reasons")
+    evidence_source.add_argument("--evidence-file", help="UTF-8 file containing comparison and reasons")
+    evaluation_parser.add_argument("--replace", action="store_true",
+                                   help="revise an existing parent evaluation")
+    job_parser = subcommands.add_parser("run", help="stage inputs and run the child")
+    job_parser.add_argument("--backend", choices=["host", "docker"], default="docker",
+                            help="Docker Desktop VM container (default) or explicit host profile")
+    job_parser.add_argument("--guide", required=True, help="Markdown processing instructions")
+    job_parser.add_argument("--input", action="append", required=True,
+                            help="one file or directory to stage; repeat as needed")
+    job_parser.add_argument("--result", required=True, help="new directory for artifacts and handoff")
+    job_parser.add_argument("--note", help="additional parent request")
+    job_parser.add_argument("--timeout", type=int, default=900, help="child timeout in seconds")
+    job_parser.add_argument("--max-input-mb", type=int, default=1024,
+                            help="maximum total staged input size in MiB")
+    job_parser.add_argument("--max-output-mb", type=int, default=1024,
+                            help="maximum total copied artifact size in MiB")
+    job_parser.add_argument("--max-entries", type=int, default=10000,
+                            help="maximum input or output file and directory count")
+    args = parser.parse_args()
+    try:
+        if args.command == "auth":
+            return run_auth(args.action)
+        if args.command == "docker":
+            return run_docker_action(args.action)
+        if args.command == "evaluate":
+            return record_evaluation(args)
+        if min(args.timeout, args.max_input_mb, args.max_output_mb,
+               args.max_entries) < 1:
+            die("--timeout, --max-input-mb, --max-output-mb, and --max-entries must be positive")
+        return run_docker_job(args) if args.backend == "docker" else run_job(args)
+    except (JobError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
+        print(f"afws-isolate: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

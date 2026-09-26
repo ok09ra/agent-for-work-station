@@ -29,9 +29,14 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 1. Claude looks for an SSHFS working tree; Codex looks for a Finder/VS Code rclone NFS view.
 2. Codex itself starts in an empty local control directory and treats the remote project as authoritative.
 3. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
-4. It picks an unused session name of the form `fws-HOST-PROJECT-N`.
+4. It picks an unused session name of the form `fws-HOST-PROJECT-N` for Claude
+   or `cx-HOST-PROJECT-N` for Codex.
 5. It records the session in `~/.afws/sessions/` so other sessions can see what this one is working on.
 6. Claude starts in its mount; Codex starts in the control directory and performs every project operation through `afws-run`.
+
+Codex also attaches four local lifecycle hooks. Review and trust them when
+Codex prompts. They record the thread ID, status, and short task label after
+the first turn so another session can address this one.
 
 Both agents run on the Mac. Under Codex, project reads, edits, Git, tests and builds all run on the SSH host. Its work continues if the visibility mount drops.
 

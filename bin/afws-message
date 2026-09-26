@@ -1,0 +1,135 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-message"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || afws_die "cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+
+readonly PEERS="${SCRIPT_DIR}/afws-peers"
+target_name=""
+broadcast=0
+same_only=0
+filter_host=""
+body=""
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-message --to SESSION_NAME --message TEXT"
+  print -r -- "  afws-message --all [--same | --host SSH_HOST] --message TEXT"
+  print -r -- ""
+  print -r -- "Queues a message for a live Codex session. --all sends to every live"
+  print -r -- "Codex session in the chosen scope, excluding this session. A queued"
+  print -r -- "message is not proof that the recipient has completed the request."
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --to)
+      (( $# >= 2 )) || afws_die "--to needs a session name"
+      target_name="$2"; shift 2 ;;
+    --all) broadcast=1; shift ;;
+    --same) same_only=1; shift ;;
+    --host)
+      (( $# >= 2 )) || afws_die "--host needs an SSH config host"
+      filter_host="$2"; shift 2 ;;
+    --message)
+      (( $# >= 2 )) || afws_die "--message needs text"
+      body="$2"; shift 2 ;;
+    *) afws_die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$body" && ${#body} -le 4000 ]] || afws_die "message must contain 1 to 4000 characters"
+if (( broadcast )); then
+  [[ -z "$target_name" ]] || afws_die "choose exactly one of --to and --all"
+else
+  [[ -n "$target_name" ]] || afws_die "choose exactly one of --to and --all"
+fi
+if (( broadcast )); then
+  (( ! same_only )) || [[ -z "$filter_host" ]] || afws_die "choose --same or --host, not both"
+else
+  (( ! same_only )) && [[ -z "$filter_host" ]] || afws_die "--same and --host require --all"
+  afws_validate_session_name "$target_name"
+fi
+[[ -z "$filter_host" ]] || afws_validate_host "$filter_host"
+command -v codex >/dev/null 2>&1 || afws_die "codex command not found"
+[[ -x "$PEERS" ]] || afws_die "afws-peers is not installed next to afws-message"
+
+listing="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-message.XXXXXX")" || exit 1
+trap 'rm -f "$listing"' EXIT
+typeset -a peer_args
+peer_args=(--json)
+[[ -z "$filter_host" ]] || peer_args+=(--host "$filter_host")
+(( ! same_only )) || peer_args+=(--same)
+"$PEERS" "${peer_args[@]}" > "$listing" || afws_die "could not list live sessions"
+
+sender="${AFWS_SESSION_NAME:-user}"
+wrapped="[AFWS peer message from ${sender}]
+${body}
+[End AFWS peer message]"
+
+typeset -A seen_threads
+found=0
+sent=0
+failed=0
+index=0
+while (( index < 512 )); do
+  peer_name="$(plutil -extract "${index}.session_name" raw -o - -- "$listing" 2>/dev/null)" || break
+  peer_agent="$(plutil -extract "${index}.agent" raw -o - -- "$listing" 2>/dev/null)" || peer_agent=""
+  peer_thread="$(plutil -extract "${index}.thread_id" raw -o - -- "$listing" 2>/dev/null)" || peer_thread=""
+  index=$(( index + 1 ))
+
+  if (( ! broadcast )); then
+    [[ "$peer_name" == "$target_name" ]] || continue
+    found=1
+  else
+    [[ "$peer_name" != "${AFWS_SESSION_NAME-}" ]] || continue
+    [[ "$peer_agent" == codex ]] || continue
+  fi
+
+  if [[ "$peer_agent" != codex ]]; then
+    afws_die "${peer_name} is a Claude session; external Codex queue cannot address it"
+  fi
+  if [[ -z "$peer_thread" ]]; then
+    if (( broadcast )); then
+      print -u2 -r -- "Skipped ${peer_name}: no Codex thread ID yet (start its first turn and trust the hooks)."
+      failed=$(( failed + 1 ))
+      continue
+    fi
+    afws_die "${peer_name} has no Codex thread ID yet; start its first turn and trust the hooks"
+  fi
+  if [[ "$peer_name" == "${AFWS_SESSION_NAME-}" || -n "${seen_threads[$peer_thread]-}" ]]; then
+    if (( ! broadcast )); then
+      afws_die "refusing to send to this session"
+    fi
+    continue
+  fi
+  seen_threads[$peer_thread]=1
+
+  if queue_result="$(codex queue --thread "$peer_thread" --message "$wrapped" 2>&1)"; then
+    print -r -- "Queued for ${peer_name}."
+    sent=$(( sent + 1 ))
+  else
+    print -u2 -r -- "Could not queue for ${peer_name}: ${queue_result}"
+    failed=$(( failed + 1 ))
+  fi
+  (( broadcast )) || break
+done
+
+if (( ! broadcast && ! found )); then
+  afws_die "no live session named ${target_name}; run afws-peers"
+fi
+if (( broadcast && sent == 0 && failed == 0 )); then
+  afws_die "no other live Codex sessions in this scope"
+fi
+(( failed == 0 && sent > 0 ))

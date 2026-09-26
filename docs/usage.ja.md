@@ -29,9 +29,11 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 1. ClaudeではSSHFS作業ツリー、CodexではFinder/VS Code用rclone NFSビューを探します。
 2. Codex自身は空のローカル制御ディレクトリで起動し、リモートプロジェクトを正本として扱います。
 3. 接続先への認証済みSSH接続を1本だけ開きます。パスワードや鍵のパスフレーズを求められる場合は、ここで入力します。
-4. `fws-HOST-PROJECT-N`形式の未使用のセッション名を決めます。
+4. Claudeなら`fws-HOST-PROJECT-N`、Codexなら`cx-HOST-PROJECT-N`形式の未使用のセッション名を決めます。
 5. `~/.afws/sessions/`へセッションを登録し、他のセッションから担当範囲が見えるようにします。
 6. `claudefws`はマウント内、`codexfws`は制御ディレクトリ内で起動します。Codexのプロジェクト操作はすべて`afws-run`経由です。
+
+Codexには4つのローカルライフサイクルフックも付けます。Codexに求められたら内容を確認して信頼してください。最初のターン後にスレッドID・状態・短い作業ラベルを記録し、別セッションから宛先にできるようにします。
 
 どちらのエージェントもMacで動きます。Codexでは読み取り・編集・Git・実行を含む全プロジェクト操作がSSH接続先で動きます。表示用ビューが切れてもCodexの作業は継続できます。
 

@@ -1,0 +1,58 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-status"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || afws_die "cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+
+usage() {
+  print -r -- "Usage: afws-status [show | set SHORT_ACTIVITY | clear]"
+  print -r -- ""
+  print -r -- "Set the short task description shown to other work-station sessions."
+  print -r -- "Run inside a codexfws session. The description stays on this Mac."
+}
+
+(( $# > 0 )) || set -- show
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  show) (( $# <= 1 )) || afws_die "show takes no argument" ;;
+  set) (( $# == 2 )) || afws_die "set requires one short description" ;;
+  clear) (( $# == 1 )) || afws_die "clear takes no argument" ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+[[ -n "${AFWS_SESSION_NAME-}" ]] || afws_die "run this inside a work-station session"
+afws_validate_session_name "$AFWS_SESSION_NAME"
+record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+[[ -r "$record" ]] || afws_die "session is no longer registered"
+afws_read_record "$record" || afws_die "could not read session record"
+[[ "$afws_record_session_name" == "$AFWS_SESSION_NAME" ]] || afws_die "session record name mismatch"
+[[ "$afws_record_agent" == codex ]] || afws_die "afws-status currently supports Codex sessions only"
+
+case "$1" in
+  show)
+    afws_read_session_meta "$AFWS_SESSION_NAME" activity 2>/dev/null ||
+      afws_read_session_meta "$AFWS_SESSION_NAME" prompt 2>/dev/null ||
+      print -r -- "(no activity recorded)"
+    ;;
+  set)
+    activity="$2"
+    [[ -n "$activity" && "$activity" != *[[:cntrl:]]* && ${#activity} -le 160 ]] ||
+      afws_die "activity must be one line of 1 to 160 characters"
+    afws_write_session_meta "$AFWS_SESSION_NAME" activity "$activity"
+    print -r -- "Activity: ${activity}"
+    ;;
+  clear)
+    rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" activity)"
+    print -r -- "Activity cleared."
+    ;;
+esac

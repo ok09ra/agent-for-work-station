@@ -2,16 +2,16 @@
 
 [English](sessions.md) · [README](../README.ja.md)
 
-1台のワークステーションでは、長時間の学習ジョブ、再現中のバグ、レビュー中のリファクタリングなど、複数の作業が同時に進むのが普通です。同じMac上で動いているClaude Codeのセッションは互いを認識し、メッセージを交換できます。そのため、これらの作業を1つのセッションで切り替えるのではなく、協調する別々のセッションとして進められます。
+1台のワークステーションでは、長時間の学習ジョブ、再現中のバグ、レビュー中のリファクタリングなど、複数の作業が同時に進むのが普通です。同じMac上のClaudeとCodexは`afws-peers`で互いの作業を確認できます。ClaudeからはClaudeまたはCodexへ、CodexからはCodexへメッセージを送れます。
 
-このページでは、その仕組みに対して`claudefws`が何を追加するのか、どう使うのかを説明します。
+このページでは、ランチャーが追加する連携の仕組みと使い方を説明します。
 
 ## 2方向の連携
 
 | 知りたいこと | 手段 |
 | --- | --- |
 | 他に誰がいて、何を担当しているか | `afws-peers`（シェルコマンド） |
-| そのセッションと話したい | `ListAgents`と`SendMessage`（Claude Codeのツール。Claudeセッション間のみ） |
+| そのセッションと話したい | Claude宛ては`ListAgents`と`SendMessage`、Codex宛ては`afws-message` |
 | このGPUは自分が使い終わるまで触らせたくない | `afws-lock`（シェルコマンド） |
 
 `ListAgents`は、このMac上のClaudeセッションと、それぞれが応答する名前を返します。`afws-peers`は、その名前がどのSSH接続先のどのリモートディレクトリを担当しているかを返します。通常は両方が必要です。前者は宛先を指定するため、後者はどのセッションを宛先にすべきか判断するためです。
@@ -62,13 +62,13 @@ afws-peers
 ```
 
 ```
-SESSION                      KIND         STATUS   SSH HOST           REMOTE DIRECTORY
-gpu-trainer                  interactive  busy     example-workstation /remote/project
-fws-example-workstation-project-2  interactive  idle  example-workstation /remote/project
-nightly-watch                background   idle     example-workstation /remote/project
+SESSION        AGENT   KIND         STATUS  SSH HOST             REMOTE DIRECTORY  ACTIVITY
+gpu-trainer    claude  interactive  busy    example-workstation  /remote/project   -
+cx-training    codex   interactive  idle    example-workstation  /remote/project   8B学習
+nightly-watch  claude  background   idle    example-workstation  /remote/project   -
 ```
 
-`AGENT`はどちらのランチャーが起動したセッションかを示します。`STATUS`はClaude Code自身が報告する値です。`busy`、`idle`、`waiting`から、そのセッションが作業中なのか、空いているのか、利用者の応答を待っているのかが分かります。終了したセッションは、これらのコマンドを次に実行した時点で一覧から取り除かれます。
+`AGENT`はどちらのランチャーが起動したセッションかを示します。Claudeの`STATUS`はClaude Code自身から取得し、`waiting`も含みます。Codexの`busy`/`idle`はローカルフックから取得します。`ACTIVITY`にはCodexの短い作業ラベルを表示します。終了したセッションは、次のコマンド実行時に一覧から取り除かれます。
 
 複数のワークステーションやプロジェクトが関係する場合は、一覧を絞り込みます。
 
@@ -80,13 +80,17 @@ afws-peers --json                   # 機械可読
 
 ## 他のセッションと話す
 
-これはClaudeセッション間で機能します。Codexセッションは`afws-peers`に現れロックも取得しますが、名前で宛先を指定できません。Codex CLIに起動時のセッション名がないためです（[エージェントごとにできること](agents.ja.md)）。
+Claude同士は標準の`ListAgents`と`SendMessage`を使います。Codex宛ては`afws-message`が`afws-peers`上の名前をフックで取得したCodexスレッドIDへ解決します。Codexは最初のターンが始まってから宛先になります（[エージェントごとにできること](agents.ja.md)）。
 
-メッセージ送信はシェルコマンドではなく、Claudeが行います。セッション内で普通に依頼してください。
+セッション内では自然な言葉で依頼してください。
 
 > `afws-peers`を確認して、`gpu-trainer`に8Bの学習が終わったか、最終lossがいくらだったかを聞いてください。
 
-セッションは`ListAgents`で名前を確認し、`SendMessage`で質問を送り、返答を報告します。受け取った側は、そのメッセージで割り込まれ、実際に実行・観測した内容に基づいて回答し、自分の作業へ戻ります。
+Claude宛てなら送信側は`ListAgents`と`SendMessage`を使い、受信側は割り込まれます。Codex宛てなら作業ラベルなどを確認して`afws-message --to 名前 --message 本文`でキューに入れます。空いているCodexは新しいターンを始め、作業中なら現在のターンの終了後に処理します。キュー投入は回答完了ではありません。送信側は投入したことを報告し、回答は受信側のセッションで後から確認できます。このツールではCodexからClaude宛てには送れません。
+
+名前は不要です。「8B学習に取り組んでいるエージェントに、データセットの準備ができたと伝えて」で構いません。作業ラベル・ホスト・ディレクトリから一意に特定できなければ確認します。`afws-peers`を読むのは必要な時だけで、フックは他セッションの情報をモデルの文脈へ流し込みません。Codexの`afws-status set '8B学習'`で安定した作業ラベルを設定でき、未設定なら直近のユーザープロンプトの最初の行を表示します。ラベルはこのMac上の本人だけが読めるファイルに保存されます。秘密情報はラベルに含めないでください。
+
+ターミナルから直接送る場合は`afws-message --to 名前 --message 本文`、同じプロジェクトの他のCodex全員へは`afws-message --all --same --message 本文`を使います。`--same`なしの`--all`はこのMac上のすべての稼働中Codexが対象です。一斉送信は明示的に依頼された場合だけ行います。
 
 これが有効なのは、一方のセッションだけが持っている情報を他方が知りたい場合です。どのcheckpointが最新か、なぜそのテストを無効化したのか、1時間前の失敗がどのような内容だったか、データセットの変換が終わったか、といった情報です。
 

@@ -3,19 +3,18 @@
 [日本語](sessions.ja.md) · [README](../README.md)
 
 One workstation is usually shared by more than one piece of work: a long
-training run, a bug being reproduced, a refactor being reviewed. Claude Code
-sessions running on the same Mac can see each other and exchange messages, so
-those pieces of work can be separate sessions that still cooperate instead of
-one session switching between them.
+training run, a bug being reproduced, a refactor being reviewed. Claude and
+Codex sessions running on the same Mac can see each other's work in
+`afws-peers`; Claude can message Claude or Codex, and Codex can message Codex.
 
-This page describes what `claudefws` adds on top of that, and how to use it.
+This page describes what the launchers add on top of that, and how to use it.
 
 ## Two directions of coordination
 
 | Question | Answer |
 | --- | --- |
 | Who else is here, and what are they working on? | `afws-peers`, a shell command |
-| Let me talk to that session | `ListAgents` and `SendMessage`, Claude Code tools — Claude sessions only |
+| Let me talk to that session | `ListAgents` and `SendMessage` for Claude; `afws-message` for Codex |
 | Nobody else touch this GPU while I use it | `afws-lock`, a shell command |
 
 `ListAgents` reports the Claude sessions on this Mac and the name each one
@@ -88,17 +87,16 @@ afws-peers
 ```
 
 ```
-SESSION                      KIND         STATUS   SSH HOST           REMOTE DIRECTORY
-gpu-trainer                  interactive  busy     example-workstation /remote/project
-fws-example-workstation-project-2  interactive  idle  example-workstation /remote/project
-nightly-watch                background   idle     example-workstation /remote/project
+SESSION        AGENT   KIND         STATUS  SSH HOST             REMOTE DIRECTORY  ACTIVITY
+gpu-trainer    claude  interactive  busy    example-workstation  /remote/project   -
+cx-training    codex   interactive  idle    example-workstation  /remote/project   8B training
+nightly-watch  claude  background   idle    example-workstation  /remote/project   -
 ```
 
-`AGENT` is which launcher started the session. `STATUS` comes from Claude Code
-itself, so `busy`, `idle`, and `waiting` say
-whether a session is working, free, or waiting for its user to answer
-something. A session that has exited is removed from the listing the next time
-any of these commands runs.
+`AGENT` is which launcher started the session. Claude's `STATUS` comes from
+Claude Code itself, including `waiting`; Codex's `busy` and `idle` come from
+local lifecycle hooks. `ACTIVITY` gives a short Codex task label. A session
+that has exited is removed from the listing the next time a command runs.
 
 Narrow the listing when several workstations or projects are in play:
 
@@ -110,20 +108,36 @@ afws-peers --json                   # machine-readable
 
 ## Talking to another session
 
-This works between Claude sessions. A Codex session appears in `afws-peers` and
-takes locks, but cannot be addressed by name, because Codex CLI has no
-launch-time session name — see [what each agent supports](agents.md).
+Claude-to-Claude messages use the native `ListAgents` and `SendMessage` tools.
+Codex recipients use `afws-message`, which resolves the name in `afws-peers` to
+the Codex thread ID captured by a lifecycle hook. A Codex recipient becomes
+addressable after its first turn. See [what each agent supports](agents.md).
 
-Messaging is done by Claude, not by a shell command. Inside a session, ask for
-it in the ordinary way:
+Inside a session, ask in ordinary language:
 
 > Check `afws-peers`, then ask `gpu-trainer` whether the 8B run has
 > finished and what the final loss was.
 
-The session uses `ListAgents` to confirm the name, `SendMessage` to send the
-question, and reports the answer back to you. The receiving session is
-interrupted with the message, answers from what it has actually run and
-observed, and continues its own work.
+For a Claude recipient, the sender uses `ListAgents` and `SendMessage`; that
+recipient is interrupted. For a Codex recipient, the sender checks the live
+activity labels and uses `afws-message --to NAME --message TEXT`. An idle Codex
+session starts a turn; a busy one handles the message after its current turn.
+Queueing is not an answer. The sender reports that it queued the message, and
+you can ask the recipient's session for its answer later. Codex cannot send to
+a Claude recipient through this tool.
+
+You need not know the name: “Tell the agent working on 8B training that the
+dataset is ready” works when the activity, host, and directory identify one
+live Codex peer. If several fit, the sender asks you which one. `afws-peers`
+performs this lookup only on demand; lifecycle hooks do not fill model context
+with peer status. `afws-status set '8B training'` gives a Codex session a stable
+activity label; otherwise the first line of its latest user prompt is shown.
+Labels remain in owner-only files on this Mac. Avoid secrets in labels.
+
+For a direct terminal send, use `afws-message --to NAME --message TEXT` or
+`afws-message --all --same --message TEXT` for every other Codex session on
+this project. `--all` without `--same` targets all live Codex sessions on this
+Mac. A broadcast must be explicitly requested.
 
 This is worth using when one session holds knowledge the other would otherwise
 have to rediscover: which checkpoint is current, why a test was disabled, what

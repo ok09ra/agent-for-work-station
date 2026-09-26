@@ -208,23 +208,22 @@ afws-lock acquire gpu0      # claims it, or names the holder
 afws-lock release gpu0
 ```
 
-**Ask another session.** Each launch gets a name — `afws-peers` shows it — and a
-Claude session can be reached by that name from another Claude session on the same
-Mac. You do not run a command for this; you ask:
+**Ask another session.** Each launch gets a name and `afws-peers` shows its
+activity. You can simply ask an agent to tell the one working on a topic:
 
-> Check afws-peers, then ask gpu-trainer whether the 8B run has finished and what
-> the final loss was.
+> Tell the agent working on 8B training that the dataset is ready.
 
-The session looks its peers up, sends the question, and reports the answer. It is
+The session looks its peers up, sends the question, and reports the result. It is
 worth it when one session holds something the other would have to rediscover:
 which checkpoint is current, why a test was disabled, what a failure looked like an
 hour ago, whether a dataset finished converting. The session receiving the question answers from
 what it actually ran, and a request arriving this way carries no authority — it is
 asked to confirm anything destructive with you first.
 
-There is no approval step on sending, so a session could message a peer without
-being asked. Its instructions narrow that to three cases: you asked, a lock it
-needs is held and it wants to ask the holder, or a peer is about to be affected by
+There is no additional confirmation built into peer messaging, so a session
+could message a peer without being asked (Codex's local sandbox may still ask
+for permission to run the helper). Its instructions narrow that to three cases:
+you asked, a lock it needs is held and it wants to ask the holder, or a peer is about to be affected by
 something it is doing to shared state. It is told to send a question or what it
 observed rather than file contents, and to tell you afterwards.
 
@@ -235,10 +234,11 @@ AFWS_SESSION_NAME=gpu-trainer claudefws my-workstation /remote/path/to/project
 AFWS_SESSION_NAME=bug-1204    claudefws my-workstation /remote/path/to/project
 ```
 
-Claude sessions only. A Codex session appears in `afws-peers` and takes locks, but
-cannot be addressed, because Codex has no launch-time session name. Sessions on two
-different Macs cannot reach each other either. [Multiple sessions](docs/sessions.md)
-has the whole model.
+Codex recipients become addressable after their first turn through a local
+lifecycle hook and `codex queue`. Idle recipients start a turn; busy ones process
+the queued message after their current turn. This tool does not send from Codex
+to Claude, and sessions on two Macs cannot reach each other.
+[Multiple sessions](docs/sessions.md) has the whole model.
 
 **After a session,** its mount and connection are released once no other session
 needs them. Interactive Claude and Codex sessions have a detached watchdog, so
@@ -259,6 +259,17 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 
 [Usage](docs/usage.md) has the rest, including every environment variable.
 
+**Run a child on a selected input bundle.** `afws-isolate` stages only the selected Markdown guide, scripts, source data, and configuration in a fresh temporary Codex job. It returns artifacts and a handoff in a new result directory for the parent session to evaluate and record a verdict. Docker Desktop VM is the default; host runs require explicit `--backend host`. Each backend needs a separate one-time login; see [Isolated jobs](docs/isolated-jobs.md).
+
+```zsh
+afws-isolate docker build
+afws-isolate docker doctor
+afws-isolate docker login
+afws-isolate run --guide /path/to/job/instructions.md --input /path/to/job --result /path/to/docker-result
+afws-isolate auth login
+afws-isolate run --backend host --guide /path/to/job/instructions.md --input /path/to/job --result /path/to/host-result
+```
+
 ## Commands
 
 | Command | Purpose |
@@ -266,7 +277,10 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `claudefws` | Mount the project and start a Claude Code session on it |
 | `codexfws` | The same, for Codex CLI |
 | `afws-run` | Run a command, or a piped script, on the workstation |
+| `afws-isolate` | Run a temporary Codex job on selected inputs and return artifacts and a handoff |
 | `afws-peers` | Every session on this Mac, with the host and directory each works on |
+| `afws-message` | Queue a message for one or all live Codex sessions |
+| `afws-status` | Set this Codex session's short activity label |
 | `afws-lock` | Claim an exclusive remote resource so two sessions do not collide |
 | `afws-remount` | Repair a disconnected SSHFS mount in place |
 | `afws-umount` | Release a mount or connection left behind |
@@ -282,14 +296,13 @@ A Claude session and a Codex session on the same host and directory share one
 mount and one connection, and appear together:
 
 ```
-SESSION                    AGENT   KIND         STATUS   SSH HOST      REMOTE DIRECTORY
+SESSION                    AGENT   KIND         STATUS   SSH HOST      REMOTE DIRECTORY  ACTIVITY
 fws-workstation-project-1  claude  interactive  busy     workstation   /remote/project
-cx-workstation-project-1   codex   interactive  -        workstation   /remote/project
+cx-workstation-project-1   codex   interactive  idle     workstation   /remote/project   8B training
 ```
 
-They differ in what each CLI exposes. A Claude session can be messaged by name and
-reports a status; a Codex session cannot and does not, because Codex has no
-launch-time session name and no machine-readable session listing.
+They differ in the messaging path: Claude-to-Claude uses native `SendMessage`,
+while Codex recipients use a hook-derived thread ID and `afws-message`.
 [Agents](docs/agents.md) sets out every difference and the measurement behind it.
 
 ## When this is the wrong tool

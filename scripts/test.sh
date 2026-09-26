@@ -9,6 +9,10 @@ readonly CODEX_LAUNCHER="${REPOSITORY_ROOT}/bin/codexfws"
 readonly RUNNER="${REPOSITORY_ROOT}/bin/afws-run"
 readonly PUSHER="${REPOSITORY_ROOT}/bin/afws-push"
 readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
+readonly MESSAGE="${REPOSITORY_ROOT}/bin/afws-message"
+readonly STATUS_HELPER="${REPOSITORY_ROOT}/bin/afws-status"
+readonly CODEX_HOOK="${REPOSITORY_ROOT}/bin/afws-codex-hook"
+readonly ISOLATE="${REPOSITORY_ROOT}/bin/afws-isolate"
 readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
 readonly REMOUNT="${REPOSITORY_ROOT}/bin/afws-remount"
 readonly UMOUNT="${REPOSITORY_ROOT}/bin/afws-umount"
@@ -91,6 +95,9 @@ for script in \
   "$CODEX_LAUNCHER" \
   "$RUNNER" \
   "$PEERS" \
+  "$MESSAGE" \
+  "$STATUS_HELPER" \
+  "$CODEX_HOOK" \
   "$LOCK" \
   "$REMOUNT" \
   "$UMOUNT" \
@@ -109,7 +116,7 @@ special_parameter_hits=""
 for name in path status cdpath fpath manpath module_path argv options signals \
   psvar mailpath watch histchars prompt SECONDS RANDOM LINES COLUMNS pipestatus dirstack; do
   hits="$(grep -nE "(^|[[:space:];(&|]|local |readonly |typeset |integer |export )${name}=" \
-    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT" \
+    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$CODEX_HOOK" "$LOCK" "$REMOUNT" "$UMOUNT" \
     "${REPOSITORY_ROOT}/scripts/"*.sh 2>/dev/null || true)"
   [[ -n "$hits" ]] && special_parameter_hits+="${name}: ${hits}"$'\n'
 done
@@ -220,6 +227,8 @@ for document in \
   "${REPOSITORY_ROOT}/docs/agents.ja.md" \
   "${REPOSITORY_ROOT}/docs/install-macos.md" \
   "${REPOSITORY_ROOT}/docs/install-macos.ja.md" \
+  "${REPOSITORY_ROOT}/docs/isolated-jobs.md" \
+  "${REPOSITORY_ROOT}/docs/isolated-jobs.ja.md" \
   "${REPOSITORY_ROOT}/docs/security.md" \
   "${REPOSITORY_ROOT}/docs/security.ja.md" \
   "${REPOSITORY_ROOT}/docs/sessions.md" \
@@ -232,6 +241,7 @@ for document in \
 done
 
 [[ -f "${REPOSITORY_ROOT}/LICENSE" ]] || fail "LICENSE is missing"
+python3 "${REPOSITORY_ROOT}/scripts/test-isolate.py" || fail "isolated job tests failed"
 grep -Fq 'MIT License' "${REPOSITORY_ROOT}/LICENSE" || fail "LICENSE is not the MIT licence"
 grep -Fq 'Copyright (c) 2026 Sota Okuda (ok09ra)' "${REPOSITORY_ROOT}/LICENSE" || \
   fail "LICENSE has no copyright line"
@@ -247,7 +257,7 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$LOCK" "$REMOUNT" "$UMOUNT"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$ISOLATE" "$LOCK" "$REMOUNT" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
@@ -258,7 +268,7 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-push afws-peers afws-lock afws-remount afws-umount afws-shell afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
@@ -1331,6 +1341,78 @@ write_record fws-alpha-dead claude 999999 alpha /remote/other 1000000000
 expect_rejected "contradictory prune options" "$PEERS" --prune --no-prune
 expect_rejected "an invalid SSH config host name" "$PEERS" --host 'invalid host'
 expect_rejected "an unknown option" "$PEERS" --nonsense
+
+# --- Codex peer metadata and queue routing -------------------------------
+
+reset_state
+write_record cx-sender codex "$$" alpha /remote/project 1000000000
+write_record cx-training codex "$$" alpha /remote/project 1000000001
+write_record cx-other codex "$$" beta /srv/other 1000000002
+write_record fws-review claude "$$" alpha /remote/project 1000000003
+
+print -r -- '{"hook_event_name":"SessionStart","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" || fail "Codex SessionStart hook failed"
+print -r -- '{"hook_event_name":"UserPromptSubmit","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","prompt":"Train the 8B model\\nmore details"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" || fail "Codex prompt hook failed"
+[[ "$(AFWS_SESSION_NAME=cx-training "$STATUS_HELPER" set '8B training')" == 'Activity: 8B training' ]] ||
+  fail "afws-status could not set a manual task label"
+print -r -- '{"hook_event_name":"UserPromptSubmit","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","prompt":"はい"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" || fail "Codex prompt update failed"
+json_listing="$("$PEERS" --json)"
+[[ "$json_listing" == *'"thread_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"'* ]] ||
+  fail "Codex hook thread ID was not listed"
+[[ "$json_listing" == *'"activity":"8B training"'* ]] ||
+  fail "manual task label did not survive the next prompt"
+[[ "$json_listing" == *'"status":"busy"'* ]] || fail "Codex busy status was not listed"
+[[ "$(print -r -- '{"hook_event_name":"Stop","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")" == '{}' ]] || fail "Codex Stop hook failed"
+[[ "$("$PEERS" --json)" == *'"status":"idle"'* ]] || fail "Codex idle status was not listed"
+
+print -r -- '{"hook_event_name":"SessionStart","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}' |
+  AFWS_SESSION_NAME=cx-other "$CODEX_HOOK" || fail "second Codex hook failed"
+
+cat >| "${STUB_BIN}/codex" <<'STUB_CODEX_QUEUE'
+#!/bin/zsh
+[[ "$1" == queue && "$2" == --thread && "$4" == --message ]] || exit 5
+print -r -- "$3" >> "$AFWS_TEST_QUEUE_LOG"
+print -r -- "$5" >> "${AFWS_TEST_QUEUE_LOG}.messages"
+STUB_CODEX_QUEUE
+chmod +x "${STUB_BIN}/codex"
+export AFWS_TEST_QUEUE_LOG="${SANDBOX}/queued-threads"
+
+direct_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
+  "$MESSAGE" --to cx-training --message 'Checkpoint complete?')" || fail "direct queue failed"
+[[ "$direct_result" == 'Queued for cx-training.' ]] || fail "direct queue output was wrong"
+[[ "$(< "$AFWS_TEST_QUEUE_LOG")" == 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' ]] ||
+  fail "direct queue used the wrong thread ID"
+[[ "$(< "${AFWS_TEST_QUEUE_LOG}.messages")" == *'[AFWS peer message from cx-sender]'* ]] ||
+  fail "queued message did not identify its sender"
+expect_rejected "direct queue to a Claude session" env PATH="${STUB_BIN}:$PATH" \
+  AFWS_SESSION_NAME=cx-sender "$MESSAGE" --to fws-review --message hello
+expect_rejected "queue to a Codex session before its first turn" env PATH="${STUB_BIN}:$PATH" \
+  AFWS_SESSION_NAME=cx-training "$MESSAGE" --to cx-sender --message hello
+
+: > "$AFWS_TEST_QUEUE_LOG"
+broadcast_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
+  AFWS_SSH_HOST=alpha AFWS_REMOTE_DIR=/remote/project \
+  "$MESSAGE" --all --same --message 'Please pause')" || fail "same-project broadcast failed"
+[[ "$broadcast_result" == 'Queued for cx-training.' ]] || fail "same-project broadcast included a wrong peer"
+[[ "$(wc -l < "$AFWS_TEST_QUEUE_LOG" | tr -d ' ')" == 1 ]] || fail "same-project broadcast sent more than once"
+
+: > "$AFWS_TEST_QUEUE_LOG"
+PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
+  "$MESSAGE" --all --message 'Status please' >/dev/null || fail "all-peer broadcast failed"
+[[ "$(wc -l < "$AFWS_TEST_QUEUE_LOG" | tr -d ' ')" == 2 ]] || fail "broadcast missed a Codex peer"
+
+"$STATUS_HELPER" --help >/dev/null || fail "afws-status help failed"
+AFWS_SESSION_NAME=cx-training "$STATUS_HELPER" clear >/dev/null || fail "afws-status clear failed"
+[[ "$("$PEERS" --json)" == *'"activity":"はい"'* ]] || fail "prompt fallback was not restored"
+
+write_record cx-gone codex 999999 alpha /remote/gone 1000000004
+mkdir -p "${AFWS_STATE_DIR}/session-meta"
+print -r -- 'cccccccc-cccc-cccc-cccc-cccccccccccc' > "${AFWS_STATE_DIR}/session-meta/cx-gone.thread"
+"$PEERS" --prune
+[[ ! -e "${AFWS_STATE_DIR}/session-meta/cx-gone.thread" ]] || fail "dead session left its thread metadata"
 
 # --- releasing mounts -----------------------------------------------------
 

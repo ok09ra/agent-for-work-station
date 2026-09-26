@@ -155,13 +155,13 @@ afws-lock acquire gpu0      # 確保する。取れなければ保持者を表�
 afws-lock release gpu0
 ```
 
-**他のセッションに尋ねる。** 起動ごとに名前が付き（`afws-peers`で見えます）、同じMac上の別のClaudeセッションからその名前で呼べます。コマンドを打つのではなく、頼みます。
+**他のセッションに尋ねる。** 起動ごとに名前が付き、`afws-peers`で作業内容も見えます。作業内容で相手を指定して、自然な言葉で頼めます。
 
-> `afws-peers`を見て、`gpu-trainer`に8Bの学習が終わったか、最終lossがいくらだったかを聞いて。
+> 8B学習に取り組んでいるエージェントに、データセットの準備ができたと伝えて。
 
-セッションが相手を調べ、質問を送り、返答を報告します。効くのは、片方だけが持っている情報を他方が欲しいときです。どのcheckpointが最新か、なぜそのテストを無効化したのか、1時間前の失敗がどういう内容だったか、データセットの変換が終わったか。受け取った側は実際に実行・観測したことから答えます。またこの経路で届いた依頼は権限を持ちません。破壊的なことは利用者に確認するよう指示されています。
+セッションが相手を調べ、質問を送り、送信結果を報告します。効くのは、片方だけが持っている情報を他方が欲しいときです。どのcheckpointが最新か、なぜそのテストを無効化したのか、1時間前の失敗がどういう内容だったか、データセットの変換が終わったか。受け取った側は実際に実行・観測したことから答えます。またこの経路で届いた依頼は権限を持ちません。破壊的なことは利用者に確認するよう指示されています。
 
-送信側に承認ステップはないため、セッションは頼まれなくても peer へ送れます。指示で3つの場合に絞っています。あなたが依頼した、必要なロックが保持されていて保持者に尋ねたい、共有状態への操作で peer に影響が及ぶ。送るのはファイルの中身ではなく質問か観測結果で、送ったことは事後に報告するよう指示しています。
+メッセージ機能自体に追加の確認はないため、セッションは頼まれなくてもpeerへ送れます（Codexのローカルサンドボックスから補助コマンドを呼ぶ際は承認を求められる場合があります）。指示で3つの場合に絞っています。あなたが依頼した、必要なロックが保持されていて保持者に尋ねたい、共有状態への操作でpeerに影響が及ぶ。送るのはファイルの中身ではなく質問か観測結果で、送ったことは事後に報告するよう指示しています。
 
 役割を表す名前を付けられます。
 
@@ -170,7 +170,7 @@ AFWS_SESSION_NAME=gpu-trainer claudefws my-workstation /remote/path/to/project
 AFWS_SESSION_NAME=bug-1204    claudefws my-workstation /remote/path/to/project
 ```
 
-Claudeセッション間のみです。Codexセッションは`afws-peers`に現れロックも取得しますが、宛先にはできません。起動時のセッション名がないためです。別のMac上のセッション同士も届きません。全体像は[複数セッション](docs/sessions.ja.md)にあります。
+Codexは最初のターンが始まった後、ローカルフックと`codex queue`を介して宛先になります。空いていれば新しいターン、作業中なら現在のターン終了後に処理します。このツールではCodexからClaude宛てには送れず、別のMac上のセッション同士も届きません。全体像は[複数セッション](docs/sessions.ja.md)にあります。
 
 **セッション終了後。** 他に必要としているセッションがなければ、マウントと接続は解放されます。対話型のClaude・Codexセッションには独立したwatchdogが付くため、launcherが強制終了・クラッシュした場合も同じ後片付けを行います。バックグラウンドClaudeセッションはマウントを残します。
 
@@ -188,6 +188,17 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 
 残りは[使い方](docs/usage.ja.md)に、環境変数の一覧も含めてあります。
 
+**入力一式だけを子に処理させる。** `afws-isolate`は指定したMarkdown説明書、スクリプト、元データ、設定ファイルを隔離された一時Codex実行へ渡し、生成物と申し送りを新しい結果ディレクトリに返します。メインセッションは元データと説明に照らして結果を評価し、判定と根拠を保存します。既定はDocker Desktop VM内実行です。ホスト実行は`--backend host`を明示した時だけ使います。使用する方式で初回ログインが必要です。詳細は[隔離ジョブ](docs/isolated-jobs.ja.md)を参照してください。
+
+```zsh
+afws-isolate docker build
+afws-isolate docker doctor
+afws-isolate docker login
+afws-isolate run --guide /path/to/job/instructions.md --input /path/to/job --result /path/to/docker-result
+afws-isolate auth login
+afws-isolate run --backend host --guide /path/to/job/instructions.md --input /path/to/job --result /path/to/host-result
+```
+
 ## コマンド
 
 | コマンド | 役割 |
@@ -195,7 +206,10 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 | `claudefws` | プロジェクトをマウントし、Claude Codeセッションを起動する |
 | `codexfws` | 同じことをCodex CLIで行う |
 | `afws-run` | コマンド、または標準入力のスクリプトをワークステーションで実行する |
+| `afws-isolate` | 指定した入力だけで一時Codexジョブを実行し、生成物と申し送りを返す |
 | `afws-peers` | このMac上の全セッションと、それぞれの担当ホスト・ディレクトリ |
+| `afws-message` | 1つまたはすべての稼働中Codexセッションへメッセージをキュー投入 |
+| `afws-status` | このCodexセッションの短い作業ラベルを設定 |
 | `afws-lock` | リモートの排他資源を確保し、複数セッションの衝突を防ぐ |
 | `afws-remount` | 切断されたSSHFSマウントを同じ場所へ張り直す |
 | `afws-umount` | 残されたマウントや接続を解放する |
@@ -209,12 +223,12 @@ afws-run my-workstation --cwd /remote/path --dry-run -- nvidia-smi
 同じホスト・同じディレクトリのClaudeセッションとCodexセッションは、マウントと接続を1つずつ共有し、並んで表示されます。
 
 ```
-SESSION                    AGENT   KIND         STATUS   SSH HOST      REMOTE DIRECTORY
+SESSION                    AGENT   KIND         STATUS   SSH HOST      REMOTE DIRECTORY  ACTIVITY
 fws-workstation-project-1  claude  interactive  busy     workstation   /remote/project
-cx-workstation-project-1   codex   interactive  -        workstation   /remote/project
+cx-workstation-project-1   codex   interactive  idle     workstation   /remote/project   8B学習
 ```
 
-違いは各CLIが公開している機能です。Claudeセッションは名前指定でメッセージを受け取れて状態も報告しますが、Codexセッションはどちらもできません。Codexに起動時のセッション名指定と機械可読なセッション一覧がないためです。差の全体と根拠は[エージェント](docs/agents.ja.md)にあります。
+メッセージの経路は異なります。Claude同士は標準の`SendMessage`、Codex宛てはフックで取得したスレッドIDと`afws-message`を使います。差の全体は[エージェント](docs/agents.ja.md)にあります。
 
 ## このツールが不適な場合
 

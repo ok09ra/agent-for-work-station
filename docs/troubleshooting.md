@@ -207,7 +207,11 @@ An exited session is pruned from the registry automatically. To see the registry
 
 ## `afws-peers` reports the status as `unknown` or `-`
 
-A Codex row always shows `-`: Codex CLI has no machine-readable session listing. For a Claude row, status comes from `claude agents --json`. Run it directly to see why it failed; the usual cause is that Claude Code is not signed in:
+A Codex row shows `-` until its first turn starts and the trusted lifecycle
+hooks record its thread ID and state. Restart through `codexfws` after
+installing this version and trust its hooks when prompted. For a Claude row,
+status comes from `claude agents --json`. Run it directly to see why it failed;
+the usual cause is that Claude Code is not signed in:
 
 ```zsh
 claude agents --json

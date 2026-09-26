@@ -29,6 +29,10 @@ executables=(
   bin/afws-run
   bin/afws-push
   bin/afws-peers
+  bin/afws-message
+  bin/afws-status
+  bin/afws-codex-hook
+  bin/afws-isolate
   bin/afws-lock
   bin/afws-remount
   bin/afws-umount
@@ -37,6 +41,7 @@ executables=(
   scripts/install.sh
   scripts/test.sh
   scripts/prepublish-check.sh
+  scripts/test-isolate.py
 )
 
 files=(
@@ -46,6 +51,8 @@ files=(
   .gitattributes
   lib/afws-common.zsh
   docs/*.md
+  docker/isolate/Dockerfile
+  docker/isolate/child.py
   examples/*
   $executables
 )
@@ -79,7 +86,7 @@ stale_name_pattern+='|CLAUDEFWS'"_"'|CODEXFWS'"_"')'
 # replaces. Everywhere else an old name is a leftover.
 renamed_scope=(lib/afws-common.zsh docs/*.md examples/*
   bin/claudefws bin/codexfws bin/afws-run bin/afws-push bin/afws-peers bin/afws-lock bin/afws-remount
-  bin/afws-umount bin/afws-shell bin/afws-doctor
+  bin/afws-message bin/afws-status bin/afws-codex-hook bin/afws-umount bin/afws-shell bin/afws-doctor
   bin/afws-doctor scripts/test.sh scripts/prepublish-check.sh)
 scan "no leftover command or variable names from before the merge" "$stale_name_pattern" $renamed_scope
 

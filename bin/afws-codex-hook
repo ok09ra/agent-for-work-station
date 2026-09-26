@@ -1,0 +1,59 @@
+#!/bin/zsh
+
+set -eu
+
+# Codex invokes this outside its command sandbox. Do not put hook output in the
+# model context: the registry is read only when an agent actually needs peers.
+[[ -n "${AFWS_SESSION_NAME-}" ]] || exit 0
+
+readonly AFWS_PROGRAM="afws-codex-hook"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || exit 0
+
+afws_validate_session_name "$AFWS_SESSION_NAME"
+record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+[[ -r "$record" ]] || exit 0
+afws_read_record "$record" || exit 0
+[[ "$afws_record_agent" == codex &&
+   "$afws_record_session_name" == "$AFWS_SESSION_NAME" ]] || exit 0
+
+input_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-codex-hook.XXXXXX")" || exit 1
+trap 'rm -f "$input_file"' EXIT
+/bin/cat > "$input_file"
+
+event_name="$(plutil -extract hook_event_name raw -o - -- "$input_file" 2>/dev/null)" || exit 0
+thread_id="$(plutil -extract session_id raw -o - -- "$input_file" 2>/dev/null)" || exit 0
+[[ -n "$thread_id" && "$thread_id" != *[[:cntrl:]]* && ${#thread_id} -le 128 ]] || exit 0
+afws_write_session_meta "$AFWS_SESSION_NAME" thread "$thread_id"
+
+case "$event_name" in
+  SessionStart)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+    ;;
+  UserPromptSubmit)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state busy
+    prompt_text="$(plutil -extract prompt raw -o - -- "$input_file" 2>/dev/null)" || prompt_text=""
+    activity="${prompt_text%%$'\n'*}"
+    activity="${activity//$'\r'/ }"
+    activity="${activity//$'\t'/ }"
+    activity="${activity[1,160]}"
+    if [[ -n "$activity" && "$activity" != "[AFWS peer message from "* ]]; then
+      afws_write_session_meta "$AFWS_SESSION_NAME" prompt "$activity"
+    fi
+    ;;
+  Stop)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+    print -r -- '{}'
+    ;;
+  Interrupt)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+    ;;
+esac

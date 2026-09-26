@@ -5,13 +5,14 @@ set -eu
 readonly REPOSITORY_ROOT="${0:A:h:h}"
 readonly INSTALL_DIRECTORY="${AFWS_INSTALL_DIR:-${HOME}/.local/bin}"
 readonly LIBRARY_DIRECTORY="${INSTALL_DIRECTORY:h}/lib"
+readonly DOCKER_DIRECTORY="${INSTALL_DIRECTORY:h}/share/afws/docker/isolate"
 readonly PROFILE_FILE="${HOME}/.zprofile"
 readonly PROFILE_BEGIN="# >>> agent-for-work-station >>>"
 readonly PROFILE_END="# <<< agent-for-work-station <<<"
 configure_shell=1
 
-readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-lock afws-remount afws-umount
-  afws-shell afws-doctor)
+readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-message afws-status
+  afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor)
 
 usage() {
   print -r -- "Usage: ./scripts/install.sh [--no-shell-config]"
@@ -51,12 +52,14 @@ if (( configure_shell )) && [[ "$INSTALL_DIRECTORY" != "${HOME}/.local/bin" ]]; 
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIRECTORY" "$LIBRARY_DIRECTORY"
+mkdir -p "$INSTALL_DIRECTORY" "$LIBRARY_DIRECTORY" "$DOCKER_DIRECTORY"
 # Every command sources the library, so it must not be group- or world-writable
 # whatever umask happens to be in effect.
 chmod 755 "$LIBRARY_DIRECTORY"
 
 install -m 0644 "${REPOSITORY_ROOT}/lib/afws-common.zsh" "${LIBRARY_DIRECTORY}/afws-common.zsh"
+install -m 0644 "${REPOSITORY_ROOT}/docker/isolate/Dockerfile" "${DOCKER_DIRECTORY}/Dockerfile"
+install -m 0644 "${REPOSITORY_ROOT}/docker/isolate/child.py" "${DOCKER_DIRECTORY}/child.py"
 for command_name in $COMMANDS; do
   install -m 0755 "${REPOSITORY_ROOT}/bin/${command_name}" "${INSTALL_DIRECTORY}/${command_name}"
 done
@@ -81,6 +84,8 @@ for command_name in $COMMANDS; do
   print -r -- "  ${INSTALL_DIRECTORY}/${command_name}"
 done
 print -r -- "  ${LIBRARY_DIRECTORY}/afws-common.zsh"
+print -r -- "  ${DOCKER_DIRECTORY}/Dockerfile"
+print -r -- "  ${DOCKER_DIRECTORY}/child.py"
 
 # The separate claudefws / codexfws installations this replaces are left alone:
 # removing another tool's files is the user's decision, not the installer's.

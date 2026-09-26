@@ -51,9 +51,8 @@ usage() {
   print -r -- "  --quiet      Suppress informational output."
   print -r -- "  --no-prune   Never delete records; hide dead ones instead."
   print -r -- ""
-  print -r -- "Claude Code reports its live sessions in machine-readable form, so a Claude"
-  print -r -- "session shows a status. Codex CLI does not, so a Codex row shows '-' and is"
-  print -r -- "judged live by its process alone."
+  print -r -- "Claude Code reports its own status. Codex status and a short task description"
+  print -r -- "come from local lifecycle hooks; liveness still uses the launcher process."
 }
 
 while (( $# > 0 )); do
@@ -125,13 +124,29 @@ claude_knows_session() {
 session_status() {
   local agent="$1" name="$2"
 
-  if [[ "$agent" != claude ]]; then
-    print -r -- "-"
+  if [[ "$agent" == codex ]]; then
+    afws_read_session_meta "$name" state 2>/dev/null || print -r -- "-"
     return 0
   fi
 
   load_live_table
   print -r -- "${live_status[$name]-unknown}"
+}
+
+session_activity() {
+  local agent="$1" name="$2"
+  if [[ "$agent" == codex ]]; then
+    afws_read_session_meta "$name" activity 2>/dev/null ||
+      afws_read_session_meta "$name" prompt 2>/dev/null || print -r -- "-"
+  else
+    print -r -- "-"
+  fi
+}
+
+session_thread_id() {
+  local agent="$1" name="$2"
+  [[ "$agent" == codex ]] || return 0
+  afws_read_session_meta "$name" thread 2>/dev/null || true
 }
 
 # --- registry -------------------------------------------------------------
@@ -185,7 +200,10 @@ collect_live_records() {
     fi
 
     if ! record_is_live; then
-      (( no_prune )) || rm -f "$record"
+      if (( ! no_prune )); then
+        afws_remove_session_meta "$afws_record_session_name"
+        rm -f "$record"
+      fi
       continue
     fi
 
@@ -293,6 +311,8 @@ if (( as_json )); then
     print -n -r -- "\"agent\":\"$(json_escape "$afws_record_agent")\","
     print -n -r -- "\"kind\":\"$(json_escape "$afws_record_kind")\","
     print -n -r -- "\"status\":\"$(json_escape "$(session_status "$afws_record_agent" "$afws_record_session_name")")\","
+    print -n -r -- "\"activity\":\"$(json_escape "$(session_activity "$afws_record_agent" "$afws_record_session_name")")\","
+    print -n -r -- "\"thread_id\":\"$(json_escape "$(session_thread_id "$afws_record_agent" "$afws_record_session_name")")\","
     print -n -r -- "\"pid\":\"$(json_escape "$afws_record_pid")\","
     print -n -r -- "\"bg_id\":\"$(json_escape "$afws_record_bg_id")\","
     print -n -r -- "\"ssh_host\":\"$(json_escape "$afws_record_ssh_host")\","
@@ -313,17 +333,18 @@ if (( ${#shown_records} == 0 )); then
   exit 0
 fi
 
-printf '%-26s %-7s %-12s %-8s %-18s %s\n' SESSION AGENT KIND STATUS "SSH HOST" "REMOTE DIRECTORY"
+printf '%-26s %-7s %-12s %-8s %-18s %-44s %s\n' SESSION AGENT KIND STATUS "SSH HOST" "REMOTE DIRECTORY" ACTIVITY
 for record in "${shown_records[@]}"; do
   afws_read_record "$record" || continue
   marker=""
   [[ -n "$self_name" && "$afws_record_session_name" == "$self_name" ]] && marker=" (this session)"
-  printf '%-26s %-7s %-12s %-8s %-18s %s%s\n' \
+  printf '%-26s %-7s %-12s %-8s %-18s %-44s %s%s\n' \
     "$afws_record_session_name" \
     "${afws_record_agent:--}" \
     "$afws_record_kind" \
     "$(session_status "$afws_record_agent" "$afws_record_session_name")" \
     "$afws_record_ssh_host" \
     "$afws_record_remote_dir" \
+    "$(session_activity "$afws_record_agent" "$afws_record_session_name")" \
     "$marker"
 done
