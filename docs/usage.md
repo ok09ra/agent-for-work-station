@@ -40,6 +40,27 @@ the first turn so another session can address this one.
 
 Both agents run on the Mac. Under Codex, project reads, edits, Git, tests and builds all run on the SSH host. Its work continues if the visibility mount drops.
 
+## Control a session from another device
+
+In an interactive `claudefws` session, enter `/remote-control` (or `/rc`) in
+Claude's prompt. It makes that conversation available through Claude on the web
+or mobile app. Enter the command again to check its status or disconnect.
+
+Inside a `codexfws` session, ask Codex to turn Remote Control on or off, or run:
+
+```zsh
+afws-remote on       # enable the shared Codex app server on this Mac
+afws-remote status   # check the connection
+afws-remote pair     # print a short-lived device pairing code
+afws-remote off      # disable Remote Control; keep local sessions running
+```
+
+Codex Remote Control applies to other Codex sessions on this Mac and stays set
+after this session exits. Pair only a trusted device. Codex may ask for approval
+to run the helper outside its workspace sandbox. An open Codex CLI conversation
+can remain locked to its terminal. Enabling Remote Control does not hand off
+that live conversation; `codexfws` currently has no safe session handoff.
+
 ## Run a remote command manually
 
 Use the normal argument form:

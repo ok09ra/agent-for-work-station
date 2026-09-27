@@ -150,6 +150,25 @@ claudefws my-workstation /remote/path/to/project
 With no arguments it asks for both values, which keeps them out of your shell
 history. A password or passphrase is asked for once, here.
 
+**Control a session from another device.** In an interactive `claudefws`
+session, type `/remote-control` (or `/rc`) to connect that conversation to
+Claude on the web or mobile app. Run it again to inspect or disconnect it.
+In a `codexfws` session, ask Codex to enable Remote Control, or run:
+
+```zsh
+afws-remote on       # enable the shared Codex app server on this Mac
+afws-remote status   # check its connection
+afws-remote pair     # print a short-lived device pairing code
+afws-remote off      # disable Remote Control; keep local sessions running
+```
+
+Codex Remote Control is a Mac-wide app-server setting, so its on/off commands
+also affect other Codex sessions on this Mac and remain set after this session
+ends. Pair only a device you trust. Codex may ask to run the helper outside its
+workspace sandbox. An open Codex CLI conversation can remain locked to its
+terminal: enabling Remote Control does not hand that live conversation to
+another device. `codexfws` currently does not provide a safe session handoff.
+
 **Run something on the workstation.** Inside a session the host and directory come
 from the environment, so `afws-run` takes the command directly:
 
@@ -281,6 +300,7 @@ afws-isolate run --backend host --guide /path/to/job/instructions.md --input /pa
 | `afws-peers` | Every session on this Mac, with the host and directory each works on |
 | `afws-message` | Queue a message for one or all live Codex sessions |
 | `afws-status` | Set this Codex session's short activity label |
+| `afws-remote` | Enable, disable, inspect, or pair Codex Remote Control on this Mac |
 | `afws-lock` | Claim an exclusive remote resource so two sessions do not collide |
 | `afws-remount` | Repair a disconnected SSHFS mount in place |
 | `afws-umount` | Release a mount or connection left behind |

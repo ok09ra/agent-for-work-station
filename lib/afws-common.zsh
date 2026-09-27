@@ -1248,7 +1248,7 @@ afws_session_meta_file() {
   local name="$1" field="$2"
   afws_validate_session_name "$name"
   case "$field" in
-    thread|activity|prompt|state) ;;
+    thread|activity|prompt|state|peer_turn) ;;
     *) afws_die "invalid session metadata field" ;;
   esac
   print -r -- "${AFWS_SESSION_META_DIR}/${name}.${field}"
@@ -1278,7 +1278,7 @@ afws_read_session_meta() {
 afws_remove_session_meta() {
   local name="$1" field
   afws_validate_session_name "$name"
-  for field in thread activity prompt state; do
+  for field in thread activity prompt state peer_turn; do
     rm -f "${AFWS_SESSION_META_DIR}/${name}.${field}" 2>/dev/null || true
   done
 }

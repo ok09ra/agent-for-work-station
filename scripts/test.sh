@@ -11,6 +11,7 @@ readonly PUSHER="${REPOSITORY_ROOT}/bin/afws-push"
 readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
 readonly MESSAGE="${REPOSITORY_ROOT}/bin/afws-message"
 readonly STATUS_HELPER="${REPOSITORY_ROOT}/bin/afws-status"
+readonly REMOTE_HELPER="${REPOSITORY_ROOT}/bin/afws-remote"
 readonly CODEX_HOOK="${REPOSITORY_ROOT}/bin/afws-codex-hook"
 readonly ISOLATE="${REPOSITORY_ROOT}/bin/afws-isolate"
 readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
@@ -97,6 +98,7 @@ for script in \
   "$PEERS" \
   "$MESSAGE" \
   "$STATUS_HELPER" \
+  "$REMOTE_HELPER" \
   "$CODEX_HOOK" \
   "$LOCK" \
   "$REMOUNT" \
@@ -116,7 +118,7 @@ special_parameter_hits=""
 for name in path status cdpath fpath manpath module_path argv options signals \
   psvar mailpath watch histchars prompt SECONDS RANDOM LINES COLUMNS pipestatus dirstack; do
   hits="$(grep -nE "(^|[[:space:];(&|]|local |readonly |typeset |integer |export )${name}=" \
-    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$CODEX_HOOK" "$LOCK" "$REMOUNT" "$UMOUNT" \
+    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$REMOTE_HELPER" "$CODEX_HOOK" "$LOCK" "$REMOUNT" "$UMOUNT" \
     "${REPOSITORY_ROOT}/scripts/"*.sh 2>/dev/null || true)"
   [[ -n "$hits" ]] && special_parameter_hits+="${name}: ${hits}"$'\n'
 done
@@ -257,7 +259,7 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$ISOLATE" "$LOCK" "$REMOUNT" "$UMOUNT"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$REMOTE_HELPER" "$ISOLATE" "$LOCK" "$REMOUNT" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
@@ -268,7 +270,7 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-remote afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
@@ -557,6 +559,109 @@ codex_trailing_resume_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /r
   fail "codexfws planned a different shared connection from claudefws"
 [[ "$codex_plan" == *"session: cx-example-workstation-project-1"* ]] || \
   fail "codexfws did not allocate its own session name"
+
+# Remote Control operates on Codex's shared daemon, not the AFWS session.
+reset_state
+write_record cx-remote codex "$$" example-workstation /remote/project "$(date +%s)"
+write_record fws-remote claude "$$" example-workstation /remote/project "$(date +%s)"
+cat >| "${STUB_BIN}/codex" <<'STUB_CODEX_REMOTE'
+#!/bin/zsh
+print -r -- "$*" >> "$AFWS_TEST_REMOTE_LOG"
+if [[ "$*" == "remote-control pair" ]]; then
+  print -r -- "PAIR-CODE"
+fi
+STUB_CODEX_REMOTE
+chmod +x "${STUB_BIN}/codex"
+export AFWS_TEST_REMOTE_LOG="${SANDBOX}/remote-codex.log"
+: > "$AFWS_TEST_REMOTE_LOG"
+expect_rejected "Remote Control outside a session" env PATH="${STUB_BIN}:$PATH" "$REMOTE_HELPER" on
+expect_rejected "Remote Control from Claude" env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=fws-remote "$REMOTE_HELPER" on
+env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" on >/dev/null ||
+  fail "afws-remote on failed"
+env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" off >/dev/null ||
+  fail "afws-remote off failed"
+pair_output="$(env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" pair)" ||
+  fail "afws-remote pair failed"
+[[ "$pair_output" == "PAIR-CODE" ]] || fail "afws-remote did not pass through the pairing code"
+[[ "$(cat "$AFWS_TEST_REMOTE_LOG")" == $'app-server daemon enable-remote-control\napp-server daemon disable-remote-control\nremote-control pair' ]] ||
+  fail "afws-remote called the wrong Codex commands"
+mkdir -p "${SANDBOX}/codex-home/app-server-control"
+if python3 - "${SANDBOX}/codex-home/app-server-control/probe.sock" <<'SOCKET_PROBE'
+import socket
+import sys
+try:
+    with socket.socket(socket.AF_UNIX) as probe:
+        probe.bind(sys.argv[1])
+except OSError:
+    sys.exit(1)
+SOCKET_PROBE
+then
+  rm -f "${SANDBOX}/codex-home/app-server-control/probe.sock"
+  cat >| "${SANDBOX}/remote-status-server.py" <<'STUB_REMOTE_STATUS'
+import base64
+import hashlib
+import json
+import socket
+import struct
+import sys
+
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(sys.argv[1])
+    server.listen(1)
+    open(sys.argv[2], "w").close()
+    conn, _ = server.accept()
+    with conn:
+        reader = conn.makefile("rb")
+        headers = {}
+        while line := reader.readline():
+            if line == b"\r\n":
+                break
+            if b":" in line:
+                name, value = line.decode("ascii").split(":", 1)
+                headers[name.lower()] = value.strip()
+        accept = base64.b64encode(hashlib.sha1(
+            (headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+        ).digest()).decode()
+        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+
+        def send_json(message):
+            payload = json.dumps(message).encode()
+            conn.sendall(bytes([0x81, len(payload)]) + payload)
+
+        while True:
+            first, second = reader.read(2)
+            size = second & 127
+            if size == 126:
+                size = struct.unpack("!H", reader.read(2))[0]
+            mask = reader.read(4)
+            payload = reader.read(size)
+            request = json.loads(bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload)))
+            if request.get("method") == "initialize":
+                send_json({"id": 1, "result": {}})
+            elif request.get("method") == "remoteControl/status/read":
+                send_json({"id": 2, "result": {"status": "connected"}})
+                break
+        reader.close()
+STUB_REMOTE_STATUS
+  python3 "${SANDBOX}/remote-status-server.py" \
+    "${SANDBOX}/codex-home/app-server-control/app-server-control.sock" \
+    "${SANDBOX}/remote-status.ready" &
+  remote_server_pid=$!
+  for attempt in {1..30}; do
+    [[ -f "${SANDBOX}/remote-status.ready" ]] && break
+    sleep 0.1
+  done
+  [[ -f "${SANDBOX}/remote-status.ready" ]] || fail "stub remote status server did not start"
+  remote_status="$(env PATH="${STUB_BIN}:$PATH" CODEX_HOME="${SANDBOX}/codex-home" \
+    AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" status)" || fail "afws-remote status failed"
+  [[ "$remote_status" == *"connected"* ]] || fail "afws-remote reported the wrong status"
+  wait "$remote_server_pid" || fail "stub remote status server failed"
+else
+  print -r -- "[SKIP] Unix socket status test (socket binding unavailable)"
+fi
+rm -f "${STUB_BIN}/codex"
+reset_state
 
 background_plan="$("$CLAUDE_LAUNCHER" --dry-run --bg example-workstation /remote/project)"
 [[ "$background_plan" == *"Would start Claude in the background with"* ]] || \
@@ -1368,6 +1473,38 @@ json_listing="$("$PEERS" --json)"
   AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")" == '{}' ]] || fail "Codex Stop hook failed"
 [[ "$("$PEERS" --json)" == *'"status":"idle"'* ]] || fail "Codex idle status was not listed"
 
+peer_prompt='[AFWS peer message from cx-sender]
+Checkpoint complete?
+[End AFWS peer message]'
+peer_hook_input="$(/usr/bin/python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"UserPromptSubmit","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","turn_id":"peer-turn-1","prompt":sys.argv[1]}))' "$peer_prompt")"
+print -r -- "$peer_hook_input" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" ||
+  fail "Codex peer prompt hook failed"
+[[ "$(< "${AFWS_STATE_DIR}/session-meta/cx-training.prompt")" == 'はい' ]] ||
+  fail "peer message replaced the direct user task label"
+peer_stop='{"hook_event_name":"Stop","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","turn_id":"peer-turn-1","stop_hook_active":false}'
+peer_stop_result="$(print -r -- "$peer_stop" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")"
+[[ "$peer_stop_result" == *'"decision":"block"'* && "$peer_stop_result" == *'direct user task'* ]] ||
+  fail "Codex peer turn did not request a return to the direct user task"
+[[ "$("$PEERS" --json)" == *'"status":"busy"'* ]] ||
+  fail "Codex peer continuation prematurely marked the session idle"
+print -r -- '{"hook_event_name":"UserPromptSubmit","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","turn_id":"resume-turn-1","prompt":"[AFWS resume after peer message] Continue the direct user task"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" || fail "Codex continuation prompt hook failed"
+[[ "$(< "${AFWS_STATE_DIR}/session-meta/cx-training.prompt")" == 'はい' ]] ||
+  fail "Codex continuation replaced the direct user task label"
+[[ "$(print -r -- "$peer_stop" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")" == '{}' ]] ||
+  fail "Codex peer continuation was not one-shot"
+print -r -- "$peer_hook_input" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" ||
+  fail "second Codex peer prompt hook failed"
+[[ "$(print -r -- '{"hook_event_name":"Stop","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","turn_id":"peer-turn-1","stop_hook_active":true}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")" == '{}' ]] ||
+  fail "active Stop continuation attempted to loop"
+print -r -- "$peer_hook_input" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" ||
+  fail "third Codex peer prompt hook failed"
+print -r -- '{"hook_event_name":"UserPromptSubmit","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","turn_id":"direct-turn-2","prompt":"New direct task"}' |
+  AFWS_SESSION_NAME=cx-training "$CODEX_HOOK" || fail "direct user prompt hook failed"
+[[ "$(print -r -- "$peer_stop" | AFWS_SESSION_NAME=cx-training "$CODEX_HOOK")" == '{}' ]] ||
+  fail "superseded peer turn resumed a stale task"
+
 print -r -- '{"hook_event_name":"SessionStart","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}' |
   AFWS_SESSION_NAME=cx-other "$CODEX_HOOK" || fail "second Codex hook failed"
 
@@ -1406,7 +1543,7 @@ PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
 
 "$STATUS_HELPER" --help >/dev/null || fail "afws-status help failed"
 AFWS_SESSION_NAME=cx-training "$STATUS_HELPER" clear >/dev/null || fail "afws-status clear failed"
-[[ "$("$PEERS" --json)" == *'"activity":"はい"'* ]] || fail "prompt fallback was not restored"
+[[ "$("$PEERS" --json)" == *'"activity":"New direct task"'* ]] || fail "prompt fallback was not restored"
 
 write_record cx-gone codex 999999 alpha /remote/gone 1000000004
 mkdir -p "${AFWS_STATE_DIR}/session-meta"

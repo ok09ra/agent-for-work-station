@@ -12,7 +12,7 @@ readonly PROFILE_END="# <<< agent-for-work-station <<<"
 configure_shell=1
 
 readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-message afws-status
-  afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor)
+  afws-codex-hook afws-remote afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor)
 
 usage() {
   print -r -- "Usage: ./scripts/install.sh [--no-shell-config]"

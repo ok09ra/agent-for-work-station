@@ -104,6 +104,17 @@ claudefws my-workstation /remote/path/to/project
 
 引数を省略すると両方を対話的に尋ねるので、シェル履歴に残りません。パスワードやパスフレーズを聞かれるのは、ここでの1回だけです。
 
+**別の端末から操作する。** `claudefws`の対話画面では`/remote-control`（または`/rc`）で今の会話をリモート操作できます。もう一度入力すると状態確認と切断ができます。`codexfws`では、Codexにオン・オフを頼むか、セッション内で次を実行します。
+
+```zsh
+afws-remote on       # このMacの共有Codex app-serverで有効化
+afws-remote status   # 接続状態を確認
+afws-remote pair     # 信頼する端末のペアリングコードを表示
+afws-remote off      # リモート操作だけ無効化
+```
+
+Codex側のオン・オフはこのMacの他のCodexセッションにも効き、セッション終了後も残ります。開いているCLI会話は端末側でロックされる場合があり、有効化だけではその会話を引き継げません。詳しくは[使い方](docs/usage.ja.md)を参照してください。
+
 **ワークステーションで実行する。** セッション内では接続名とディレクトリが環境変数に入るので、`afws-run`はコマンドをそのまま取ります。
 
 ```zsh

@@ -1,0 +1,179 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-remote"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || {
+  print -u2 -r -- "afws-remote: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+}
+
+usage() {
+  print -r -- "Usage: afws-remote {on|off|status|pair}"
+  print -r -- ""
+  print -r -- "Control Codex Remote Control from a codexfws session. The setting"
+  print -r -- "applies to the shared Codex app server on this Mac, including other"
+  print -r -- "Codex sessions. It stays set after this session exits."
+  print -r -- ""
+  print -r -- "  on      Enable Remote Control for the running and future app server"
+  print -r -- "  off     Disable Remote Control without stopping the app server"
+  print -r -- "  status  Read the current app-server connection status"
+  print -r -- "  pair    Print a short-lived pairing code for a trusted device"
+}
+
+(( $# == 1 )) || { usage >&2; exit 2; }
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  on|off|status|pair) action="$1" ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+[[ -n "${AFWS_SESSION_NAME-}" ]] || afws_die "run this inside a codexfws session"
+afws_validate_session_name "$AFWS_SESSION_NAME"
+record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+[[ -r "$record" ]] || afws_die "session is no longer registered"
+afws_read_record "$record" || afws_die "could not read session record"
+[[ "$afws_record_session_name" == "$AFWS_SESSION_NAME" &&
+   "$afws_record_agent" == codex ]] || afws_die "run this inside a codexfws session"
+command -v codex >/dev/null 2>&1 || afws_die "Codex CLI is not installed"
+
+case "$action" in
+  on)
+    codex app-server daemon enable-remote-control || exit $?
+    print -r -- "Codex Remote Control enabled on this Mac for all sessions on its shared app server."
+    print -r -- "An open CLI conversation may stay locked to its terminal; this command does not hand it off."
+    ;;
+  off)
+    codex app-server daemon disable-remote-control || exit $?
+    print -r -- "Codex Remote Control disabled on this Mac. Local sessions keep running."
+    ;;
+  pair)
+    print -u2 -r -- "Pairing gives the device access to this Mac's shared Codex app server."
+    print -u2 -r -- "An open CLI conversation may stay locked to its terminal; pairing does not hand it off."
+    codex remote-control pair
+    ;;
+  status)
+    command -v python3 >/dev/null 2>&1 || afws_die "python3 is required to read app-server status"
+    python3 - <<'PY'
+import json
+import os
+import socket
+import sys
+import base64
+import hashlib
+import struct
+
+sock_path = os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")),
+                         "app-server-control", "app-server-control.sock")
+try:
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(3)
+        conn.connect(sock_path)
+        reader = conn.makefile("rb")
+
+        # The control socket speaks WebSocket, even though the app-server's
+        # stdio transport uses newline-delimited JSON.
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        conn.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                      "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\n\r\n").encode("ascii"))
+        headers = bytearray()
+        while not headers.endswith(b"\r\n\r\n"):
+            if len(headers) >= 16384:
+                raise RuntimeError("oversized WebSocket handshake")
+            chunk = reader.read(1)
+            if not chunk:
+                raise RuntimeError("app server closed during handshake")
+            headers.extend(chunk)
+        expected = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        ).digest()).decode("ascii")
+        header_text = headers.decode("ascii", errors="replace").lower()
+        if not header_text.startswith("http/1.1 101 ") or f"sec-websocket-accept: {expected.lower()}\r\n" not in header_text:
+            raise RuntimeError("app server rejected WebSocket handshake")
+
+        def read_exact(length):
+            data = reader.read(length)
+            if len(data) != length:
+                raise RuntimeError("app server closed the connection")
+            return data
+
+        def send_frame(payload, opcode=1):
+            mask = os.urandom(4)
+            size = len(payload)
+            header = bytes([0x80 | opcode])
+            if size < 126:
+                header += bytes([0x80 | size])
+            elif size < 65536:
+                header += bytes([0x80 | 126]) + struct.pack("!H", size)
+            else:
+                header += bytes([0x80 | 127]) + struct.pack("!Q", size)
+            conn.sendall(header + mask + bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload)))
+
+        def receive_json():
+            chunks = []
+            total = 0
+            while True:
+                first, second = read_exact(2)
+                opcode = first & 15
+                size = second & 127
+                if size == 126:
+                    size = struct.unpack("!H", read_exact(2))[0]
+                elif size == 127:
+                    size = struct.unpack("!Q", read_exact(8))[0]
+                if size > 1048576 or total + size > 1048576:
+                    raise RuntimeError("oversized app-server response")
+                mask = read_exact(4) if second & 0x80 else None
+                payload = read_exact(size)
+                if mask:
+                    payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+                if opcode == 9:
+                    send_frame(payload, 10)
+                    continue
+                if opcode == 8:
+                    raise RuntimeError("app server closed the connection")
+                if opcode not in (0, 1):
+                    raise RuntimeError("unexpected WebSocket frame")
+                chunks.append(payload)
+                total += size
+                if first & 0x80:
+                    return json.loads(b"".join(chunks))
+
+        def send_json(message):
+            send_frame(json.dumps(message, separators=(",", ":")).encode("utf-8"))
+
+        def request(message):
+            send_json(message)
+            while True:
+                response = receive_json()
+                if response.get("id") == message["id"]:
+                    if "error" in response:
+                        raise RuntimeError(str(response["error"]))
+                    return response.get("result", {})
+
+        request({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "afws-remote", "version": "1"},
+            "capabilities": {"experimentalApi": True}}})
+        send_json({"method": "initialized"})
+        result = request({"id": 2, "method": "remoteControl/status/read"})
+        state = result.get("status")
+        if state not in ("disabled", "connecting", "connected", "errored"):
+            raise RuntimeError("unexpected app-server status response")
+        print("Codex Remote Control on this Mac: " + state)
+        if state == "disabled":
+            print("Run afws-remote on to enable it.")
+except (OSError, ValueError, RuntimeError) as exc:
+    print("afws-remote: cannot read Codex app-server status: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+    ;;
+esac

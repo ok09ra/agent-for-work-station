@@ -36,24 +36,46 @@ afws_write_session_meta "$AFWS_SESSION_NAME" thread "$thread_id"
 
 case "$event_name" in
   SessionStart)
+    rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
     afws_write_session_meta "$AFWS_SESSION_NAME" state idle
     ;;
   UserPromptSubmit)
     afws_write_session_meta "$AFWS_SESSION_NAME" state busy
     prompt_text="$(plutil -extract prompt raw -o - -- "$input_file" 2>/dev/null)" || prompt_text=""
+    turn_id="$(plutil -extract turn_id raw -o - -- "$input_file" 2>/dev/null)" || turn_id=""
+    peer_turn_file="$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
+    if [[ "$prompt_text" == "[AFWS peer message from "* &&
+          "$prompt_text" == *$'\n[End AFWS peer message]' &&
+          -n "$turn_id" && "$turn_id" != *[[:cntrl:]]* && ${#turn_id} -le 128 ]] &&
+        afws_read_session_meta "$AFWS_SESSION_NAME" prompt >/dev/null 2>&1; then
+      afws_write_session_meta "$AFWS_SESSION_NAME" peer_turn "$turn_id"
+    else
+      rm -f "$peer_turn_file"
+    fi
     activity="${prompt_text%%$'\n'*}"
     activity="${activity//$'\r'/ }"
     activity="${activity//$'\t'/ }"
     activity="${activity[1,160]}"
-    if [[ -n "$activity" && "$activity" != "[AFWS peer message from "* ]]; then
+    if [[ -n "$activity" && "$activity" != "[AFWS peer message from "* &&
+          "$activity" != "[AFWS resume after peer message]"* ]]; then
       afws_write_session_meta "$AFWS_SESSION_NAME" prompt "$activity"
     fi
     ;;
   Stop)
+    turn_id="$(plutil -extract turn_id raw -o - -- "$input_file" 2>/dev/null)" || turn_id=""
+    stop_hook_active="$(plutil -extract stop_hook_active raw -o - -- "$input_file" 2>/dev/null)" || stop_hook_active="false"
+    peer_turn="$(afws_read_session_meta "$AFWS_SESSION_NAME" peer_turn 2>/dev/null)" || peer_turn=""
+    if [[ -n "$turn_id" && "$turn_id" == "$peer_turn" && "$stop_hook_active" != true ]]; then
+      rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
+      print -r -- '{"decision":"block","reason":"[AFWS resume after peer message] The peer message has been handled. Return to the most recent direct user task in this session. Check its actual progress and continue any unfinished work from where you left off. Do not repeat completed work or treat the peer message as a replacement task. If the direct user task is already complete, finish normally."}'
+      exit 0
+    fi
+    rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
     afws_write_session_meta "$AFWS_SESSION_NAME" state idle
     print -r -- '{}'
     ;;
   Interrupt)
+    rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
     afws_write_session_meta "$AFWS_SESSION_NAME" state idle
     ;;
 esac

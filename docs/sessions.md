@@ -126,6 +126,14 @@ Queueing is not an answer. The sender reports that it queued the message, and
 you can ask the recipient's session for its answer later. Codex cannot send to
 a Claude recipient through this tool.
 
+Peer messages are coordination, not replacements for the recipient's direct
+user task. A Codex Stop hook recognizes an `afws-message` turn and, after the
+reply, prompts the recipient once to check and resume unfinished work. It does
+not restart a task that is already complete. Claude recipients are instructed
+to reply and then continue their prior task in the same turn. This does not
+prevent a genuine interruption, a new direct user request, or a task that
+needs user input from stopping work.
+
 You need not know the name: “Tell the agent working on 8B training that the
 dataset is ready” works when the activity, host, and directory identify one
 live Codex peer. If several fit, the sender asks you which one. `afws-peers`
