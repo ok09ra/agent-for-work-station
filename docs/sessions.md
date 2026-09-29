@@ -232,6 +232,25 @@ naming the paths and pointing at `afws-org wait`. It blocks once per stop, so a
 session that cannot reach the workstation to clean up is not trapped. Reading is
 never restricted: an agent that cannot look around guesses instead.
 
+`--worktree` on an assignment goes further and removes the collision instead
+of reporting it. On `afws-org start`, the ledger creates a Git worktree beside
+the project -- `<project>.afws-worktrees/<assignment>` -- on its own `afws/<id>`
+branch, and the assignment works there. Beside rather than inside: a worktree
+under the project would be swept up by every build, search and scope check run
+against it. It refuses when the project is not a Git work tree, and when the
+project has uncommitted changes, because a worktree starts from HEAD and those
+changes would be invisible inside it.
+
+A worktree is a fresh checkout, so whatever the project keeps untracked -- data,
+virtualenvs, checkpoints -- is simply absent. `--share PATH` symlinks one such
+path in. Sharing is named rather than inferred because a shared path is the one
+thing the worktree does not isolate, and that belongs in the ledger where
+`afws-org show` reports it.
+
+A terminal outcome reclaims the checkout and keeps the branch: the branch is the
+work. Nothing is merged automatically. An assignment that is orphaned rather
+than closed keeps its checkout, so it can be inspected; `afws-org show` lists it.
+
 `afws-org guard PATH...` is that check on its own. It is read-only, records no
 event, and returns success when the session has no scoped assignment, so it is
 safe to call on every write. `check-write` remains the self-reported form.

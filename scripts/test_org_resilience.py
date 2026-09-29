@@ -38,6 +38,18 @@ class OrganizationResilienceTest(unittest.TestCase):
             "exit \"${AFWS_TEST_MESSAGE_EXIT:-0}\"\n"
         )
         self.lock.write_text("#!/bin/sh\nexit \"${AFWS_TEST_LOCK_EXIT:-0}\"\n")
+        self.run_log = self.root / "run.log"
+        self.run = self.root / "run"
+        self.run.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$AFWS_TEST_RUN_LOG\"\n"
+            "case \"$*\" in\n"
+            "  *'--is-inside-work-tree'*) printf '%s\\n' \"${AFWS_TEST_IS_GIT:-true}\"; exit 0 ;;\n"
+            "  *'status --porcelain'*) printf '%s' \"${AFWS_TEST_DIRTY:-}\"; exit 0 ;;\n"
+            "esac\n"
+            "exit \"${AFWS_TEST_RUN_EXIT:-0}\"\n"
+        )
+        self.run.chmod(0o755)
         self.message.chmod(0o755)
         self.lock.chmod(0o755)
         for name in ("coord", "lead", "worker", "worker2", "outsider"):
@@ -71,6 +83,8 @@ class OrganizationResilienceTest(unittest.TestCase):
             "AFWS_INSTANCE_ID": instance, "AFWS_SESSION_TOKEN": f"{instance}-token",
             "AFWS_ORG_MESSAGE_COMMAND": str(self.message),
             "AFWS_ORG_LOCK_COMMAND": str(self.lock),
+            "AFWS_ORG_RUN_COMMAND": str(self.run),
+            "AFWS_TEST_RUN_LOG": str(self.run_log),
             "AFWS_TEST_DELIVERY_LOG": str(self.delivery_log),
         })
         values.update(extra)
@@ -279,8 +293,11 @@ class OrganizationResilienceTest(unittest.TestCase):
             assignment_columns = {row[1] for row in database.execute("PRAGMA table_info(assignments)")}
             self.assertIn("done_when", assignment_columns)
             self.assertIn("evidence", assignment_columns)
+            self.assertIn("wants_worktree", assignment_columns)
+            self.assertIn("worktree_path", assignment_columns)
+            self.assertIn("shared_paths", assignment_columns)
             self.assertEqual(database.execute(
-                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "5")
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "6")
             database.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
         rejected = subprocess.run([str(ORG), "version"], env=environment, text=True, capture_output=True)
         self.assertNotEqual(rejected.returncode, 0)
@@ -356,6 +373,64 @@ class OrganizationResilienceTest(unittest.TestCase):
         self.run_as("worker", "guard", "lib/afws-common.zsh")
         with self.db() as database:
             self.assertEqual(database.execute("SELECT count(*) FROM events").fetchone()[0], before)
+
+    def calls(self) -> str:
+        return self.run_log.read_text() if self.run_log.exists() else ""
+
+    def test_worktree_isolation_is_opt_in_and_reclaimed(self) -> None:
+        # Sharing only means anything when there is something to share into.
+        self.run_as("lead", "assign", "worker", "no worktree", "--share", "data", ok=False)
+
+        output = self.run_as("lead", "assign", "worker", "isolated work", "--scope", "lib",
+                             "--worktree", "--share", "data", "--share", ".venv").stdout
+        assignment = output.split("assignment_id=", 1)[1].strip()
+        row = self.assignment(assignment)
+        self.assertEqual(row["wants_worktree"], 1)
+        self.assertEqual(json.loads(row["shared_paths"]), ["data", ".venv"])
+        self.assertIsNone(row["worktree_path"], "the checkout waits for start, not assign")
+        with self.db() as database:
+            payload = database.execute("SELECT payload FROM outbox WHERE assignment_id=?",
+                                       (assignment,)).fetchone()[0]
+        self.assertIn("shared and therefore NOT isolated: data, .venv", payload)
+
+        self.run_as("lead", "dispatch", assignment)
+        self.run_as("worker", "claim", assignment, self.claim_token(assignment))
+
+        # A project with uncommitted changes would lose them behind a worktree
+        # that starts from HEAD, so the ledger refuses rather than guessing.
+        refused = self.run_as("worker", "start", assignment, ok=False, AFWS_TEST_DIRTY=" M lib/x.py")
+        self.assertIn("uncommitted changes", refused.stderr)
+        self.assertNotIn("worktree add", self.calls())
+        self.assertEqual(self.assignment(assignment)["state"], "acknowledged")
+
+        # Neither does it try to isolate something that is not a Git work tree.
+        refused = self.run_as("worker", "start", assignment, ok=False, AFWS_TEST_IS_GIT="false")
+        self.assertIn("Git work tree", refused.stderr)
+
+        started = self.run_as("worker", "start", assignment).stdout
+        row = self.assignment(assignment)
+        expected = f"{REMOTE}.afws-worktrees/{assignment}"
+        self.assertEqual(row["worktree_path"], expected)
+        self.assertEqual(row["worktree_branch"], f"afws/{assignment[:8]}")
+        self.assertIn(expected, started)
+        calls = self.calls()
+        self.assertIn(f"worktree add {expected} -b afws/{assignment[:8]} HEAD", calls)
+        self.assertIn("ln -sfn", calls)
+        self.assertIn(f"{REMOTE}/data", calls)
+        # The checkout sits beside the project, not inside it: a worktree under
+        # the project would be swept up by every build, search and scope check.
+        self.assertFalse(expected.startswith(REMOTE + "/"))
+
+        view = self.run_as("coord", "show").stdout
+        self.assertIn(expected, view)
+        self.assertIn("shared, not isolated: data, .venv", view)
+
+        self.run_as("worker", "complete", assignment, "done")
+        row = self.assignment(assignment)
+        self.assertIsNotNone(row["worktree_removed_at"])
+        self.assertIn(f"worktree remove --force {expected}", self.calls())
+        # The branch is the work, so reclaiming the checkout must not touch it.
+        self.assertNotIn("branch -D", self.calls())
 
     def test_archive_a_team_with_history_and_recover_delivery_lease(self) -> None:
         assignment = self.assign("lead", "worker", "historical task")

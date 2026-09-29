@@ -18,7 +18,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import NoReturn
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 AFWS_VERSION = "2"
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 ACTIVE_STATES = {
@@ -157,6 +157,8 @@ def open_database(state_dir: Path, host: str, remote: str) -> sqlite3.Connection
         revision INTEGER NOT NULL, write_scope TEXT, required_locks TEXT NOT NULL,
         claim_hash TEXT, ack_deadline INTEGER, heartbeat_at INTEGER, result TEXT,
         done_when TEXT, evidence TEXT,
+        wants_worktree INTEGER NOT NULL DEFAULT 0, shared_paths TEXT,
+        worktree_path TEXT, worktree_branch TEXT, worktree_removed_at INTEGER,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS outbox(
         outbox_id TEXT PRIMARY KEY, assignment_id TEXT NOT NULL REFERENCES assignments(assignment_id),
@@ -192,6 +194,12 @@ def open_database(state_dir: Path, host: str, remote: str) -> sqlite3.Connection
             db.execute("ALTER TABLE assignments ADD COLUMN done_when TEXT")
         if "evidence" not in assignment_columns:
             db.execute("ALTER TABLE assignments ADD COLUMN evidence TEXT")
+        if "wants_worktree" not in assignment_columns:
+            db.execute("ALTER TABLE assignments ADD COLUMN wants_worktree INTEGER NOT NULL DEFAULT 0")
+        for column, kind in (("shared_paths", "TEXT"), ("worktree_path", "TEXT"),
+                             ("worktree_branch", "TEXT"), ("worktree_removed_at", "INTEGER")):
+            if column not in assignment_columns:
+                db.execute(f"ALTER TABLE assignments ADD COLUMN {column} {kind}")
         for key, value in (("schema_version", str(SCHEMA_VERSION)), ("ssh_host", host), ("remote_dir", remote)):
             db.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     os.chmod(target, 0o600)
@@ -375,6 +383,24 @@ def afws_message_path() -> Path:
     return Path("afws-message")
 
 
+def run_command_path() -> Path:
+    override = os.environ.get("AFWS_ORG_RUN_COMMAND")
+    if override:
+        return Path(override)
+    candidate = Path(__file__).resolve().parent.parent / "bin" / "afws-run"
+    if candidate.is_file():
+        return candidate
+    return Path("afws-run")
+
+
+def remote_run(host: str, directory: str, *command: str) -> subprocess.CompletedProcess:
+    """Run one command on the workstation, in `directory`."""
+    return subprocess.run(
+        [str(run_command_path()), host, "--cwd", directory, "--", *command],
+        text=True, capture_output=True, timeout=120,
+    )
+
+
 def lock_command_path() -> Path:
     override = os.environ.get("AFWS_ORG_LOCK_COMMAND")
     if override:
@@ -391,6 +417,73 @@ def release_assignment_locks(assignment: sqlite3.Row) -> None:
                        stderr=subprocess.DEVNULL, check=False)
 
 
+def worktree_paths(remote_dir: str, assignment_id: str) -> tuple[str, str]:
+    """Where an assignment's worktree lives, and the branch it carries.
+
+    Beside the project rather than inside it: a worktree under the project
+    would be picked up by the very scope check it exists to make unnecessary,
+    and by every build and search the session runs.
+    """
+    return f"{remote_dir.rstrip('/')}.afws-worktrees/{assignment_id}", f"afws/{assignment_id[:8]}"
+
+
+def create_worktree(db: sqlite3.Connection, assignment: sqlite3.Row, actor_id: str,
+                    host: str, remote_dir: str) -> str:
+    assignment_id = assignment["assignment_id"]
+    path, branch = worktree_paths(remote_dir, assignment_id)
+
+    probe = remote_run(host, remote_dir, "git", "rev-parse", "--is-inside-work-tree")
+    if probe.returncode or probe.stdout.strip() != "true":
+        die("an isolated assignment needs the project to be a Git work tree; "
+            "assign it without --worktree to work in the project directly", 4)
+    dirty = remote_run(host, remote_dir, "git", "status", "--porcelain")
+    if dirty.returncode:
+        die(f"could not read the project's state: {dirty.stderr.strip()}", 3)
+    if dirty.stdout.strip():
+        die("the project has uncommitted changes. A worktree starts from HEAD, so those "
+            "changes would be invisible inside it and easy to lose track of. Commit or "
+            "stash them first, or assign this work without --worktree.", 4)
+
+    created = remote_run(host, remote_dir, "git", "worktree", "add", path, "-b", branch, "HEAD")
+    if created.returncode:
+        die(f"could not create the worktree: {created.stderr.strip()}", 3)
+
+    # A worktree is a fresh checkout, so anything the project keeps untracked --
+    # data, virtualenvs, checkpoints -- is simply absent. Sharing is named
+    # explicitly because a shared path is the one thing the worktree does not
+    # isolate, and that has to be visible in the ledger rather than inferred.
+    shared = json.loads(assignment["shared_paths"] or "[]")
+    for item in shared:
+        linked = remote_run(
+            host, remote_dir, "sh", "-c",
+            f'mkdir -p "$(dirname {shell_quote(path + "/" + item)})" && '
+            f'ln -sfn {shell_quote(remote_dir.rstrip("/") + "/" + item)} {shell_quote(path + "/" + item)}')
+        if linked.returncode:
+            remote_run(host, remote_dir, "git", "worktree", "remove", "--force", path)
+            die(f"could not share {item} into the worktree: {linked.stderr.strip()}", 3)
+
+    db.execute("UPDATE assignments SET worktree_path=?,worktree_branch=?,worktree_removed_at=NULL WHERE assignment_id=?",
+               (path, branch, assignment_id))
+    audit(db, actor_id, "assignment.worktree_created", assignment_id,
+          {"path": path, "branch": branch, "shared": shared})
+    return path
+
+
+def remove_worktree(assignment: sqlite3.Row, host: str, remote_dir: str) -> bool:
+    """Reclaim the checkout. The branch stays: it is the work."""
+    path = assignment["worktree_path"]
+    if not path or assignment["worktree_removed_at"]:
+        return False
+    removed = remote_run(host, remote_dir, "git", "worktree", "remove", "--force", path)
+    if removed.returncode:
+        remote_run(host, remote_dir, "git", "worktree", "prune")
+    return True
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="afws-org")
     sub = parser.add_subparsers(dest="command")
@@ -403,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     command = sub.add_parser("remove-team"); command.add_argument("team"); command.add_argument("--cancel-active", action="store_true")
     command = sub.add_parser("transfer-coordinator"); command.add_argument("session")
     sub.add_parser("recover-coordinator")
-    command = sub.add_parser("assign"); command.add_argument("session"); command.add_argument("task"); command.add_argument("--scope"); command.add_argument("--lock", action="append", default=[]); command.add_argument("--done-when", dest="done_when")
+    command = sub.add_parser("assign"); command.add_argument("session"); command.add_argument("task"); command.add_argument("--scope"); command.add_argument("--lock", action="append", default=[]); command.add_argument("--done-when", dest="done_when"); command.add_argument("--worktree", action="store_true"); command.add_argument("--share", action="append", default=[])
     command = sub.add_parser("dispatch"); command.add_argument("assignment_id", nargs="?"); command.add_argument("--force", action="store_true")
     command = sub.add_parser("claim"); command.add_argument("assignment_id"); command.add_argument("claim_token")
     command = sub.add_parser("start"); command.add_argument("assignment_id")
@@ -586,7 +679,8 @@ def main() -> None:
             die("assignee is not an active organization member")
         require_manager(db, actor_id, member["team"])
         assignment_id = assign_to(db, actor, member, args.task, args.scope, args.lock,
-                                  done_when=args.done_when)
+                                  done_when=args.done_when, wants_worktree=args.worktree,
+                                  shared_paths=args.share)
         print(f"Assigned {args.session}: {args.task}\nassignment_id={assignment_id}")
         return
     if args.command == "dispatch":
@@ -627,7 +721,11 @@ def main() -> None:
                     change_state(db, assignment, "waiting", actor_id, f"waiting for lock {lock_name}")
                 die(f"could not acquire required lock {lock_name}", 3)
             acquired.append(lock_name)
+        worktree = assignment["worktree_path"]
         try:
+            if assignment["wants_worktree"] and not worktree:
+                with db:
+                    worktree = create_worktree(db, assignment, actor_id, host, remote)
             with db:
                 change_state(db, assignment, "running", actor_id)
         except BaseException:
@@ -635,6 +733,9 @@ def main() -> None:
                 subprocess.run([str(lock_command_path()), "release", held], check=False)
             raise
         print(f"Started {args.assignment_id}.")
+        if worktree:
+            branch = get_assignment(db, args.assignment_id)["worktree_branch"]
+            print(f"Isolated checkout: {worktree} on branch {branch}.")
         return
     if args.command in {"complete", "fail"}:
         assignment = owned_assignment(db, args.assignment_id, actor_id)
@@ -666,6 +767,13 @@ def main() -> None:
                 audit(db, actor_id, "assignment.evidence_recorded", assignment["assignment_id"],
                       {"done_when": assignment["done_when"]})
         release_assignment_locks(assignment)
+        if remove_worktree(assignment, host, remote):
+            with db:
+                db.execute("UPDATE assignments SET worktree_removed_at=? WHERE assignment_id=?",
+                           (timestamp(), assignment["assignment_id"]))
+                audit(db, actor_id, "assignment.worktree_removed", assignment["assignment_id"],
+                      {"branch": assignment["worktree_branch"]})
+            print(f"Reclaimed the checkout; branch {assignment['worktree_branch']} still holds the work.")
         print(f"{target.capitalize()} {args.assignment_id}.")
         return
     if args.command in {"wait", "block"}:
@@ -720,7 +828,8 @@ def main() -> None:
             die("new assignee must be an active member of the same team")
         new_id = assign_to(db, actor, target, task["title"], old["write_scope"],
                            json.loads(old["required_locks"]), task, old,
-                           done_when=old["done_when"])
+                           done_when=old["done_when"], wants_worktree=bool(old["wants_worktree"]),
+                           shared_paths=json.loads(old["shared_paths"] or "[]"))
         print(f"Reassigned {args.assignment_id} -> {new_id} ({args.session}).")
         return
     if args.command == "set-state":
@@ -852,10 +961,14 @@ def assign_to(db: sqlite3.Connection, actor: dict[str, str], member: sqlite3.Row
               title: str, scope: str | None, locks: list[str],
               existing_task: sqlite3.Row | None = None,
               previous_assignment: sqlite3.Row | None = None,
-              done_when: str | None = None) -> str:
+              done_when: str | None = None, wants_worktree: bool = False,
+              shared_paths: list[str] | None = None) -> str:
     validate_text(title, "task")
     if done_when:
         done_when = validate_text(done_when, "acceptance condition")
+    shared = [normalize_project_path(item) for item in (shared_paths or [])]
+    if shared and not wants_worktree:
+        die("--share only means something for an isolated assignment; add --worktree")
     if scope:
         scope = normalize_scope(scope)
     for lock_name in locks:
@@ -882,14 +995,23 @@ def assign_to(db: sqlite3.Connection, actor: dict[str, str], member: sqlite3.Row
                        (stamp, task_id))
         db.execute("""
           INSERT INTO assignments(assignment_id,task_id,assignee_instance,state,revision,write_scope,
-                                  required_locks,claim_hash,done_when,created_at,updated_at)
-          VALUES(?,?,?,'assigned',1,?,?,?,?,?,?)
+                                  required_locks,claim_hash,done_when,wants_worktree,shared_paths,
+                                  created_at,updated_at)
+          VALUES(?,?,?,'assigned',1,?,?,?,?,?,?,?,?)
         """, (assignment_id, task_id, member["instance_id"], scope, json.dumps(locks),
-              hashlib.sha256(claim_token.encode()).hexdigest(), done_when, stamp, stamp))
+              hashlib.sha256(claim_token.encode()).hexdigest(), done_when,
+              1 if wants_worktree else 0, json.dumps(shared), stamp, stamp))
+        worktree_line = ""
+        if wants_worktree:
+            worktree_line = "worktree: created when you run 'afws-org start'"
+            if shared:
+                worktree_line += f"; shared and therefore NOT isolated: {', '.join(shared)}"
+            worktree_line += "\n"
         payload = (
             f"[AFWS organization assignment]\nassignment_id: {assignment_id}\nclaim_token: {claim_token}\n"
             f"team: {member['team']}\ntask: {title}\nwrite_scope: {scope or '-'}\n"
             f"done_when: {done_when or '-'}\n"
+            f"{worktree_line}"
             f"report_to: {actor['name']}\nredelegation: forbidden"
         )
         db.execute("""
@@ -900,7 +1022,7 @@ def assign_to(db: sqlite3.Connection, actor: dict[str, str], member: sqlite3.Row
               stamp, stamp, stamp))
         audit(db, actor["instance_id"], "assignment.created", assignment_id,
               {"task_id": task_id, "assignee": member["session_name"], "scope": scope, "locks": locks,
-               "done_when": done_when})
+               "done_when": done_when, "worktree": wants_worktree, "shared": shared})
         db.commit()
     except BaseException:
         db.rollback()
@@ -1100,6 +1222,12 @@ def show(db: sqlite3.Connection, state_dir: Path, host: str, remote: str,
                     print(f"│  │     scope: {assignment['write_scope']}")
                 if assignment["done_when"]:
                     print(f"│  │     done when: {assignment['done_when']}")
+                if assignment["worktree_path"] and not assignment["worktree_removed_at"]:
+                    print(f"│  │     worktree: {assignment['worktree_path']} "
+                          f"({assignment['worktree_branch']})")
+                    shared = json.loads(assignment["shared_paths"] or "[]")
+                    if shared:
+                        print(f"│  │     shared, not isolated: {', '.join(shared)}")
 
 
 def validate_database(db: sqlite3.Connection, state_dir: Path, host: str, remote: str) -> None:
