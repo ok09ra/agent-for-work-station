@@ -87,6 +87,21 @@ every later session on that machine. It also means the agent's shell is on the
 Mac, so it does not incidentally leave long-lived processes running on the
 workstation.
 
+**The Codex sandbox does not cover the work.** `codexfws` runs Codex under
+`workspace-write`, which blocks network egress. The project is on the
+workstation, so every project operation is an SSH call, and SSH is exactly what
+that sandbox refuses: measured under the same Seatbelt profile, `ssh` to the
+workstation fails with `Operation not permitted`. Codex therefore asks to
+escalate, and the command runs outside the sandbox. That is not a
+misconfiguration to fix. Turning `sandbox_workspace_write.network_access` on
+does not help either: it enables egress -- a public HTTPS request succeeds --
+but the connection to a workstation on a private address is still refused, so it
+would widen what the agent can reach on the internet without letting the work
+run inside the boundary. For the same reason, do not auto-reject sandbox
+escalation with a granular `approval_policy`: it would refuse every project
+operation. Treat Codex's sandbox as protecting the Mac from what Codex runs
+locally, not as containing the session's actual work.
+
 **It does not by itself limit what the agent can reach.** Two things decide
 that, and both are yours to set:
 
