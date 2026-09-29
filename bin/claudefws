@@ -216,6 +216,7 @@ Organization and persistence rules:
 - Claude Agent Teams and the shared Claude task list are the short-lived execution layer. afws-org is the durable source of truth across Claude and Codex sessions. Do not create a second conflicting hierarchy in the native task list.
 - The write scope on an assignment is checked, not trusted. Before the turn ends, the workstation tree is compared against it and a change outside the scope refuses the stop. Do not work around that: revert what does not belong to the assignment, or stop with 'afws-org wait ASSIGNMENT_ID REASON' and say what the work actually needs. Reading is never restricted; look anywhere, write only where you were sent.
 - An assignment that carries 'done_when' states the condition for calling it finished. Close it with 'afws-org complete ASSIGNMENT_ID RESULT --evidence \"COMMAND -> WHAT IT RETURNED\"'. A close without that evidence is refused. If the condition does not hold, that is 'fail', 'wait', or 'block', not a completion with a caveat.
+- If your assignment is isolated, afws-run and the file tools already point at its own checkout, on its own branch, and the project itself is untouched. Work as if it were the project: the redirect is the point. Do not pass afws-run an explicit --cwd to reach outside it, and do not merge the branch yourself unless the user asks. Anything listed as shared is a symlink back to the project and is the one thing not isolated.
 - When you assign work, give it a '--done-when' condition someone else could check. Split work by what can be understood independently, not by what can be listed separately: two tasks that need the same context belong in one assignment even when they touch different files.
 - This Mac's configuration is denied to the file tools by rule: ~/.claude, ~/.codex, ~/.afws, ~/.ssh and the shell startup files. Do not try to reach them another way. Ask the user if something there genuinely needs to change.
 - A durable assignment injected by the lifecycle hook begins '[AFWS organization assignment]'. Verify it with afws-org show --json, claim its one-time token, then run afws-org start. Before stopping, record complete, fail, wait, or block with a concrete result or reason. The Stop hook continues a still-running assignment up to Claude Code's safety cap; never claim completion merely to silence it.
@@ -285,15 +286,20 @@ afws_fs_mcp="${afws_library:h}/afws-fs-mcp.py"
 if [[ -z "${AFWS_NO_FS_MCP-}" && -r "$afws_fs_mcp" ]]; then
   mcp_config="$(python3 -c '
 import json, sys
-server, host, remote_dir, socket, persist = sys.argv[1:6]
-environment = {"AFWS_SSH_HOST": host, "AFWS_REMOTE_DIR": remote_dir}
+server, host, remote_dir, socket, persist, session, state = sys.argv[1:8]
+# The session name and registry let the server find the checkout an isolated
+# assignment gets. That checkout does not exist yet at launch, so it cannot be
+# baked in here; the server reads it per request and falls back to the project.
+environment = {"AFWS_SSH_HOST": host, "AFWS_REMOTE_DIR": remote_dir,
+               "AFWS_SESSION_NAME": session, "AFWS_STATE_DIR": state}
 if socket:
     environment["AFWS_CONTROL_PATH"] = socket
     environment["AFWS_CONTROL_PERSIST"] = persist
 print(json.dumps({"mcpServers": {"afws-fs": {
     "command": "python3", "args": [server], "env": environment}}}))
 ' "$afws_fs_mcp" "$afws_ssh_host" "$afws_remote_dir" \
-  "${afws_control_socket_path-}" "$AFWS_CONTROL_PERSIST")" ||
+  "${afws_control_socket_path-}" "$AFWS_CONTROL_PERSIST" \
+  "$afws_session_name" "$AFWS_STATE_DIR")" ||
     afws_die "could not build the remote-filesystem MCP configuration"
   mcp_arguments=(--mcp-config "$mcp_config")
   # The remote-first rules above send every file operation through afws-run,

@@ -88,6 +88,7 @@ fi
 afws_validate_host "$ssh_host"
 
 remote_cwd="${AFWS_REMOTE_DIR-}"
+explicit_cwd=0
 dry_run=0
 allow_remote_files=0
 
@@ -96,6 +97,7 @@ while (( $# > 0 )); do
     --cwd)
       (( $# >= 2 )) || afws_die "--cwd requires a remote directory"
       remote_cwd="$2"
+      explicit_cwd=1
       shift 2
       ;;
     -n|--dry-run) dry_run=1; shift ;;
@@ -105,6 +107,19 @@ while (( $# > 0 )); do
     *) break ;;
   esac
 done
+
+# An isolated assignment works in its own checkout, and the session should not
+# have to know that. The ledger publishes the path when the work starts and
+# removes it when the work ends, so this is a file read on a path that already
+# pays for an SSH round trip. A caller that names a directory means it.
+if (( ! explicit_cwd )) && [[ -n "${AFWS_SESSION_NAME-}" ]]; then
+  afws_assignment_checkout="${AFWS_SESSION_META_DIR}/${AFWS_SESSION_NAME}.worktree"
+  if [[ -r "$afws_assignment_checkout" ]]; then
+    IFS= read -r afws_checkout_path < "$afws_assignment_checkout" || afws_checkout_path=""
+    [[ "$afws_checkout_path" == /* && "$afws_checkout_path" != *[[:cntrl:]]* ]] &&
+      remote_cwd="$afws_checkout_path"
+  fi
+fi
 
 [[ -n "$remote_cwd" ]] || afws_die "--cwd must be an absolute remote path"
 remote_cwd="$(afws_normalize_remote_dir "$remote_cwd")"

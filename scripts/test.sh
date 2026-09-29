@@ -676,7 +676,8 @@ EXTRACT_MCP_GENERATOR
 [[ -s "$mcp_generator" ]] || fail "could not find the MCP configuration the launcher builds"
 
 mcp_emitted="$(python3 "$mcp_generator" /lib/afws-fs-mcp.py example-workstation \
-  /remote/project /tmp/socket.sock 600)" || fail "the MCP configuration generator failed"
+  /remote/project /tmp/socket.sock 600 fws-session "$AFWS_STATE_DIR")" || \
+  fail "the MCP configuration generator failed"
 python3 -c '
 import json, sys
 config = json.loads(sys.argv[1])
@@ -687,12 +688,17 @@ environment = server["env"]
 assert environment["AFWS_SSH_HOST"] == "example-workstation", environment
 assert environment["AFWS_REMOTE_DIR"] == "/remote/project", environment
 assert environment["AFWS_CONTROL_PATH"] == "/tmp/socket.sock", environment
+# The server is launched before an isolated assignment exists, so it is given
+# the identity it needs to find that checkout later rather than the checkout.
+assert environment["AFWS_SESSION_NAME"] == "fws-session", environment
+assert environment["AFWS_STATE_DIR"], environment
 ' "$mcp_emitted" || fail "the injected MCP configuration is not what the server expects (${mcp_emitted})"
 
 # With no shared connection yet there is nothing to point the server at, but
 # it must still be given the host and directory rather than dropped.
 mcp_socketless="$(python3 "$mcp_generator" /lib/afws-fs-mcp.py example-workstation \
-  /remote/project "" 600)" || fail "the MCP configuration generator failed without a socket"
+  /remote/project "" 600 fws-session "$AFWS_STATE_DIR")" || \
+  fail "the MCP configuration generator failed without a socket"
 python3 -c '
 import json, sys
 environment = json.loads(sys.argv[1])["mcpServers"]["afws-fs"]["env"]
@@ -1445,6 +1451,45 @@ expect_rejected "a relative afws-remount directory" \
 runner_plan="$("$RUNNER" example-workstation --cwd /remote/project --dry-run -- printf '%s' 'hello world')"
 [[ "$runner_plan" == ssh\ * && "$runner_plan" == *" example-workstation "* ]] || \
   fail "afws-run did not plan SSH execution"
+
+# An isolated assignment redirects the session's project operations into its
+# own checkout without the session having to know. The ledger publishes the
+# path; afws-run reads it because it is on the path of every project operation
+# and cannot afford to open the ledger each time.
+checkout_state="$(mktemp -d)"
+mkdir -p "${checkout_state}/session-meta"
+print -r -- "/remote/project.afws-worktrees/abc" > "${checkout_state}/session-meta/fws-checkout.worktree"
+redirected="$(AFWS_STATE_DIR="$checkout_state" AFWS_SESSION_NAME=fws-checkout \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run -- printf '%s' hello)"
+[[ "$redirected" == *"/remote/project.afws-worktrees/abc"* ]] || \
+  fail "afws-run did not follow the assignment's checkout (${redirected})"
+# A caller that names a directory means it, and a session with no isolated
+# assignment is not redirected anywhere.
+named="$(AFWS_STATE_DIR="$checkout_state" AFWS_SESSION_NAME=fws-checkout \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --cwd /remote/elsewhere --dry-run -- printf '%s' hello)"
+[[ "$named" == *"/remote/elsewhere"* && "$named" != *afws-worktrees* ]] || \
+  fail "afws-run overrode an explicitly named directory"
+plain="$(AFWS_STATE_DIR="$checkout_state" AFWS_SESSION_NAME=fws-nothing \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run -- printf '%s' hello)"
+[[ "$plain" == *"/remote/project"* && "$plain" != *afws-worktrees* ]] || \
+  fail "afws-run redirected a session that has no isolated assignment"
+# A pointer that is empty, relative or unreadable means the project, not a
+# guess: this runs before every project operation and must never invent a path.
+print -rn -- "" > "${checkout_state}/session-meta/fws-checkout.worktree"
+blank="$(AFWS_STATE_DIR="$checkout_state" AFWS_SESSION_NAME=fws-checkout \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run -- printf '%s' hello)"
+[[ "$blank" == *"/remote/project"* ]] || fail "an empty checkout pointer did not fall back to the project"
+print -r -- "relative/path" > "${checkout_state}/session-meta/fws-checkout.worktree"
+relative="$(AFWS_STATE_DIR="$checkout_state" AFWS_SESSION_NAME=fws-checkout \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  "$RUNNER" --dry-run -- printf '%s' hello)"
+[[ "$relative" == *"/remote/project"* && "$relative" != *"relative/path"* ]] || \
+  fail "a relative checkout pointer was not refused"
+rm -rf "$checkout_state"
 
 stdin_plan="$(print -r -- 'echo remote-script' | "$RUNNER" example-workstation --cwd /remote/project --dry-run)"
 [[ "$stdin_plan" == *"bash\\ -s"* ]] || fail "afws-run did not plan Bash standard-input execution"

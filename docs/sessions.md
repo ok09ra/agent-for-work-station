@@ -247,6 +247,20 @@ path in. Sharing is named rather than inferred because a shared path is the one
 thing the worktree does not isolate, and that belongs in the ledger where
 `afws-org show` reports it.
 
+While the assignment runs, the ledger publishes the checkout's path beside the
+session record, and `afws-run` and the filesystem tools follow it. The session
+does not have to know: it works on what looks like the project and lands in its
+own checkout. A caller that names `--cwd` means it, and a session with no
+isolated assignment is not redirected anywhere. An unreadable, empty or relative
+pointer means the project, because this runs before every project operation and
+must never invent a path.
+
+The scope check follows the redirect, so it compares the checkout against the
+scope. Shared paths are left out of it: sharing is a declaration that the path
+is outside the isolation, the symlink itself would otherwise read as an
+untracked change, and sharing a data directory is only worth doing when the work
+writes into it.
+
 A terminal outcome reclaims the checkout and keeps the branch: the branch is the
 work. Nothing is merged automatically. An assignment that is orphaned rather
 than closed keeps its checkout, so it can be inspected; `afws-org show` lists it.

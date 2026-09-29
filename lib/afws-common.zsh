@@ -1261,7 +1261,7 @@ afws_session_meta_file() {
   local name="$1" field="$2"
   afws_validate_session_name "$name"
   case "$field" in
-    thread|activity|prompt|state|peer_turn) ;;
+    thread|activity|prompt|state|peer_turn|worktree|config_changed) ;;
     *) afws_die "invalid session metadata field" ;;
   esac
   print -r -- "${AFWS_SESSION_META_DIR}/${name}.${field}"

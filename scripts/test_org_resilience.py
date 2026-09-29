@@ -421,14 +421,33 @@ class OrganizationResilienceTest(unittest.TestCase):
         # the project would be swept up by every build, search and scope check.
         self.assertFalse(expected.startswith(REMOTE + "/"))
 
+        # afws-run and the filesystem server must be able to find the checkout
+        # without opening the ledger on every call, and the server was launched
+        # before the checkout existed.
+        pointer = self.state / "session-meta" / "w1.worktree"
+        self.assertFalse(pointer.exists(), "the pointer belongs to the assignee, not the lead")
+        pointer = self.state / "session-meta" / "worker.worktree"
+        self.assertEqual(pointer.read_text().strip(), expected)
+
         view = self.run_as("coord", "show").stdout
         self.assertIn(expected, view)
         self.assertIn("shared, not isolated: data, .venv", view)
+
+        # A shared path is declared to be outside the isolation, so a change
+        # there is not drift. Without this the feature is unusable: the symlink
+        # itself reads as an untracked change, and sharing a data directory is
+        # only worth doing when the work writes into it.
+        self.run_as("worker", "guard", "data", "data/train.csv", ".venv/lib/x.py")
+        self.run_as("worker", "guard", "lib/thing.py")
+        refused = self.run_as("worker", "guard", "data/ok.csv", "bin/tool.sh", ok=False)
+        self.assertIn("bin/tool.sh", refused.stderr)
+        self.assertNotIn("data/ok.csv", refused.stderr)
 
         self.run_as("worker", "complete", assignment, "done")
         row = self.assignment(assignment)
         self.assertIsNotNone(row["worktree_removed_at"])
         self.assertIn(f"worktree remove --force {expected}", self.calls())
+        self.assertFalse(pointer.exists(), "a finished assignment must stop redirecting its session")
         # The branch is the work, so reclaiming the checkout must not touch it.
         self.assertNotIn("branch -D", self.calls())
 

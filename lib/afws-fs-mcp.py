@@ -347,11 +347,34 @@ class RemoteProject:
         self.remote_dir = os.environ.get("AFWS_REMOTE_DIR", "")
         self.control_path = os.environ.get("AFWS_CONTROL_PATH", "")
         self.control_persist = os.environ.get("AFWS_CONTROL_PERSIST", "600")
+        self.session_name = os.environ.get("AFWS_SESSION_NAME", "")
+        self.state_dir = os.environ.get("AFWS_STATE_DIR", "")
         if not self.ssh_host or not self.remote_dir:
             die("AFWS_SSH_HOST and AFWS_REMOTE_DIR must be set; run this from a "
                 "work-station session")
         if not self.remote_dir.startswith("/"):
             die(f"AFWS_REMOTE_DIR must be absolute: {self.remote_dir}")
+
+    def root(self) -> str:
+        """The directory this session's file operations are confined to.
+
+        An isolated assignment gets its own checkout, and it appears after this
+        server was launched, so the environment cannot carry it. The ledger
+        publishes the path while the work runs; anything unreadable, relative,
+        or gone means the project itself, which is also what every session
+        without an isolated assignment gets.
+        """
+        if not (self.session_name and self.state_dir):
+            return self.remote_dir
+        pointer = os.path.join(self.state_dir, "session-meta", f"{self.session_name}.worktree")
+        try:
+            with open(pointer, encoding="utf-8") as handle:
+                candidate = handle.read().strip()
+        except OSError:
+            return self.remote_dir
+        if candidate.startswith("/") and "\0" not in candidate:
+            return candidate
+        return self.remote_dir
 
     def ssh_command(self) -> list[str]:
         command = ["ssh", "-o", "BatchMode=yes"]
@@ -371,7 +394,7 @@ class RemoteProject:
     def run(self, operation: str, **arguments: Any) -> dict[str, Any]:
         request = {
             "operation": operation,
-            "root": self.remote_dir,
+            "root": self.root(),
             "limits": {
                 "read_bytes": MAX_READ_BYTES, "read_lines": MAX_READ_LINES,
                 "directory_entries": MAX_DIRECTORY_ENTRIES, "matches": MAX_MATCHES,

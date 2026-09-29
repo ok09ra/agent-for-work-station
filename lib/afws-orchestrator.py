@@ -427,6 +427,29 @@ def worktree_paths(remote_dir: str, assignment_id: str) -> tuple[str, str]:
     return f"{remote_dir.rstrip('/')}.afws-worktrees/{assignment_id}", f"afws/{assignment_id[:8]}"
 
 
+def session_worktree_file(state_dir: Path, session_name: str) -> Path:
+    return state_dir / "session-meta" / f"{session_name}.worktree"
+
+
+def publish_worktree(state_dir: Path, session_name: str, path: str | None) -> None:
+    """Tell the session's own tools which checkout is theirs.
+
+    The ledger is the authority, but afws-run runs on every project operation
+    and the filesystem server was launched before this worktree existed. Both
+    need an answer that costs a file read, not a database open, so the ledger
+    publishes one here and removes it when the work ends.
+    """
+    target = session_worktree_file(state_dir, session_name)
+    if path is None:
+        target.unlink(missing_ok=True)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = target.with_suffix(f".worktree.{os.getpid()}")
+    temporary.write_text(path + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(target)
+
+
 def create_worktree(db: sqlite3.Connection, assignment: sqlite3.Row, actor_id: str,
                     host: str, remote_dir: str) -> str:
     assignment_id = assignment["assignment_id"]
@@ -728,6 +751,8 @@ def main() -> None:
                     worktree = create_worktree(db, assignment, actor_id, host, remote)
             with db:
                 change_state(db, assignment, "running", actor_id)
+            if worktree:
+                publish_worktree(state_dir, actor["name"], worktree)
         except BaseException:
             for held in acquired:
                 subprocess.run([str(lock_command_path()), "release", held], check=False)
@@ -767,6 +792,7 @@ def main() -> None:
                 audit(db, actor_id, "assignment.evidence_recorded", assignment["assignment_id"],
                       {"done_when": assignment["done_when"]})
         release_assignment_locks(assignment)
+        publish_worktree(state_dir, actor["name"], None)
         if remove_worktree(assignment, host, remote):
             with db:
                 db.execute("UPDATE assignments SET worktree_removed_at=? WHERE assignment_id=?",
@@ -891,8 +917,22 @@ def main() -> None:
         scope = assignment["write_scope"]
         if not scope:
             return
+        # A shared path is the one thing an isolated assignment deliberately
+        # does not isolate, and it is named in the ledger rather than inferred.
+        # Reporting it as drift would make sharing unusable: the symlink itself
+        # reads as an untracked change, and the whole point of sharing a data
+        # directory is that the work writes into it.
+        shared = json.loads(assignment["shared_paths"] or "[]")
+        candidates = [
+            item for item in args.paths
+            if not any(normalize_project_path(item) == base
+                       or normalize_project_path(item).startswith(base + "/")
+                       for base in shared)
+        ]
+        if not candidates:
+            return
         try:
-            outside = paths_outside_scope(scope, args.paths)
+            outside = paths_outside_scope(scope, candidates)
         except SystemExit:
             raise
         if outside:
