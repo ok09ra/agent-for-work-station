@@ -262,7 +262,17 @@ untracked change, and sharing a data directory is only worth doing when the work
 writes into it.
 
 A terminal outcome reclaims the checkout and keeps the branch: the branch is the
-work. Nothing is merged automatically. An assignment that is orphaned rather
+work. A checkout that is not clean is kept and reported instead, because an
+outcome says the assignment is over, not that the work was saved, and what is
+uncommitted there exists nowhere else. `afws-org worktrees` lists every checkout
+still held and whether it is clean; `--prune` reclaims the ones whose assignment
+reached an outcome and whose tree is clean, and says why it kept the rest.
+
+Nothing is merged automatically. `afws-org land ASSIGNMENT` reports what the
+branch adds to HEAD and stops there; `--merge` takes it, and refuses when the
+assignment was not completed, when the project has uncommitted changes that a
+merge would sweep in, and when the branch does not apply cleanly -- the last of
+which it hands back rather than forcing. An assignment that is orphaned rather
 than closed keeps its checkout, so it can be inspected; `afws-org show` lists it.
 
 `afws-org guard PATH...` is that check on its own. It is read-only, records no

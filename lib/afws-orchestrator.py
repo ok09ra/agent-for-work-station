@@ -492,15 +492,25 @@ def create_worktree(db: sqlite3.Connection, assignment: sqlite3.Row, actor_id: s
     return path
 
 
-def remove_worktree(assignment: sqlite3.Row, host: str, remote_dir: str) -> bool:
-    """Reclaim the checkout. The branch stays: it is the work."""
+def remove_worktree(assignment: sqlite3.Row, host: str, remote_dir: str) -> str:
+    """Reclaim the checkout. The branch stays: it is the work.
+
+    Anything still uncommitted in the checkout exists nowhere else, so a tree
+    that is not clean is kept and reported rather than reclaimed. An outcome
+    says the assignment is over; it does not say the work was saved.
+    """
     path = assignment["worktree_path"]
     if not path or assignment["worktree_removed_at"]:
-        return False
+        return "none"
+    dirty = remote_run(host, remote_dir, "git", "-C", path, "status", "--porcelain")
+    if dirty.returncode:
+        return "unreadable"
+    if dirty.stdout.strip():
+        return "dirty"
     removed = remote_run(host, remote_dir, "git", "worktree", "remove", "--force", path)
     if removed.returncode:
         remote_run(host, remote_dir, "git", "worktree", "prune")
-    return True
+    return "removed"
 
 
 def shell_quote(value: str) -> str:
@@ -543,6 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
     command = sub.add_parser("check-write"); command.add_argument("assignment_id"); command.add_argument("paths", nargs="+")
     command = sub.add_parser("guard"); command.add_argument("paths", nargs="+")
     sub.add_parser("scope")
+    command = sub.add_parser("land"); command.add_argument("assignment_id"); command.add_argument("--merge", action="store_true")
+    command = sub.add_parser("worktrees"); command.add_argument("--prune", action="store_true")
     sub.add_parser("inbox")
     sub.add_parser("hook-context")
     sub.add_parser("version")
@@ -793,13 +805,18 @@ def main() -> None:
                       {"done_when": assignment["done_when"]})
         release_assignment_locks(assignment)
         publish_worktree(state_dir, actor["name"], None)
-        if remove_worktree(assignment, host, remote):
+        outcome = remove_worktree(assignment, host, remote)
+        if outcome == "removed":
             with db:
                 db.execute("UPDATE assignments SET worktree_removed_at=? WHERE assignment_id=?",
                            (timestamp(), assignment["assignment_id"]))
                 audit(db, actor_id, "assignment.worktree_removed", assignment["assignment_id"],
                       {"branch": assignment["worktree_branch"]})
             print(f"Reclaimed the checkout; branch {assignment['worktree_branch']} still holds the work.")
+        elif outcome in {"dirty", "unreadable"}:
+            print(f"Kept the checkout at {assignment['worktree_path']}: it is {outcome}, and what is "
+                  "uncommitted there is nowhere else. Reclaim it with 'afws-org worktrees --prune' "
+                  "once it is clean.")
         print(f"{target.capitalize()} {args.assignment_id}.")
         return
     if args.command in {"wait", "block"}:
@@ -944,6 +961,72 @@ def main() -> None:
                 "coordinator to widen the scope with 'afws-org set-scope'.",
                 4,
             )
+        return
+    if args.command == "worktrees":
+        rows = [row for row in db.execute(
+            "SELECT a.*,t.title,t.team FROM assignments a JOIN tasks t USING(task_id) "
+            "WHERE a.worktree_path IS NOT NULL AND a.worktree_removed_at IS NULL "
+            "ORDER BY a.created_at")]
+        if not rows:
+            print("No checkouts are held.")
+            return
+        for row in rows:
+            session = session_name_for(db, row["assignee_instance"])
+            dirty = remote_run(host, remote, "git", "-C", row["worktree_path"], "status", "--porcelain")
+            state = "unreadable" if dirty.returncode else ("dirty" if dirty.stdout.strip() else "clean")
+            print(f"{row['assignment_id'][:8]}  {row['state']:<16} {session:<20} {state:<10} "
+                  f"{row['worktree_branch']}  {row['worktree_path']}")
+            if not args.prune:
+                continue
+            # Work that was never closed may be the only copy of itself, so a
+            # checkout is reclaimed on an outcome or on an empty tree, never
+            # because its session went away.
+            if row["state"] not in TERMINAL_STATES:
+                print(f"          kept: {row['state']} is not an outcome; close it first")
+                continue
+            if state != "clean":
+                print(f"          kept: the checkout is {state}; inspect it before reclaiming")
+                continue
+            require_manager(db, actor_id, row["team"])
+            if remove_worktree(row, host, remote) == "removed":
+                with db:
+                    db.execute("UPDATE assignments SET worktree_removed_at=? WHERE assignment_id=?",
+                               (timestamp(), row["assignment_id"]))
+                    audit(db, actor_id, "assignment.worktree_removed", row["assignment_id"],
+                          {"branch": row["worktree_branch"], "via": "prune"})
+                publish_worktree(state_dir, session, None)
+                print(f"          reclaimed; branch {row['worktree_branch']} still holds the work")
+        return
+    if args.command == "land":
+        assignment = get_assignment(db, args.assignment_id)
+        branch = assignment["worktree_branch"]
+        if not branch:
+            die("that assignment was not isolated, so there is no branch to land", 4)
+        task = db.execute("SELECT team FROM tasks WHERE task_id=?", (assignment["task_id"],)).fetchone()
+        commits = remote_run(host, remote, "git", "log", "--oneline", f"HEAD..{branch}")
+        if commits.returncode:
+            die(f"could not read {branch}: {commits.stderr.strip()}", 3)
+        changed = remote_run(host, remote, "git", "diff", "--stat", f"HEAD...{branch}")
+        print(f"Branch {branch} for assignment {args.assignment_id}:")
+        print(commits.stdout.rstrip() or "  (nothing this branch adds to HEAD)")
+        if changed.stdout.strip():
+            print(changed.stdout.rstrip())
+        if not args.merge:
+            print(f"\nNothing was merged. To take it: git merge --no-ff {branch}")
+            return
+        require_manager(db, actor_id, task["team"] if task else None)
+        if assignment["state"] != "completed":
+            die(f"assignment {args.assignment_id} is {assignment['state']}; land work that was completed", 4)
+        dirty = remote_run(host, remote, "git", "status", "--porcelain")
+        if dirty.returncode or dirty.stdout.strip():
+            die("the project has uncommitted changes; a merge would mix them with the branch", 4)
+        merged = remote_run(host, remote, "git", "merge", "--no-ff", "--no-edit", branch)
+        if merged.returncode:
+            remote_run(host, remote, "git", "merge", "--abort")
+            die(f"{branch} does not merge cleanly; merge it yourself:\n{merged.stdout.strip()}", 4)
+        with db:
+            audit(db, actor_id, "assignment.landed", args.assignment_id, {"branch": branch})
+        print(f"Merged {branch}.")
         return
     if args.command == "set-done-when":
         assignment = owned_assignment(db, args.assignment_id, actor_id)

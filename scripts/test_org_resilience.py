@@ -45,7 +45,11 @@ class OrganizationResilienceTest(unittest.TestCase):
             "printf '%s\\n' \"$*\" >> \"$AFWS_TEST_RUN_LOG\"\n"
             "case \"$*\" in\n"
             "  *'--is-inside-work-tree'*) printf '%s\\n' \"${AFWS_TEST_IS_GIT:-true}\"; exit 0 ;;\n"
+            "  *-C*'status --porcelain'*) printf '%s' \"${AFWS_TEST_WT_DIRTY:-}\"; exit 0 ;;\n"
             "  *'status --porcelain'*) printf '%s' \"${AFWS_TEST_DIRTY:-}\"; exit 0 ;;\n"
+            "  *'log --oneline'*) printf 'abc1234 the work\\n'; exit 0 ;;\n"
+            "  *'diff --stat'*) printf ' lib/thing.py | 2 +-\\n'; exit 0 ;;\n"
+            "  *merge*) exit \"${AFWS_TEST_MERGE_EXIT:-0}\" ;;\n"
             "esac\n"
             "exit \"${AFWS_TEST_RUN_EXIT:-0}\"\n"
         )
@@ -450,6 +454,69 @@ class OrganizationResilienceTest(unittest.TestCase):
         self.assertFalse(pointer.exists(), "a finished assignment must stop redirecting its session")
         # The branch is the work, so reclaiming the checkout must not touch it.
         self.assertNotIn("branch -D", self.calls())
+
+    def test_landing_reports_before_it_merges_and_pruning_spares_live_work(self) -> None:
+        output = self.run_as("lead", "assign", "worker", "isolated", "--worktree").stdout
+        assignment = output.split("assignment_id=", 1)[1].strip()
+        self.run_as("lead", "dispatch", assignment)
+        self.run_as("worker", "claim", assignment, self.claim_token(assignment))
+        self.run_as("worker", "start", assignment)
+        branch = f"afws/{assignment[:8]}"
+
+        # A checkout that is still being worked in is never reclaimed, whatever
+        # its session is doing: it may be the only copy of the work.
+        listed = self.run_as("coord", "worktrees", "--prune").stdout
+        self.assertIn(branch, listed)
+        self.assertIn("is not an outcome", listed)
+        self.assertIsNone(self.assignment(assignment)["worktree_removed_at"])
+
+        # Landing reports; it does not merge unless asked.
+        report = self.run_as("lead", "land", assignment).stdout
+        self.assertIn("abc1234 the work", report)
+        self.assertIn("lib/thing.py", report)
+        self.assertIn("Nothing was merged", report)
+        self.assertNotIn("merge --no-ff --no-edit", self.calls())
+
+        # Work that has not been closed is not work to take.
+        self.run_as("lead", "land", assignment, "--merge", ok=False)
+
+        self.run_as("worker", "complete", assignment, "done")
+        # A project with uncommitted changes would have them swept into the merge.
+        refused = self.run_as("lead", "land", assignment, "--merge", ok=False,
+                              AFWS_TEST_DIRTY=" M lib/other.py")
+        self.assertIn("uncommitted changes", refused.stderr)
+
+        # A branch that does not apply cleanly is handed back, not forced.
+        conflicted = self.run_as("lead", "land", assignment, "--merge", ok=False,
+                                 AFWS_TEST_MERGE_EXIT="1")
+        self.assertIn("does not merge cleanly", conflicted.stderr)
+        self.assertIn("merge --abort", self.calls())
+
+        self.run_as("lead", "land", assignment, "--merge")
+        self.assertIn(f"merge --no-ff --no-edit {branch}", self.calls())
+
+    def test_pruning_keeps_a_checkout_that_still_holds_changes(self) -> None:
+        output = self.run_as("lead", "assign", "worker", "abandoned", "--worktree").stdout
+        assignment = output.split("assignment_id=", 1)[1].strip()
+        self.run_as("lead", "dispatch", assignment)
+        self.run_as("worker", "claim", assignment, self.claim_token(assignment))
+        self.run_as("worker", "start", assignment)
+        # An outcome says the assignment is over; it does not say the work was
+        # saved. What is uncommitted in the checkout exists nowhere else.
+        gave_up = self.run_as("worker", "fail", assignment, "gave up",
+                              AFWS_TEST_WT_DIRTY=" M lib/x.py").stdout
+        self.assertIn("Kept the checkout", gave_up)
+        self.assertIsNone(self.assignment(assignment)["worktree_removed_at"])
+
+        # Pruning applies the same rule rather than a looser one.
+        kept = self.run_as("coord", "worktrees", "--prune", AFWS_TEST_WT_DIRTY=" M lib/x.py").stdout
+        self.assertIn("inspect it before reclaiming", kept)
+        self.assertIsNone(self.assignment(assignment)["worktree_removed_at"])
+
+        reclaimed = self.run_as("coord", "worktrees", "--prune").stdout
+        self.assertIn("reclaimed", reclaimed)
+        self.assertIsNotNone(self.assignment(assignment)["worktree_removed_at"])
+        self.assertEqual(self.run_as("coord", "worktrees").stdout.strip(), "No checkouts are held.")
 
     def test_archive_a_team_with_history_and_recover_delivery_lease(self) -> None:
         assignment = self.assign("lead", "worker", "historical task")
