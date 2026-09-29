@@ -80,6 +80,63 @@ AFWS_PROBE_TIMEOUT_SECONDS=60 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTOR
 
 If there is no such process, the mount is dead; unmount it as below.
 
+## The mount fails again a few hours after every repair
+
+`afws-remount` restores access, the directory lists normally, and some hours
+later every path inside it fails with `Device not configured` again. Repeating
+the repair repeats the cycle.
+
+The cause is two filesystems mounted on the same path. Mounting does not
+replace what is already there: it stacks on top of it, and only the newest
+layer is visible. So a view that is still healthy can sit unreachable beneath a
+dead layer, and `umount` uncovers it rather than freeing the path — which is why
+the repair appears to work and the fault returns.
+
+`afws-doctor` reports it directly:
+
+```
+[FAIL] filesystems are stacked on the same path; the top one hides the rest:
+       ~/afws-mounts/HOST/remote/project — 2 layers
+```
+
+Release every layer, not just the top one, then mount once:
+
+```zsh
+afws-umount --list                                  # what is mounted, and who uses it
+mount | grep afws-mounts                            # every layer on the path
+umount ~/afws-mounts/HOST/remote/project   # repeat until the path is clear
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+If an `rclone` process for the old view survives the unmount, stop it as well;
+`afws-doctor` names one that is holding a shared connection which no longer
+exists. Current launchers refuse to mount onto an occupied path, so a stack can
+only be inherited from an earlier version or created by mounting by hand.
+
+## A view lists only part of the project
+
+The directory lists without error, but entries are missing, and `stat` on one
+of them reports `No such file or directory`. A view that lost its SSH transport
+part-way through can cache an incomplete listing and keep serving it, which is
+worse than an error because nothing reports a fault.
+
+Compare it against the remote before trusting it:
+
+```zsh
+ls -1 ~/afws-mounts/HOST/remote/project | wc -l
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- ls -1 | wc -l
+```
+
+Recreating the view clears it:
+
+```zsh
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+This is a view fault, not a project fault. Nothing the agent does goes through
+the view, so `afws-run` and `afws-lab` continue to see the whole project while
+it is happening.
+
 ## The mount exists but does not respond
 
 This is the other case: the read came back as an error rather than not coming
@@ -132,6 +189,12 @@ Increase the keepalive values in your SSH configuration if this happens during l
   ServerAliveInterval 30
   ServerAliveCountMax 6
 ```
+
+Without them neither end probes the other, so a connection that dies with the
+network is never noticed: ssh hangs rather than failing, and anything anchored
+to it keeps retrying. The shared connection itself now recovers on its own —
+whoever needs it next re-opens it — but a mount is only as good as the transport
+underneath it at the moment it was made.
 
 ## The GPU is not visible
 
@@ -195,7 +258,7 @@ sitting in the directory.
 
 ## `afws-peers` shows nothing, or a session is missing
 
-The registry only holds sessions started through `claudefws` or `codexfws`. A session started with plain `claude` or `codex` is not registered, even in a mounted workspace.
+The registry only holds sessions started through `claudefws` or `codexfws`. A session started with plain `claude` or `codex` is not registered.
 
 If a session you started is missing, check whether it is still running:
 

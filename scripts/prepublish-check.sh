@@ -7,6 +7,9 @@ cd "$REPOSITORY_ROOT"
 
 findings=0
 
+# scan LABEL PATTERN FILE...
+# AFWS_SCAN_EXCEPT, when set, is a second pattern whose matching lines are not
+# findings. It exists for literals that are legitimate rather than leaked.
 scan() {
   local label="$1"
   local pattern="$2"
@@ -14,6 +17,9 @@ scan() {
 
   local matches
   matches="$(grep -EnI "$pattern" "$@" 2>/dev/null || true)"
+  if [[ -n "${AFWS_SCAN_EXCEPT-}" && -n "$matches" ]]; then
+    matches="$(print -r -- "$matches" | grep -Ev "$AFWS_SCAN_EXCEPT" || true)"
+  fi
   if [[ -n "$matches" ]]; then
     print -u2 -r -- "[FAIL] ${label}"
     print -u2 -r -- "$matches"
@@ -38,6 +44,7 @@ executables=(
   bin/afws-remount
   bin/afws-umount
   bin/afws-shell
+  bin/afws-lab
   bin/afws-doctor
   scripts/install.sh
   scripts/test.sh
@@ -51,6 +58,7 @@ files=(
   .gitignore
   .gitattributes
   lib/afws-common.zsh
+  lib/afws-fs-mcp.py
   docs/*.md
   docker/isolate/Dockerfile
   docker/isolate/child.py
@@ -72,7 +80,9 @@ linux_user_path_pattern='/ho'"me/"'[A-Za-z0-9._-]+/'
 
 scan "no private-key material" "$private_key_pattern" $files
 scan "no common access-token formats" "$access_token_pattern" $files
-scan "no IPv4 address literals" '(^|[^0-9])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9]|$)' $files
+AFWS_SCAN_EXCEPT='127\.0\.0\.1' \
+  scan "no IPv4 address literals other than loopback" \
+  '(^|[^0-9])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9]|$)' $files
 scan "no macOS user-home absolute paths" "$mac_user_path_pattern" $files
 scan "no Linux user-home absolute paths" "$linux_user_path_pattern" $files
 scan "no likely assigned passwords" '(password|passwd)[[:space:]]*[:=][[:space:]]*[^[:space:]]+' $files

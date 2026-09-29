@@ -73,6 +73,19 @@ afws_pause_seconds() {
   fi
 }
 
+# Keep parallel interactive sessions recognizable in Terminal tabs. The title
+# begins with the stable session name, while the short project basename keeps
+# otherwise similar tabs readable. Most shells replace the title again when
+# their next prompt is drawn after the launcher exits.
+afws_terminal_title_text() {
+  print -r -- "[${afws_session_name}] ${afws_remote_dir:t} | agent-for-work-station"
+}
+
+afws_set_terminal_title() {
+  [[ -z "${AFWS_NO_TERMINAL_TITLE-}" && "${TERM-}" != dumb && -t 1 ]] || return 0
+  print -n -r -- $'\033]0;'"$(afws_terminal_title_text)"$'\007'
+}
+
 # afws_run_with_timeout SECONDS COMMAND [ARG ...]
 # Returns 124 after terminating a command that exceeded its deadline. This is
 # deliberately implemented with zsh builtins so macOS does not need GNU
@@ -297,6 +310,21 @@ afws_mount_is_present() {
   ${=AFWS_MOUNT_COMMAND} | grep -Fq " on $1 ("
 }
 
+# afws_mount_sources_at PATH
+# The sources of every mount sitting at exactly PATH, newest last, as 'mount'
+# spells them. More than one means they are stacked: the newest shadows the
+# rest, and unmounting it uncovers the one below rather than freeing the path.
+afws_mount_sources_at() {
+  local target="$1" mount_line remainder mount_path
+
+  while IFS= read -r mount_line; do
+    remainder="${mount_line#* on }"
+    mount_path="${remainder%% \(*}"
+    [[ "$mount_path" == "$target" ]] || continue
+    print -r -- "${mount_line%% on *}"
+  done < <(${=AFWS_MOUNT_COMMAND})
+}
+
 # Codex works on the remote tree through afws-run. This separate rclone/NFS
 # mount exists only so Finder and VS Code can display the project.
 afws_visibility_record() {
@@ -388,7 +416,10 @@ afws_visibility_mount_is_healthy() {
   afws_mount_is_present "$workspace" || return 1
   afws_directory_responds "$workspace" || return 1
   ssh_options=(-o BatchMode=yes)
-  [[ -n "$socket" ]] && ssh_options+=(-S "$socket")
+  if [[ -n "$socket" ]]; then
+    afws_control_master_options "$socket"
+    ssh_options+=("${afws_control_master_option_list[@]}")
+  fi
   remote_command="cd ${(q)remote_dir} && find . -mindepth 1 -maxdepth 1 ! -type l -print -quit"
   remote_entry="$(ssh "${ssh_options[@]}" "$ssh_host" "$remote_command" 2>/dev/null)" || return 1
   remote_entry="${remote_entry#./}"
@@ -410,12 +441,15 @@ afws_visibility_mount() {
   record="$(afws_visibility_record "$ssh_host" "$remote_dir")"
   pidfile="${record}.pid"
   cache_dir="${AFWS_RCLONE_CACHE_DIR}/${ssh_host}${remote_dir}"
+  afws_refuse_to_stack rclone "a Finder/VS Code view of ${ssh_host}:${remote_dir}" "$workspace"
   mkdir -p "$workspace" "${record:h}" "$cache_dir" "${logfile:h}"
   chmod 700 "$AFWS_STATE_DIR" "$AFWS_MOUNT_RECORD_DIR" "$AFWS_RCLONE_CACHE_DIR" \
     "$cache_dir" "$AFWS_LOG_DIR" 2>/dev/null || true
 
   ssh_command="ssh -o BatchMode=yes"
-  [[ -n "$socket" ]] && ssh_command+=" -S ${(q)socket}"
+  # This process outlives the session that started it, so it must be able to
+  # re-open the shared connection rather than hold a path to a dead one.
+  [[ -n "$socket" ]] && ssh_command+=" -o ControlMaster=auto -o ControlPath=${(q)socket} -o ControlPersist=${(q)AFWS_CONTROL_PERSIST}"
   ssh_command+=" ${(q)ssh_host}"
   rclone_options=(
     --sftp-ssh "$ssh_command"
@@ -519,11 +553,18 @@ afws_establish_visibility_mount() {
   fi
 
   if afws_mount_is_present "$workspace"; then
+    # A healthy pre-rclone mount is still a usable visibility view. Keep it
+    # shared instead of forcing every live session to stop for migration.
+    # Do not create a rclone record: we do not own an rclone process here.
+    if (( ! existing_record )) && afws_directory_responds "$workspace"; then
+      print -r -- "Reusing existing Finder/VS Code view: ${workspace}"
+      return 0
+    fi
     if (( ! existing_record )) && [[ -x "$peers" ]]; then
       users="$(env -u AFWS_SESSION_NAME "$peers" --users-of-mount "$workspace" 2>/dev/null)" || users=1
       if (( users > 0 )); then
-        afws_die "the legacy SSHFS mount is still used by ${users} live session(s): ${workspace}
-Close those sessions before the one-time switch to the rclone Finder/VS Code view."
+        afws_die "the existing view is not responding and is still used by ${users} live session(s): ${workspace}
+Repair it with afws-remount, or close those sessions before replacing it."
       fi
     fi
     print -r -- "Replacing an unhealthy Finder/VS Code view: ${workspace}"
@@ -608,9 +649,49 @@ Its sshfs process is gone, so every path inside it fails with ENXIO. ${unmount_a
 # A detached sshfs cannot answer a password prompt, and a session's remote
 # commands have nobody to ask either. One multiplexed connection is
 # authenticated in the foreground and reused by everything afterwards.
+#
+# That invariant is deliberately relaxed by afws_control_master_options below:
+# a consumer may open a replacement when the shared connection has gone. Read
+# the reasoning there before tightening it back.
 
 afws_control_socket() {
   print -r -- "${AFWS_CONTROL_DIR}/$1.sock"
+}
+
+# afws_control_master_options SOCKET
+# Sets afws_control_master_option_list to the ssh options that reuse the shared
+# connection at SOCKET and, once it has gone, open a replacement in its place.
+#
+# -S on its own only ever reuses. With nothing at the path ssh connects by
+# itself, silently, and leaves the path empty, so a master that dies is never
+# replaced. A long-lived consumer -- the rclone view, an SSHFS mount -- then
+# holds a path to a socket that is never coming back and pays a full handshake
+# for every operation until someone notices. A view was once left retrying
+# against a socket that had been gone for nine hours with nothing to recreate
+# it. ControlMaster=auto makes the next consumer open the replacement, and it
+# clears a stale socket file out of the way in order to do so.
+#
+# The cost is worth stating rather than discovering. The invariant above -- one
+# connection, authenticated in the foreground, reused by everything -- is
+# relaxed: a consumer may now authenticate a connection of its own. On a host
+# that authenticates by password nothing changes, because a background consumer
+# still has nobody to ask. On a key-authenticated host a consumer can do what
+# only the launcher did before.
+afws_control_master_options() {
+  # Creating a socket needs somewhere to put it. -S was forgiving here: with no
+  # directory to bind in, ssh connected on its own and said nothing.
+  # ControlMaster=auto is not -- it fails the whole connection with
+  # "unix_listener: cannot bind to path" and exit 255. Any command that runs
+  # before a launcher has opened the shared connection would otherwise be
+  # unable to reach the work station at all.
+  [[ -d "${1:h}" ]] || mkdir -p "${1:h}" 2>/dev/null || true
+  chmod 700 "${1:h}" 2>/dev/null || true
+
+  afws_control_master_option_list=(
+    -o ControlMaster=auto
+    -o "ControlPath=$1"
+    -o "ControlPersist=${AFWS_CONTROL_PERSIST}"
+  )
 }
 
 afws_check_socket_length() {
@@ -685,8 +766,9 @@ afws_control_ssh_options() {
   [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && return 0
 
   control_path="$(afws_resolve_control_path "$ssh_host")"
+  afws_control_master_options "$control_path"
   if [[ -S "$control_path" ]]; then
-    afws_ssh_control_options=(-S "$control_path")
+    afws_ssh_control_options=("${afws_control_master_option_list[@]}")
     return 0
   fi
 
@@ -699,11 +781,12 @@ afws_control_ssh_options() {
   # refusal, and key-based authentication still goes through untouched.
   if afws_has_controlling_terminal || [[ -n "${SSH_ASKPASS-}" ]]; then
     afws_control_fallback=terminal
+    afws_ssh_control_options=("${afws_control_master_option_list[@]}")
     return 0
   fi
 
   afws_control_fallback=batch
-  afws_ssh_control_options=(-o BatchMode=yes)
+  afws_ssh_control_options=(-o BatchMode=yes "${afws_control_master_option_list[@]}")
 
   return 0
 }
@@ -758,11 +841,41 @@ afws_detached() {
 }
 
 
+# afws_refuse_to_stack KIND SOURCE_DESCRIPTION WORKSPACE
+# Nothing else catches a mount of a different kind sitting on exactly this
+# path. afws_find_existing_mount only considers sources spelled "${ssh_host}:",
+# which the rclone view is not -- it mounts as "localhost:/". afws_find_nested_
+# mount only considers paths strictly below. So an SSHFS mount could be laid
+# straight on top of a live Finder/VS Code view: the newest layer shadows the
+# older, and once its process dies the corpse answers ENXIO for every path
+# while a healthy mount sits unreachable underneath. Unmounting one layer only
+# uncovers the next, which is why repeated repairs restored access and then
+# failed again hours later.
+#
+# This lives in the two mount functions rather than in their callers because
+# they are the only chokepoint both paths pass: afws-remount calls afws_mount
+# directly, without going through afws_establish_mount.
+afws_refuse_to_stack() {
+  local kind="$1" source_description="$2" workspace="$3"
+
+  afws_mount_is_present "$workspace" || return 0
+  afws_die "refusing to mount ${source_description} on ${workspace}
+Something is already mounted on exactly that path:
+$(afws_mount_sources_at "$workspace" | sed 's/^/  /')
+Mounting over it would stack a second filesystem on the same path rather than
+replace it, and releasing the top one afterwards only uncovers the next.
+Release every layer first:
+  afws-umount --list
+  afws-umount HOST REMOTE_DIRECTORY"
+}
+
 # afws_mount HOST REMOTE_DIR WORKSPACE SOCKET_OR_EMPTY LOGFILE
 afws_mount() {
   local ssh_host="$1" remote_dir="$2" workspace="$3" socket="$4" logfile="$5"
   local waited=0
   local -a sshfs_options
+
+  afws_refuse_to_stack sshfs "${ssh_host}:${remote_dir}" "$workspace"
 
   mkdir -p "$workspace"
   mkdir -p "${logfile:h}"
@@ -774,7 +887,12 @@ afws_mount() {
   # after reconnection. Correct directory contents matter more than avoiding a
   # round trip here; expensive tree scans should be narrowed by the agent.
   sshfs_options+=(-o dir_cache=no)
-  [[ -n "$socket" ]] && sshfs_options+=(-o "ControlPath=${socket}")
+  # An SSHFS mount outlives the command that made it, so like the rclone view
+  # it has to be able to re-open the shared connection, not merely reuse one.
+  if [[ -n "$socket" ]]; then
+    afws_control_master_options "$socket"
+    sshfs_options+=("${afws_control_master_option_list[@]}")
+  fi
   # sshfs reconnects on its own after an interruption, and a reconnect that has
   # to authenticate has nobody to ask: this is a background mount. Left to
   # itself ssh would ask anyway, on the terminal the agent is drawing on.
@@ -863,85 +981,25 @@ afws_toml_string_list() {
 
 # --- workspace shape ------------------------------------------------------
 
-# Mounting a home directory does not grant the agent anything its own account
-# cannot already do, so this warns rather than refuses. What it costs is
-# containment: the agent's own credentials and every other project sit inside
-# the workspace, and a settings file there is read as project settings.
-# afws_warn_about_home_workspace WORKSPACE AGENT
-afws_warn_about_home_workspace() {
-  local workspace="$1" agent="$2" settings
-  local -a home_signals
-
-  [[ -n "${AFWS_ALLOW_HOME_MOUNT-}" ]] && return 0
-  [[ -d "$workspace" ]] || return 0
-
-  # .claude and .codex are normal in a project, alongside .git, so they say
-  # nothing about this being a home directory. Only things that belong to a
-  # login account do.
-  home_signals=()
-  [[ -e "${workspace}/.ssh" ]] && home_signals+=(.ssh)
-  [[ -e "${workspace}/.zshrc" ]] && home_signals+=(.zshrc)
-  [[ -e "${workspace}/.bashrc" ]] && home_signals+=(.bashrc)
-  [[ -e "${workspace}/.bash_profile" ]] && home_signals+=(.bash_profile)
-  [[ -e "${workspace}/.profile" ]] && home_signals+=(.profile)
-  (( ${#home_signals} > 0 )) || return 0
-
-  print -u2 -r -- ""
-  print -u2 -r -- "${AFWS_PROGRAM}: this workspace looks like a home directory, not a project."
-  print -u2 -r -- "  It contains: ${home_signals}"
-  print -u2 -r -- "  Your account's permissions still apply, so nothing new is reachable, but"
-  print -u2 -r -- "  everything in that home is now inside the agent's workspace: any SSH key,"
-  print -u2 -r -- "  any stored credential, and every other project. A file read there also"
-  print -u2 -r -- "  reaches the model."
-
-  settings="${workspace}/.claude/settings.json"
-  if [[ "$agent" == claude && -f "$settings" ]]; then
-    print -u2 -r -- "  It also contains .claude/settings.json ($(wc -c <"$settings" | tr -d ' ') bytes),"
-    print -u2 -r -- "  which Claude Code loads as this session's project settings, including any"
-    print -u2 -r -- "  permission rules in it."
-  fi
-
-  print -u2 -r -- "  Consider starting on a project directory instead. Set AFWS_ALLOW_HOME_MOUNT=1"
-  print -u2 -r -- "  to silence this."
-  print -u2 -r -- ""
-
-  return 0
-}
-
 # --- what a session is told --------------------------------------------------
 # The facts and the rules that do not depend on which agent is running. Keeping
 # them here means a change to them cannot reach one launcher and not the other.
 
-afws_session_preamble() {
-  print -r -- "This is an agent-for-work-station session backed by an SSHFS mount.
-Session name: ${afws_session_name}
-SSH config host: ${afws_ssh_host}
-Local workspace: ${afws_local_workspace}
-Remote working directory: ${afws_remote_dir}"
-}
-
-afws_shared_operating_rules() {
-  print -r -- "- The local workspace and remote working directory are two paths to the same project tree; the mount is this session's only checkout.
-- Do all project reads, searches, edits, file management, and Git locally in the mount. Never copy, clone, synchronize, stage, or create a worktree or alternate checkout unless the user explicitly asks; a lock does not authorize one.
-- Read and edit files only within the current mounted workspace, and within any additional directory this session was given, unless the user explicitly expands scope.
-- Additional directories are local reference material: read them, but write conclusions into the mounted project unless the user says otherwise.
-- Use afws-run only to execute programs that require the workstation's runtime, dependencies, hardware, or operating system: Python, tests, builds, and GPU jobs. Those programs may create their ordinary generated outputs in the project. Do not invoke ssh, scp, sftp, or rsync directly to bypass it.
-- Do not use afws-run for project inspection, file management, or Git. It rejects common cases; use --allow-remote-files only when the user explicitly requested a remote-side file operation. Piped scripts follow the same rule.
-- If the mounted workspace becomes unreadable, empty when the remote project is not, or reports ENXIO, do not switch project file work to afws-run. Use afws-remount to repair the mount; ask the user before adding --force for a timeout or a mount that still answers but has incorrect contents.
-- Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
-- Show the remote command and only its relevant stdout and stderr to the user; keep large logs and listings out of context unless they are needed.
-- Ask before destructive, expensive, or long-running operations. Narrow slow SSHFS searches to relevant paths rather than moving project inspection to the remote shell."
-}
-
+# afws_remote_first_operating_rules [AGENT_NAME]
+# Both launchers share these rules, so the agent names itself rather than the
+# text naming one of them. Left out, it reads as "this session", which is what
+# a single-agent reader needs it to mean anyway.
 afws_remote_first_operating_rules() {
-  print -r -- "- The remote working directory is the authoritative project. The local mount is only a Finder/VS Code view; do not use it for Codex project work.
+  local agent="${1:-this session}"
+
+  print -r -- "- The remote working directory is the authoritative project. The local mount is only a Finder/VS Code view; do not use it for ${agent} project work.
 - Run every project read, search, edit, file-management, and Git operation through afws-run. This includes rg, find, cat, sed, patch application, and git status/diff/commit.
 - Run tests, builds, Python, and other project commands through afws-run too. Commands start in the remote project directory.
 - Transfer explicitly allowed local input with afws-push. Its destination is confined to the remote project.
 - Ordinary local shell and file tools are only for the empty control workspace and the local directories explicitly listed for this session. Do not copy or synchronize the remote project into the control workspace.
-- Local afws-peers, afws-status, and afws-message are allowed for coordination through this Mac's work-station registry; they do not inspect or edit the remote project.
+- Local afws-peers, afws-status, afws-message, and afws-org are allowed for coordination through this Mac's work-station registry; they do not inspect or edit the remote project.
 - The Finder/VS Code view omits native remote symlinks because rclone SFTP cannot represent them faithfully. Use afws-run to inspect or operate through those paths.
-- If the Finder/VS Code view is unavailable, continue project work through afws-run; the view is not Codex's data path. Use afws-remount to recreate the view when convenient.
+- If the Finder/VS Code view is unavailable, continue project work through afws-run; the view is not ${agent}'s data path. Use afws-remount to recreate the view when convenient.
 - Do not invoke ssh, scp, sftp, or rsync directly to bypass the helpers.
 - Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
 - Show the remote command and only its relevant stdout and stderr to the user; keep large logs and listings out of context unless needed.
@@ -1002,75 +1060,12 @@ afws_open_session_connection() {
   return 0
 }
 
-# afws_establish_mount HOST REMOTE_DIR SOCKET_OR_EMPTY DRY_RUN LOG_NAME REMOUNT_COMMAND
-# Sets afws_local_workspace and afws_mount_point, reusing a mount that already
-# covers the directory, automatically repairing a confirmed disconnected mount,
-# refusing an ambiguous timeout or a mount that would hide another, and otherwise
-# mounting.
-afws_establish_mount() {
-  local ssh_host="$1" remote_dir="$2" socket="$3" dry_run="$4" log_name="$5"
-  local remount_command="${6-}" stale_mount stale_remote_root suffix
-
-  if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
-    print -r -- "Reusing SSHFS mount: ${afws_mount_source}"
-    return 0
-  fi
-
-  if [[ -n "$afws_stale_mount" ]]; then
-    if [[ "$afws_stale_mount_reason" == timeout ]]; then
-      afws_die "$(afws_stale_mount_message "$afws_stale_mount" "$afws_stale_mount_reason")"
-    fi
-
-    [[ -x "$remount_command" ]] ||
-      afws_die "the mount is disconnected and afws-remount is not installed next to the launcher"
-
-    stale_mount="$afws_stale_mount"
-    stale_remote_root="$afws_stale_mount_remote_root"
-    if [[ "$remote_dir" == "$stale_remote_root" ]]; then
-      suffix=""
-    elif [[ "$stale_remote_root" == / ]]; then
-      suffix="$remote_dir"
-    else
-      suffix="${remote_dir#${stale_remote_root}}"
-    fi
-
-    print -r -- "The existing SSHFS mount is disconnected; reconnecting it before launch."
-    if (( dry_run )); then
-      "$remount_command" --dry-run "$ssh_host" "$remote_dir" || exit 1
-      afws_mount_point="$stale_mount"
-      afws_local_workspace="${stale_mount%/}${suffix}"
-      return 0
-    fi
-
-    "$remount_command" "$ssh_host" "$remote_dir" || exit 1
-    if afws_find_existing_mount "$ssh_host" "$remote_dir"; then
-      print -r -- "Reusing repaired SSHFS mount: ${afws_mount_source}"
-      return 0
-    fi
-    afws_die "afws-remount completed but the replacement mount is not usable"
-  fi
-
-  afws_local_workspace="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
-  afws_mount_point="$afws_local_workspace"
-
-  if afws_find_nested_mount "$afws_local_workspace"; then
-    afws_die "refusing to mount ${ssh_host}:${remote_dir} on ${afws_local_workspace}
-Another mount is already in use underneath it: ${afws_nested_mount}
-That mount belongs to a session working on a subdirectory of this one. Start this
-session on that deeper directory instead, or unmount it first. Run afws-peers to
-see which session it belongs to."
-  fi
-
-  if (( dry_run )); then
-    print -r -- "Would mount ${ssh_host}:${remote_dir}"
-    print -r -- "  on ${afws_local_workspace}"
-    [[ -n "$socket" ]] && print -r -- "  over a shared SSH connection at ${socket}"
-    return 0
-  fi
-
-  afws_mount "$ssh_host" "$remote_dir" "$afws_local_workspace" "$socket" \
-    "${AFWS_LOG_DIR}/${log_name}.sshfs.log" || exit 1
-}
+# The mounted session type these four served is gone: both launchers are
+# remote-first, so nothing creates an SSHFS mount for a session to work in any
+# more. afws_establish_mount, afws_session_preamble,
+# afws_shared_operating_rules and afws_warn_about_home_workspace were removed
+# with it. afws_mount itself stays -- afws-remount still repairs and recreates
+# an SSHFS mount that someone already has.
 
 # afws_print_session_header TITLE PEERS DRY_RUN EXTRA_DIR...
 afws_print_session_header() {
@@ -1103,6 +1098,8 @@ afws_export_session_environment() {
   export AFWS_STATE_DIR
   export AFWS_AGENT="$afws_agent"
   export AFWS_SESSION_NAME="$afws_session_name"
+  export AFWS_INSTANCE_ID="${afws_instance_id-}"
+  export AFWS_SESSION_TOKEN="${afws_session_token-}"
   export AFWS_SSH_HOST="$afws_ssh_host"
   export AFWS_REMOTE_DIR="$afws_remote_dir"
   export AFWS_LOCAL_WORKSPACE="$afws_local_workspace"
@@ -1112,6 +1109,15 @@ afws_export_session_environment() {
   [[ -S "$afws_control_socket_path" ]] && export AFWS_CONTROL_PATH="$afws_control_socket_path"
 
   return 0
+}
+
+afws_initialize_session_identity() {
+  local token_material
+  command -v uuidgen >/dev/null 2>&1 || afws_die "uuidgen is required for session identity"
+  afws_instance_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  token_material="$(uuidgen)$(uuidgen)"
+  afws_session_token="$(print -rn -- "$token_material" | shasum -a 256 | awk '{print $1}')"
+  [[ -n "$afws_instance_id" && -n "$afws_session_token" ]] || afws_die "could not create session identity"
 }
 
 # EXIT alone does not cover a signal: zsh runs it on a normal exit and on HUP,
@@ -1205,11 +1211,15 @@ afws_run_tracked_agent() {
 # The launchers set these before calling the functions below.
 #   afws_agent afws_session_name afws_ssh_host afws_remote_dir
 #   afws_local_workspace afws_mount_point afws_control_socket_path
+#   afws_instance_id afws_session_token
 
 # afws_write_session_record KIND PID BG_ID
 afws_write_session_record() {
   local kind="$1" pid="$2" bg_id="$3"
   local record="${AFWS_SESSION_DIR}/${afws_session_name}.conf"
+
+  [[ -n "${afws_instance_id-}" && -n "${afws_session_token-}" ]] ||
+    afws_initialize_session_identity
 
   mkdir -p "$AFWS_SESSION_DIR"
   chmod 700 "$AFWS_STATE_DIR" "$AFWS_SESSION_DIR" 2>/dev/null || true
@@ -1221,6 +1231,9 @@ afws_write_session_record() {
   umask 077
   {
     print -r -- "session_name=${afws_session_name}"
+    print -r -- "instance_id=${afws_instance_id}"
+    print -r -- "token_hash=$(print -rn -- "$afws_session_token" | shasum -a 256 | awk '{print $1}')"
+    print -r -- "afws_version=2"
     print -r -- "agent=${afws_agent}"
     print -r -- "kind=${kind}"
     print -r -- "pid=${pid}"
@@ -1288,6 +1301,9 @@ afws_read_record() {
   local record="$1" line key value
 
   afws_record_session_name=""
+  afws_record_instance_id=""
+  afws_record_token_hash=""
+  afws_record_version=""
   afws_record_agent=""
   afws_record_kind=""
   afws_record_pid=""
@@ -1306,6 +1322,9 @@ afws_read_record() {
     value="${line#*=}"
     case "$key" in
       session_name) afws_record_session_name="$value" ;;
+      instance_id) afws_record_instance_id="$value" ;;
+      token_hash) afws_record_token_hash="$value" ;;
+      afws_version) afws_record_version="$value" ;;
       agent) afws_record_agent="$value" ;;
       kind) afws_record_kind="$value" ;;
       pid) afws_record_pid="$value" ;;

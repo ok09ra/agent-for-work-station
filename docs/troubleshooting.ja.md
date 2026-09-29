@@ -68,6 +68,49 @@ AFWS_PROBE_TIMEOUT_SECONDS=60 claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTOR
 
 該当するプロセスが無ければ、そのマウントは死んでいます。次項の正式な修復コマンドを使ってください。
 
+## 修復しても数時間で再発する
+
+`afws-remount`で復旧し、一覧も正常に出るのに、数時間後にまた内部のすべてのパスが`Device not configured`で失敗する。修復を繰り返すと、同じ周期を繰り返すことになります。
+
+原因は、同じパスに2つのファイルシステムがマウントされていることです。マウントは既にあるものを置き換えません。その上に積み重なり、見えるのは最新の層だけです。そのため、健全なビューが死んだ層の下で到達不能になっていることがあり、`umount`はパスを空けるのではなく下の層を露出させるだけです。修復が効いたように見えて再発するのはこのためです。
+
+`afws-doctor`が直接報告します。
+
+```
+[FAIL] filesystems are stacked on the same path; the top one hides the rest:
+       ~/afws-mounts/HOST/remote/project — 2 layers
+```
+
+上の層だけでなく全部の層を解放してから、1回だけマウントします。
+
+```zsh
+afws-umount --list                                  # 何がマウントされ、誰が使っているか
+mount | grep afws-mounts                            # そのパス上の全部の層
+umount ~/afws-mounts/HOST/remote/project   # パスが空になるまで繰り返す
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+古いビューの`rclone`プロセスがアンマウント後も残っている場合は、それも停止します。既に存在しない共有接続を掴んでいるプロセスは`afws-doctor`が名指しします。現在のlauncherは既に使われているパスへのマウントを拒否するので、積み重なりは古いバージョンからの引き継ぎか、手作業でのマウントでしか作れません。
+
+## ビューにプロジェクトの一部しか出ない
+
+エラーは出ないのに一覧からエントリが欠けていて、欠けているものを`stat`すると`No such file or directory`になる。SSHの経路を途中で失ったビューは、不完全な一覧をキャッシュしてそのまま返し続けることがあります。エラーとして報告されない分、エラーより厄介です。
+
+信用する前にリモートと突き合わせます。
+
+```zsh
+ls -1 ~/afws-mounts/HOST/remote/project | wc -l
+afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- ls -1 | wc -l
+```
+
+ビューを作り直せば解消します。
+
+```zsh
+afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+```
+
+これはビューの障害であって、プロジェクトの障害ではありません。エージェントの操作はビューを通らないので、この状態でも`afws-run`と`afws-lab`はプロジェクト全体を見ています。
+
 ## マウントはあるが応答しない
 
 こちらは、読み取りが返ってこないのではなく、エラーを返した場合です。macFUSEではこれは、マウント内部のすべてのパスが`ENXIO`で失敗することを意味します。ここに至る原因は2つあり、メッセージはどちらを検出したかを述べます — sshfsプロセスが消えているか、プロセスは動いているが接続を張り直せていないか。いずれも自然には回復しません。
@@ -91,6 +134,8 @@ launcherはSSHFSのディレクトリ名キャッシュを無効にします。�
   ServerAliveInterval 30
   ServerAliveCountMax 6
 ```
+
+これが無いとどちらの端も相手を確認しないため、ネットワークとともに死んだ接続に誰も気づきません。sshは失敗せずに固まり、その接続に紐づいたものは再試行を続けます。共有接続自体は自力で回復するようになりましたが（次に必要とした側が張り直します）、マウントは作られた時点の経路の健全性以上にはなりません。
 
 ## GPUが見えない
 

@@ -8,3 +8,5 @@ id_*
 local/
 mounts/
 tmp/
+__pycache__/
+*.pyc

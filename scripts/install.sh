@@ -11,8 +11,9 @@ readonly PROFILE_BEGIN="# >>> agent-for-work-station >>>"
 readonly PROFILE_END="# <<< agent-for-work-station <<<"
 configure_shell=1
 
-readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-message afws-status
-  afws-codex-hook afws-remote afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor)
+readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-org
+  afws-codex-hook afws-claude-hook afws-claude-inbox afws-remote afws-isolate afws-lock
+  afws-remount afws-umount afws-shell afws-lab afws-doctor)
 
 usage() {
   print -r -- "Usage: ./scripts/install.sh [--no-shell-config]"
@@ -58,6 +59,8 @@ mkdir -p "$INSTALL_DIRECTORY" "$LIBRARY_DIRECTORY" "$DOCKER_DIRECTORY"
 chmod 755 "$LIBRARY_DIRECTORY"
 
 install -m 0644 "${REPOSITORY_ROOT}/lib/afws-common.zsh" "${LIBRARY_DIRECTORY}/afws-common.zsh"
+install -m 0644 "${REPOSITORY_ROOT}/lib/afws-orchestrator.py" "${LIBRARY_DIRECTORY}/afws-orchestrator.py"
+install -m 0644 "${REPOSITORY_ROOT}/lib/afws-fs-mcp.py" "${LIBRARY_DIRECTORY}/afws-fs-mcp.py"
 install -m 0644 "${REPOSITORY_ROOT}/docker/isolate/Dockerfile" "${DOCKER_DIRECTORY}/Dockerfile"
 install -m 0644 "${REPOSITORY_ROOT}/docker/isolate/child.py" "${DOCKER_DIRECTORY}/child.py"
 for command_name in $COMMANDS; do
@@ -84,6 +87,8 @@ for command_name in $COMMANDS; do
   print -r -- "  ${INSTALL_DIRECTORY}/${command_name}"
 done
 print -r -- "  ${LIBRARY_DIRECTORY}/afws-common.zsh"
+print -r -- "  ${LIBRARY_DIRECTORY}/afws-orchestrator.py"
+print -r -- "  ${LIBRARY_DIRECTORY}/afws-fs-mcp.py"
 print -r -- "  ${DOCKER_DIRECTORY}/Dockerfile"
 print -r -- "  ${DOCKER_DIRECTORY}/child.py"
 

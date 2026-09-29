@@ -1,0 +1,142 @@
+#!/bin/zsh
+
+set -eu
+
+[[ -n "${AFWS_SESSION_NAME-}" ]] || exit 0
+
+readonly AFWS_PROGRAM="afws-claude-hook"
+readonly SCRIPT_DIR="${0:A:h}"
+readonly INBOX="${SCRIPT_DIR}/afws-claude-inbox"
+readonly ORG="${SCRIPT_DIR}/afws-org"
+readonly RUN="${SCRIPT_DIR}/afws-run"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || exit 0
+
+afws_validate_session_name "$AFWS_SESSION_NAME"
+record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+[[ -r "$record" ]] || exit 0
+afws_read_record "$record" || exit 0
+[[ "$afws_record_agent" == claude &&
+   "$afws_record_session_name" == "$AFWS_SESSION_NAME" &&
+   "$afws_record_instance_id" == "${AFWS_INSTANCE_ID-}" ]] || exit 0
+
+input_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-claude-hook.XXXXXX")" || exit 1
+trap 'rm -f "$input_file"' EXIT
+/bin/cat > "$input_file"
+
+event_name="$(plutil -extract hook_event_name raw -o - -- "$input_file" 2>/dev/null)" || exit 0
+session_id="$(plutil -extract session_id raw -o - -- "$input_file" 2>/dev/null)" || session_id=""
+if [[ -n "$session_id" && "$session_id" != *[[:cntrl:]]* && ${#session_id} -le 128 ]]; then
+  afws_write_session_meta "$AFWS_SESSION_NAME" thread "$session_id"
+fi
+
+# The project is on the workstation, not on this Mac, so a local sandbox rule
+# cannot hold a write scope: every project write arrives through afws-run. What
+# can be checked is the result. Only a scoped assignment pays for the round
+# trip, which is also the only case where the answer matters. Nothing here
+# prevents a write; it refuses to let the turn end with one nobody declared.
+afws_scope_drift() {
+  local scope_line assignment_id scope raw entry verdict
+  typeset -a changed
+  [[ -x "$ORG" && -x "$RUN" ]] || return 0
+  [[ -n "${AFWS_REMOTE_FIRST-}" ]] || return 0
+  scope_line="$($ORG scope 2>/dev/null)" || return 0
+  [[ -n "$scope_line" ]] || return 0
+  assignment_id="${scope_line%%$'\t'*}"
+  scope="${scope_line#*$'\t'}"
+  [[ -n "$assignment_id" && -n "$scope" ]] || return 0
+
+  # -z keeps paths with spaces or quotes intact; a rename yields both its new
+  # and its old path, and checking both is the conservative reading.
+  raw="$($RUN sh -c 'git status --porcelain -z 2>/dev/null | tr "\000" "\n"' 2>/dev/null)" || return 0
+  changed=()
+  for entry in ${(f)raw}; do
+    [[ -n "$entry" ]] || continue
+    if (( ${#entry} > 3 )) && [[ "${entry[1,2]}" == [\ MADRCU?!][\ MADRCU?!] && "${entry[3]}" == " " ]]; then
+      entry="${entry[4,-1]}"
+    fi
+    [[ -n "$entry" ]] || continue
+    changed+=("$entry")
+  done
+  (( ${#changed} > 0 )) || return 0
+
+  verdict="$($ORG guard "${changed[@]}" 2>&1)" && return 0
+  print -rn -- "$verdict"
+  return 1
+}
+
+collect_context() {
+  local peer_context="" organization_inbox="" loop_context="" combined=""
+  [[ -x "$INBOX" ]] && peer_context="$($INBOX poll 2>/dev/null || true)"
+  if [[ -x "$ORG" ]]; then
+    organization_inbox="$($ORG inbox 2>/dev/null || true)"
+    loop_context="$($ORG hook-context 2>/dev/null || true)"
+  fi
+  [[ -z "$peer_context" ]] || combined+="${peer_context}"
+  if [[ -n "$organization_inbox" ]]; then
+    [[ -z "$combined" ]] || combined+=$'\n\n'
+    combined+="${organization_inbox}"
+  fi
+  if [[ -n "$loop_context" ]]; then
+    [[ -z "$combined" ]] || combined+=$'\n\n'
+    combined+="${loop_context}"
+  fi
+  print -rn -- "$combined"
+}
+
+case "$event_name" in
+  SessionStart)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+    collect_context
+    ;;
+  UserPromptSubmit)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state busy
+    prompt_text="$(plutil -extract prompt raw -o - -- "$input_file" 2>/dev/null)" || prompt_text=""
+    activity="${prompt_text%%$'\n'*}"
+    activity="${activity//$'\r'/ }"
+    activity="${activity//$'\t'/ }"
+    activity="${activity[1,160]}"
+    [[ -z "$activity" ]] || afws_write_session_meta "$AFWS_SESSION_NAME" prompt "$activity"
+    collect_context
+    ;;
+  Stop)
+    stop_hook_active="$(plutil -extract stop_hook_active raw -o - -- "$input_file" 2>/dev/null)" || stop_hook_active="false"
+    # Block once. A second block on the same stop would trap a session that
+    # cannot reach the workstation to clean up.
+    if [[ "$stop_hook_active" != true ]] && ! drift="$(afws_scope_drift)"; then
+      print -u2 -r -- "${drift}
+The workstation tree carries changes outside the declared scope. Do not end the turn on them: revert what does not belong to this assignment, or stop and report it with 'afws-org wait'."
+      exit 2
+    fi
+    context="$(collect_context)"
+    if [[ -n "$context" ]]; then
+      print -rn -- "$context" | python3 -c '
+import json, sys
+context = sys.stdin.read()
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "Stop",
+    "additionalContext": context,
+}}, ensure_ascii=False))
+'
+    else
+      afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+      print -r -- '{}'
+    fi
+    ;;
+  ConfigChange)
+    changed_path="$(plutil -extract file_path raw -o - -- "$input_file" 2>/dev/null)" || changed_path=""
+    [[ -n "$changed_path" ]] || changed_path="(unnamed)"
+    print -u2 -r -- "[AFWS] configuration changed during this session: ${changed_path}"
+    afws_write_session_meta "$AFWS_SESSION_NAME" config_changed "$changed_path"
+    ;;
+  StopFailure|SessionEnd)
+    afws_write_session_meta "$AFWS_SESSION_NAME" state idle
+    ;;
+esac

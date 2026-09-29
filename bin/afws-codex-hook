@@ -8,6 +8,8 @@ set -eu
 
 readonly AFWS_PROGRAM="afws-codex-hook"
 readonly SCRIPT_DIR="${0:A:h}"
+readonly ORG="${SCRIPT_DIR}/afws-org"
+readonly RUN="${SCRIPT_DIR}/afws-run"
 for afws_library in \
   "${SCRIPT_DIR}/../lib/afws-common.zsh" \
   "${HOME}/.local/lib/afws-common.zsh"; do
@@ -33,6 +35,38 @@ event_name="$(plutil -extract hook_event_name raw -o - -- "$input_file" 2>/dev/n
 thread_id="$(plutil -extract session_id raw -o - -- "$input_file" 2>/dev/null)" || exit 0
 [[ -n "$thread_id" && "$thread_id" != *[[:cntrl:]]* && ${#thread_id} -le 128 ]] || exit 0
 afws_write_session_meta "$AFWS_SESSION_NAME" thread "$thread_id"
+
+# The project lives on the workstation, so no local sandbox rule can hold a
+# write scope: every project write arrives through afws-run. The result can be
+# checked, and only a scoped assignment pays for the round trip. This prevents
+# nothing; it refuses to let a turn end on an undeclared change.
+afws_scope_drift() {
+  local scope_line assignment_id scope raw entry verdict
+  typeset -a changed
+  [[ -x "$ORG" && -x "$RUN" ]] || return 0
+  [[ -n "${AFWS_REMOTE_FIRST-}" ]] || return 0
+  scope_line="$($ORG scope 2>/dev/null)" || return 0
+  [[ -n "$scope_line" ]] || return 0
+  assignment_id="${scope_line%%$'\t'*}"
+  scope="${scope_line#*$'\t'}"
+  [[ -n "$assignment_id" && -n "$scope" ]] || return 0
+
+  raw="$($RUN sh -c 'git status --porcelain -z 2>/dev/null | tr "\000" "\n"' 2>/dev/null)" || return 0
+  changed=()
+  for entry in ${(f)raw}; do
+    [[ -n "$entry" ]] || continue
+    if (( ${#entry} > 3 )) && [[ "${entry[1,2]}" == [\ MADRCU?!][\ MADRCU?!] && "${entry[3]}" == " " ]]; then
+      entry="${entry[4,-1]}"
+    fi
+    [[ -n "$entry" ]] || continue
+    changed+=("$entry")
+  done
+  (( ${#changed} > 0 )) || return 0
+
+  verdict="$($ORG guard "${changed[@]}" 2>&1)" && return 0
+  print -rn -- "$verdict"
+  return 1
+}
 
 case "$event_name" in
   SessionStart)
@@ -62,8 +96,22 @@ case "$event_name" in
     fi
     ;;
   Stop)
-    turn_id="$(plutil -extract turn_id raw -o - -- "$input_file" 2>/dev/null)" || turn_id=""
     stop_hook_active="$(plutil -extract stop_hook_active raw -o - -- "$input_file" 2>/dev/null)" || stop_hook_active="false"
+    # Block once. A second block on the same stop would trap a session that
+    # cannot reach the workstation to clean up.
+    if [[ "$stop_hook_active" != true ]] && ! drift="$(afws_scope_drift)"; then
+      print -rn -- "$drift" | python3 -c '
+import json, sys
+reason = sys.stdin.read().strip() + (
+    "\nThe workstation tree carries changes outside the declared scope. Do not end the turn on "
+    "them: revert what does not belong to this assignment, or stop and report it with "
+    "'"'"'afws-org wait'"'"'."
+)
+print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+'
+      exit 0
+    fi
+    turn_id="$(plutil -extract turn_id raw -o - -- "$input_file" 2>/dev/null)" || turn_id=""
     peer_turn="$(afws_read_session_meta "$AFWS_SESSION_NAME" peer_turn 2>/dev/null)" || peer_turn=""
     if [[ -n "$turn_id" && "$turn_id" == "$peer_turn" && "$stop_hook_active" != true ]]; then
       rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"

@@ -28,6 +28,11 @@ usage() {
   print -r -- "  off     Disable Remote Control without stopping the app server"
   print -r -- "  status  Read the current app-server connection status"
   print -r -- "  pair    Print a short-lived pairing code for a trusted device"
+  print -r -- ""
+  print -r -- "'on' and 'pair' widen access to a daemon shared by this whole Mac, so"
+  print -r -- "they confirm at the terminal and cannot be completed from inside an"
+  print -r -- "agent session. 'off' and 'status' do not widen anything and need no"
+  print -r -- "confirmation."
 }
 
 (( $# == 1 )) || { usage >&2; exit 2; }
@@ -46,8 +51,27 @@ afws_read_record "$record" || afws_die "could not read session record"
    "$afws_record_agent" == codex ]] || afws_die "run this inside a codexfws session"
 command -v codex >/dev/null 2>&1 || afws_die "Codex CLI is not installed"
 
+# 'on' and 'pair' widen access to a daemon that outlives this session and is
+# shared by every Codex session on this Mac, so neither belongs to whatever is
+# driving the session. Asking on the controlling terminal is the check: an
+# agent's command has no terminal to answer from, and a user running this
+# themselves sees exactly what they are widening.
+afws_confirm_at_terminal() {
+  local notice="$1" answer=""
+  [[ -z "${AFWS_REMOTE_ASSUME_YES-}" ]] || return 0
+  [[ -r /dev/tty && -t 1 ]] || afws_die \
+    "${notice} affects every Codex session on this Mac and outlives this one, so it needs a person at the terminal.
+Tell the user to run 'afws-remote ${action}' in their own shell, not from inside an agent session: an agent
+session captures this command's output and has no terminal to confirm at. Do not set AFWS_REMOTE_ASSUME_YES
+to get past this; it exists for the user's own scripts."
+  print -u2 -rn -- "${notice}. Type 'yes' to continue: "
+  IFS= read -r answer < /dev/tty || answer=""
+  [[ "$answer" == yes ]] || afws_die "not confirmed; nothing changed"
+}
+
 case "$action" in
   on)
+    afws_confirm_at_terminal "Enabling Codex Remote Control for this whole Mac"
     codex app-server daemon enable-remote-control || exit $?
     print -r -- "Codex Remote Control enabled on this Mac for all sessions on its shared app server."
     print -r -- "An open CLI conversation may stay locked to its terminal; this command does not hand it off."
@@ -57,6 +81,7 @@ case "$action" in
     print -r -- "Codex Remote Control disabled on this Mac. Local sessions keep running."
     ;;
   pair)
+    afws_confirm_at_terminal "Pairing a device with this Mac's shared Codex app server"
     print -u2 -r -- "Pairing gives the device access to this Mac's shared Codex app server."
     print -u2 -r -- "An open CLI conversation may stay locked to its terminal; pairing does not hand it off."
     codex remote-control pair

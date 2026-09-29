@@ -26,16 +26,20 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 
 ## 起動時の動作
 
-1. ClaudeではSSHFS作業ツリー、CodexではFinder/VS Code用rclone NFSビューを探します。
-2. Codex自身は空のローカル制御ディレクトリで起動し、リモートプロジェクトを正本として扱います。
-3. 接続先への認証済みSSH接続を1本だけ開きます。パスワードや鍵のパスフレーズを求められる場合は、ここで入力します。
+1. 接続先への認証済みSSH接続を1本だけ開きます。パスワードや鍵のパスフレーズを求められる場合は、ここで入力します。
+2. `codexfws`はFinder/VS Code用rclone NFSビューを作ります（正常なものが既にあれば再利用）。`claudefws`は`--view`が無ければ何もマウントしません。
+3. どちらのエージェントも空のローカル制御ディレクトリで起動し、リモートプロジェクトを正本として扱います。
 4. Claudeなら`fws-HOST-PROJECT-N`、Codexなら`cx-HOST-PROJECT-N`形式の未使用のセッション名を決めます。
 5. `~/.afws/sessions/`へセッションを登録し、他のセッションから担当範囲が見えるようにします。
-6. `claudefws`はマウント内、`codexfws`は制御ディレクトリ内で起動します。Codexのプロジェクト操作はすべて`afws-run`経由です。
+6. プロジェクト操作はすべて`afws-run`経由で、リモートのプロジェクトディレクトリから始まります。
 
 Codexには4つのローカルライフサイクルフックも付けます。Codexに求められたら内容を確認して信頼してください。最初のターン後にスレッドID・状態・短い作業ラベルを記録し、別セッションから宛先にできるようにします。
 
-どちらのエージェントもMacで動きます。Codexでは読み取り・編集・Git・実行を含む全プロジェクト操作がSSH接続先で動きます。表示用ビューが切れてもCodexの作業は継続できます。
+どちらのエージェントもMacで動きます。読み取り・編集・Git・実行を含む全プロジェクト操作がSSH接続先で動きます。ビューが切れても作業は継続できます。ビューはデータ経路ではないからです。エージェント自身の作業ディレクトリは空の制御ディレクトリで、これがファイルツールを、古かったり欠けていたりするローカルコピーから遠ざけます。
+
+対話セッションのターミナルタイトルは`[セッション名] プロジェクト名 | agent-for-work-station`になります。たとえば`AFWS_SESSION_NAME=ngof-1`なら`[ngof-1] ngof | agent-for-work-station`です。端末側でタイトルを管理したい場合は、起動時に`AFWS_NO_TERMINAL_TITLE=1`を設定します。バックグラウンドセッションはタイトルを変更しません。
+
+追加のセッションは、同じマウントポイントの正常なビューを共有します。既存のSSHFSマウントも再利用するため、起動のたびに再マウントしたり、rcloneへの移行だけを理由に既存セッションを終了したりする必要はありません。マウントがない場合はrcloneで新しいビューを作ります。すでに何かがマウントされているパスへの新規マウントは拒否します。同じパスに重ねると下の層を置き換えるのではなく隠すことになり、後から上の層を外しても次の層が出てくるだけだからです。
 
 ## セッションを別の端末から操作する
 
@@ -44,9 +48,9 @@ Codexには4つのローカルライフサイクルフックも付けます。Co
 `codexfws`セッションでは、Codexにリモート操作のオン・オフを頼むか、次を実行します。
 
 ```zsh
-afws-remote on       # このMacの共有Codex app-serverで有効化
+afws-remote on       # このMacの共有Codex app-serverで有効化（自分のシェルで実行）
 afws-remote status   # 接続状態を確認
-afws-remote pair     # 端末を追加する短期ペアリングコードを表示
+afws-remote pair     # 端末を追加する短期ペアリングコードを表示（自分のシェルで実行）
 afws-remote off      # リモート操作だけ無効化し、ローカルの会話は継続
 ```
 
@@ -190,11 +194,11 @@ claudefws --bg SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY "学習ジョブを監�
 
 ## セッションの終了
 
-セッションが終了すると、launcherはそのセッションが最後の利用者だったものを解放します。レジストリの記録、そのマウント内で作業している他のセッションがなければSSHFSマウント、そのホスト上に他のセッションがなければ共有SSH接続です。他のセッションがまだ使っているマウントは残します。`~/afws-mounts`の外にあるマウント、つまりclaudefwsが作成していないものも解放しません。
+セッションが終了すると、launcherはそのセッションが最後の利用者だったものを解放します。レジストリの記録、他に使っているセッションがなければ起動したビュー、他に必要とするセッションがなければ`afws-lab`が起動したJupyterLab、そのホスト上に他のセッションがなければ共有SSH接続です。他のセッションがまだ使っているビューは残します。`~/afws-mounts`の外にあるマウント、つまりlauncherが作成していないものも解放しません。
 
 対話型セッションでは、独立したwatchdogも起動します。`claudefws`または`codexfws`のlauncherが`kill -9`やクラッシュで終了した場合、watchdogは生き残ったエージェントプロセスの終了を待ち、通常終了時と同じ「最後の利用者か」の確認と後片付けを行います。他の登録済みセッションが使っているワークスペースはアンマウントしません。
 
-バックグラウンドClaudeセッションにはlauncherのwatchdogがないため、マウントを残します。またwatchdog自体も停止した場合や、macOSがアンマウントを拒否した場合には残ることがあります。その場合は明示的に解放します。
+バックグラウンドClaudeセッションにはlauncherのwatchdogがないため、起動したビューを残します。またwatchdog自体も停止した場合や、macOSがアンマウントを拒否した場合には残ることがあります。その場合は明示的に解放します。
 
 ```zsh
 afws-umount --list                                  # マウントと利用中のセッション数
@@ -212,11 +216,47 @@ afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 
 `codexfws`と`claudefws`は起動時にも同じ検査を行い、読み取りエラーによって切断が確定した既存マウントを、エージェント起動前に自動で張り直します。正常なマウントに対しては、`--force`を明示しない限り何もしません。切断が確認できたマウントは、セッションがより広いマウントのサブディレクトリを使っている場合も、元のマウント元とマウントポイントを保って張り直します。交換時は、長時間動作した共有SSH接続の故障を引き継がないよう、独立した新しい接続を使います。鍵認証が使えず、正常だと確認済みの共有接続が必要な場合だけ`--reuse-connection`を指定します。マウントを手動で外した後など、交換対象を自動検出できない場合は`--fresh-connection`を指定できます。応答タイムアウトは、単に低速で冷えたマウントかもしれないため、自動交換しません。それを交換する場合は利用者の承認と`afws-remount --force`が必要です。簡易な読み取りは成功しても内容が明らかに誤っている場合も、同じ明示オプションで修復できます。複数の生存セッションが共有していても、読み取りエラーが確定したマウントは全セッションのために自動修復します。応答中またはタイムアウトだけのマウントを交換する場合は、全セッションの中断を利用者が明示的に承認した`--force-shared`が必要です。通常の`umount`が固まった場合も期限を設け、対象のSSHFSだけを停止して強制解除へ進みます。修復後も実行中のエージェントが古い作業ディレクトリを保持して`ENXIO`を返す場合は、そのエージェントを終了して起動し直します。
 
-セッション終了後もマウントを残したい場合（続けて別のセッションを起動するときなど）は、その起動時に`AFWS_KEEP_MOUNT=1`を指定します。
+セッション終了後もビューを残したい場合（続けて別のセッションを起動するときなど）は、その起動時に`AFWS_KEEP_MOUNT=1`を指定します。
+
+## プロジェクトを読む：JupyterLab
+
+ビューはファイル名を眺めるためのもので、中身を読むためのものが`afws-lab`です。ワークステーション上の専用`tmux`セッションでJupyterLabを動かし、ローカルのポートへ転送します。
+
+```zsh
+afws-lab                    # 起動する。動いていれば修復して再利用する
+afws-lab --force            # 状態を判定できなかった層も作り直す
+afws-lab status             # 層ごとの健全性と、壊れている層への次の一手
+afws-lab open               # ブラウザで開く
+afws-lab list               # すべてのlabと、それぞれの利用セッション
+afws-lab stop
+afws-lab stop --orphaned    # 生存セッションが使っていないlabを停止する
+afws-lab -n                 # 変更内容だけ表示し、何も変えない
+```
+
+サーバがワークステーション上で動くため、プロジェクトをワークステーション上のまま読みます。symlinkは解決され、画像やPDFは描画され、ノートブックはリモートのカーネルで動き、Markdownは画像込みで整形されます。マウントが遅い・古い・無いことは一切関係しません。
+
+同じホスト・同じリモートディレクトリのセッションで1つを共有し（ビューと同じ共有規則です）、最後の1つが終了した時点で解放されます。`start`は修復経路でもあります。`tmux`セッション、サーバプロセス、転送ポート、HTTPエンドポイントを順に確認し、実際に壊れている層だけを作り直します。そのため接続が切れても再起動ではなく再接続で済み、開いているノートブックは状態を保ちます。
+
+共有マシンでは2点が効きます。ポートは固定しません。JupyterLabが空きポートを選び、`afws-lab`がそれを読み戻すので、他の人と衝突しません。そしてtokenをコマンドラインに載せません。多くのシステムで`ps`は他ユーザから読めるためで、サーバ自身のランタイムファイルから読み取ります。
+
+`afws-lab`はワークステーション側のJupyterLabを`python3 -m jupyterlab`として呼びます。ディストリビューションの`jupyter`コマンドはJupyterLabを含まない旧notebookパッケージであることが多いため、コマンド名ではなくモジュールの有無を確認しています。
+
+## マウント無しで構造化されたファイルツールを使う：MCPサーバ
+
+`lib/afws-fs-mcp.py`はMac側で動くstdio MCPサーバで、セッションの共有SSH接続を通してリモートプロジェクトに届きます。`read_file`、`write_file`、`edit_file`、`list_directory`、`glob`、`grep`、`stat`を提供します。プロジェクトがシェル出力としてしか届かない状況で失われる、構造化された操作を取り戻すためのものです。
+
+`AFWS_SSH_HOST`、`AFWS_REMOTE_DIR`、任意で`AFWS_CONTROL_PATH`と`AFWS_CONTROL_PERSIST`を読みます。いずれもセッションが既にexport済みです。launcherには組み込まれていないので、Claude Codeへ明示的に指定します。
+
+```zsh
+claude --mcp-config '{"mcpServers":{"afws-fs":{"command":"python3",
+  "args":["'"$HOME"'/.local/lib/afws-fs-mcp.py"]}}}'
+```
+
+すべてのパスは`AFWS_REMOTE_DIR`内に閉じ込められます。検査はローカルの文字列判定ではなく、パス解決後にリモート側で行います。ローカルでいくら文字列を調べても分からない形で、symlinkを通ってプロジェクトの外へ出られるためです。`stat`だけはリンクを追跡せず、リンクであることと向き先を報告します。`bin/python3`がプロジェクト外を指す`venv`を、そういうものとして見られるようにするためです。
 
 ## 変更せずに内容だけ確認する
 
-dry-runモードでは、SSHFSのマウント、レジストリへの書き込み、エージェントの起動をいずれも行わず、予定される操作だけを表示します。
+dry-runモードでは、マウント、レジストリへの書き込み、エージェントの起動をいずれも行わず、予定される操作だけを表示します。
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
@@ -239,13 +279,16 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_MOUNT_BASE` | 新規マウントの親ディレクトリ（既定: `~/afws-mounts`） |
 | `AFWS_STATE_DIR` | セッションレジストリの場所（既定: `~/.afws`） |
 | `AFWS_PERMISSION_MODE` | Claude Codeのpermission mode。`claudefws`のみ（既定: `auto`） |
+| `AFWS_NO_AGENT_TEAMS` | この起動ではClaude Codeの実験的Agent Teamsを有効にしません |
 | `AFWS_SESSION_NAME` | 自動生成の代わりに使うセッション名 |
 | `AFWS_REMOTE_LOCK_DIR` | リモート側のロック置き場（既定: `~/.afws-locks`） |
 | `AFWS_NO_CONTROL_MASTER` | 値を設定すると、接続ごとに個別に認証します |
-| `AFWS_KEEP_MOUNT` | 値を設定すると、セッション終了時にマウントを残します |
+| `AFWS_KEEP_MOUNT` | 値を設定すると、セッション終了時にFinder/VS Codeビューを残します |
+| `AFWS_VISIBILITY_MOUNT` | 値を設定すると、既定でFinder/VS Codeビューをマウントします（`claudefws`のみ。`--no-view`が優先） |
 | `AFWS_NO_SHELL_MARKER` | 値を設定すると、ローカル実行への印付けを止めます |
-| `AFWS_ALLOW_HOME_MOUNT` | 値を設定すると、ホームディレクトリの警告を抑止します |
 | `AFWS_ADD_DIR` | セッションが追加で読めるローカルディレクトリ。`:`区切り（`claudefws`のみ） |
+| `AFWS_REMOTE_ASSUME_YES` | `afws-remote on`と`pair`の端末確認を省きます。自分のスクリプト用であり、agentセッションが確認を回避するためのものではありません |
+| `AFWS_CODEX_AUTO_REVIEW` | 値を設定すると、Codexの承認要求をセッション内で判断させず、Codex自身の審査agentに回します（`codexfws`のみ） |
 | `AFWS_KEEP_CONTROL_MASTER` | 値を設定すると、最後のセッション終了後も共有接続を開いたままにします |
 | `AFWS_CONTROL_PERSIST` | 共有SSH接続が無通信で維持される秒数（既定: 600、`AFWS_KEEP_CONTROL_MASTER`指定時は28800） |
 | `AFWS_PROBE_TIMEOUT_SECONDS` | 既存マウントが最初の読み取りに応答するまで待つ秒数（既定: 20） |
@@ -254,6 +297,8 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 セッション内では、launcherが`AFWS_SSH_HOST`、`AFWS_REMOTE_DIR`、`AFWS_LOCAL_WORKSPACE`もexportします。これにより`afws-run`と`afws-lock`を接続名なしで使えます。
 
 permission modeをそのセッションだけ変更する場合は、起動時に指定します。指定できるのはClaude Codeが受け付ける値、すなわち`acceptEdits`、`auto`、`bypassPermissions`、`manual`、`dontAsk`、`plan`です。認識できない値は、マウントを行う前に拒否します。
+
+`claudefws`は既定でClaude Code Agent Teamsと、プロジェクト単位で共有するnative task listを有効にします。実験的機能をポリシーや互換性の都合で無効のままにする場合は`AFWS_NO_AGENT_TEAMS=1`を指定します。その場合もAFWSの組織台帳、peer配送、lifecycle hookは動作します。
 
 ```zsh
 AFWS_PERMISSION_MODE=manual claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY

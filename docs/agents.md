@@ -3,17 +3,23 @@
 [日本語](agents.ja.md) · [README](../README.md)
 
 One installation provides two launchers. They share everything about reaching
-the workstation — the mount, the shared SSH connection, the registry, the locks
-— and differ only in the agent they start and in what that agent exposes.
+the workstation — `afws-run`, the shared SSH connection, the registry, the
+locks — and differ only in the agent they start and in what that agent exposes.
+Both are remote-first: the remote tree is authoritative and neither reads the
+project through a mount.
 
 | | `claudefws` (Claude Code) | `codexfws` (Codex CLI) |
 | --- | --- | --- |
-| Mount, shared SSH connection, release on exit | yes | yes |
+| Remote-first: the project is reached through `afws-run` | yes | yes |
+| Shared SSH connection, release on exit | yes | yes |
+| Finder/VS Code view | opt-in, `--view` | yes, on every launch |
+| `afws-lab` (JupyterLab on the workstation) | yes | yes |
 | `afws-run`, `afws-lock`, `afws-remount`, `afws-umount` | yes | yes |
 | Listed in `afws-peers` with its host and directory | yes | yes |
 | Session name the agent itself knows | yes, via `--name` | yes, via launcher instructions |
 | Status column in `afws-peers` | native `busy` / `idle` / `waiting` | hook-derived `busy` / `idle` |
-| Messaged by name from another session | yes, `SendMessage` from Claude | yes, `afws-message` to Codex |
+| Messaged by name from another independent session | yes, durable `afws-message` inbox | yes, `afws-message` via `codex queue` |
+| Native multi-agent execution | experimental Agent Teams, enabled by `claudefws` | subagents managed by Codex |
 | Locally-run shell commands labelled `[local]` | yes | no |
 | Background session (`--bg`) | yes | no |
 | Extra local directories (`AFWS_ADD_DIR`) | yes | yes |
@@ -44,11 +50,12 @@ The remaining differences follow from the CLIs, measured against Codex CLI
   browser with no JSON output. Codex liveness therefore comes from the launcher
   process; hooks supply `busy` and `idle` state plus a short activity label.
   Claude status comes from `claude agents --json`.
-- **Different messaging paths.** `afws-message` resolves a live registry name
-  to the hooked Codex thread UUID and calls `codex queue`. An idle session
-  starts a turn; a busy session processes the queued message after its current
-  turn. Claude-to-Claude still uses `ListAgents` and `SendMessage`. There is no
-  external CLI path here for Codex-to-Claude messages.
+- **Different messaging adapters.** `afws-message` resolves a live registry
+  name. For Codex it calls `codex queue` with the hooked thread UUID. For Claude
+  it writes an owner-only durable inbox that a lifecycle hook injects on session
+  start, user input, or stop. Native `ListAgents` and `SendMessage` are reserved
+  for teammates in the current Claude Agent Team, not arbitrary independent
+  Claude sessions.
 - **No shell wrapper.** Claude Code runs shell commands through
   `CLAUDE_CODE_SHELL_PREFIX`, which is how `[local]` gets attached. Codex CLI has
   no equivalent, so in a Codex session nothing marks a command as having run on
@@ -57,8 +64,9 @@ The remaining differences follow from the CLIs, measured against Codex CLI
 ## What this means in practice
 
 A Codex session participates fully in everything that protects the workstation:
-it shares one mount and one authenticated connection with any other session on
-the same host, it takes and respects `afws-lock`, and it releases what it was
+it shares one authenticated connection with any other session on the same host,
+and one Finder/VS Code view and one JupyterLab with any session on the same
+remote directory, it takes and respects `afws-lock`, and it releases what it was
 the last user of when it exits. A Claude session on the same workstation can see
 it in `afws-peers` and avoid its directory.
 
@@ -71,10 +79,12 @@ on demand; hooks do not put the session list into the model's context.
 ## Mixing the two
 
 Nothing stops a Claude session and a Codex session from working on the same
-workstation, and on the same directory. They share the mount, so they are
-looking at the same files through the same SSHFS connection, and `afws-lock`
-serialises the GPU between them. Codex can receive queued messages from either
-agent, but cannot use this tool to message a Claude recipient. Shared-file edits
-still need coordination and locks where appropriate.
+workstation, and on the same directory. Both reach it through `afws-run`, so
+they are acting on the same remote tree directly rather than through a
+filesystem layer, they share a view and a lab if either started one, and
+`afws-lock` serialises the GPU between them. Either agent can queue a direct message for
+the other through `afws-message`. Claude delivery is hook-driven rather than an
+immediate external interrupt, so queue receipt is not acknowledgement.
+Shared-file edits still need coordination and locks where appropriate.
 
 See [Multiple sessions](sessions.md) for the coordination model itself.

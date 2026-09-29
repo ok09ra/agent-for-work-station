@@ -1,0 +1,1085 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-lab"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || {
+  print -u2 -r -- "afws-lab: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+}
+
+readonly PEERS="${SCRIPT_DIR}/afws-peers"
+
+# Records live beside the mount records and are keyed the same way: by host and
+# remote directory, not by session. One JupyterLab serves every session working
+# on the same project, exactly as one mount does.
+AFWS_LAB_RECORD_DIR="${AFWS_STATE_DIR}/labs"
+# Every tmux session this command may kill begins with this. A name that does
+# not is somebody's own work and is never touched. See lab_tmux_name_is_ours.
+readonly LAB_TMUX_PREFIX="afws-lab-"
+# Remote JupyterLab output goes here so a server that died before writing its
+# runtime file can still say why. Quoted so the tilde reaches the remote shell.
+readonly LAB_REMOTE_STATE_DIR="~/.afws-lab"
+# How long the server is given to write its runtime file after tmux starts it.
+: ${AFWS_LAB_START_TIMEOUT_SECONDS:=45}
+# A remote probe that says nothing within this is "unknown", not "dead".
+: ${AFWS_LAB_PROBE_TIMEOUT_SECONDS:=20}
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-lab [start] [--force] [-n|--dry-run]"
+  print -r -- "  afws-lab stop [--orphaned] [-n|--dry-run]"
+  print -r -- "  afws-lab status"
+  print -r -- "  afws-lab open"
+  print -r -- "  afws-lab list"
+  print -r -- ""
+  print -r -- "Runs JupyterLab on the workstation and forwards it to this Mac, so the"
+  print -r -- "project can be browsed -- images, rendered Markdown, notebooks -- without"
+  print -r -- "reading it through a local mount. The server runs remotely, so a mount"
+  print -r -- "that is slow, stale, or absent does not affect it."
+  print -r -- ""
+  print -r -- "start is also the repair: it checks each layer and rebuilds only the ones"
+  print -r -- "that are actually broken. A running lab is reused, not restarted."
+  print -r -- ""
+  print -r -- "Options:"
+  print -r -- "  --force        Rebuild even when a layer's state could not be determined."
+  print -r -- "  --orphaned     Stop labs no live session is using (stop only)."
+  print -r -- "  -n, --dry-run  Print what would change, change nothing."
+  print -r -- ""
+  print -r -- "One lab serves every session on the same host and remote directory. It is"
+  print -r -- "released when the last of those sessions exits."
+}
+
+action=start
+dry_run=0
+force=0
+orphaned=0
+
+(( $# > 0 )) || set -- start
+case "${1-}" in
+  -h|--help) usage; exit 0 ;;
+  start|stop|status|open|list) action="$1"; shift ;;
+  -*) ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    --force) force=1; shift ;;
+    --orphaned) orphaned=1; shift ;;
+    *) afws_die "unknown option: $1" ;;
+  esac
+done
+
+if (( force )) && [[ "$action" != start ]]; then
+  afws_die "--force applies to start"
+fi
+if (( orphaned )) && [[ "$action" != stop ]]; then
+  afws_die "--orphaned applies to stop"
+fi
+
+# --- session ---------------------------------------------------------------
+# Deliberately agent-independent. Codex and Claude sessions have the same claim
+# on a way to look at the project; nothing here touches an agent's own tooling.
+
+lab_ssh_host=""
+lab_remote_dir=""
+
+resolve_session() {
+  local record
+
+  [[ -n "${AFWS_SESSION_NAME-}" ]] || afws_die "run this inside a work-station session
+Outside one there is no host or remote directory to work from."
+  afws_validate_session_name "$AFWS_SESSION_NAME"
+  record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+  [[ -r "$record" ]] || afws_die "session is no longer registered"
+  afws_read_record "$record" || afws_die "could not read session record"
+  [[ "$afws_record_session_name" == "$AFWS_SESSION_NAME" ]] ||
+    afws_die "session record name mismatch"
+
+  # The record is authoritative, not the environment: a session's host and
+  # directory are fixed when it launches and cannot be pointed elsewhere later.
+  lab_ssh_host="$afws_record_ssh_host"
+  lab_remote_dir="$afws_record_remote_dir"
+  [[ -n "$lab_ssh_host" && -n "$lab_remote_dir" ]] ||
+    afws_die "the session record names no host or remote directory"
+  afws_validate_host "$lab_ssh_host"
+}
+
+# --- identity --------------------------------------------------------------
+
+# The mount point is not used as a path here; it is the key afws-peers already
+# counts sessions by, so reusing it means the lab is shared and released on
+# exactly the same terms as the mount, with no second notion of "who is using
+# this" to drift out of step.
+lab_mount_point() {
+  print -r -- "${AFWS_MOUNT_BASE}/$1$2"
+}
+
+lab_record_file() {
+  print -r -- "${AFWS_LAB_RECORD_DIR}/$1$2.conf"
+}
+
+# tmux names are flat, so the host and directory have to be folded into one
+# token. afws_sanitize_component truncates, which two sibling directories can
+# collide through, so a short digest of the untruncated pair is appended. The
+# result is stable: the same project always resolves to the same name, which is
+# what makes "is it already running" answerable without any local state.
+lab_tmux_session_name() {
+  local readable digest
+
+  readable="$(afws_sanitize_component "$1$2")"
+  digest="$(print -rn -- "$1
+$2" | shasum -a 256 | awk '{print substr($1,1,8)}')"
+  print -r -- "${LAB_TMUX_PREFIX}${readable}-${digest}"
+}
+
+# Two conditions, both required, before anything may be killed: the name is in
+# this command's namespace, and it is the name this project's record holds. The
+# workstation carries long-lived tmux sessions belonging to the user -- 'ngof',
+# 'gror_remaining164_esm15b_tf32_v1' -- and neither a bug here nor a corrupt
+# record should be able to reach them.
+lab_tmux_name_is_ours() {
+  local candidate="$1" expected="$2"
+
+  [[ "$candidate" == "${LAB_TMUX_PREFIX}"* ]] || return 1
+  [[ "$candidate" == "$expected" ]] || return 1
+  [[ "$candidate" != *[[:space:]]* ]] || return 1
+  return 0
+}
+
+# --- record ----------------------------------------------------------------
+# The token is deliberately absent. It is read from the workstation whenever it
+# is needed, so this Mac never stores a credential that can go stale or leak,
+# and the port is a cache: the server's own runtime file is authoritative
+# because a restarted server picks a new one.
+
+lab_record_ssh_host=""
+lab_record_remote_dir=""
+lab_record_tmux=""
+lab_record_remote_port=""
+lab_record_local_port=""
+lab_record_remote_pid=""
+lab_record_started_at=""
+
+lab_read_lab_record() {
+  local record="$1" line key value
+
+  lab_record_ssh_host=""
+  lab_record_remote_dir=""
+  lab_record_tmux=""
+  lab_record_remote_port=""
+  lab_record_local_port=""
+  lab_record_remote_pid=""
+  lab_record_started_at=""
+  [[ -r "$record" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      ssh_host) lab_record_ssh_host="$value" ;;
+      remote_dir) lab_record_remote_dir="$value" ;;
+      tmux_session) lab_record_tmux="$value" ;;
+      remote_port) lab_record_remote_port="$value" ;;
+      local_port) lab_record_local_port="$value" ;;
+      remote_pid) lab_record_remote_pid="$value" ;;
+      started_at) lab_record_started_at="$value" ;;
+    esac
+  done < "$record"
+  [[ -n "$lab_record_ssh_host" && -n "$lab_record_remote_dir" && -n "$lab_record_tmux" ]]
+}
+
+lab_write_lab_record() {
+  local record="$1" ssh_host="$2" remote_dir="$3" tmux_session="$4"
+  local remote_port="$5" local_port="$6" remote_pid="$7"
+
+  mkdir -p "${record:h}"
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_LAB_RECORD_DIR" 2>/dev/null || true
+  (
+    umask 077
+    {
+      print -r -- "ssh_host=${ssh_host}"
+      print -r -- "remote_dir=${remote_dir}"
+      print -r -- "tmux_session=${tmux_session}"
+      print -r -- "remote_port=${remote_port}"
+      print -r -- "local_port=${local_port}"
+      print -r -- "remote_pid=${remote_pid}"
+      print -r -- "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$record"
+  )
+}
+
+# --- remote ----------------------------------------------------------------
+
+lab_ssh_status=0
+lab_ssh_output=""
+
+# ControlMaster=auto does not merely reuse a socket, it creates one, and ssh
+# fails outright -- exit 255, "unix_listener: cannot bind to path" -- when the
+# directory that socket would live in is absent. Only afws_open_session_connection
+# creates it, so a command that runs before any launcher has opened a shared
+# connection would otherwise be unable to reach the workstation at all.
+lab_ensure_control_dir() {
+  [[ -n "${AFWS_NO_CONTROL_MASTER-}" ]] && return 0
+  mkdir -p "$AFWS_CONTROL_DIR" 2>/dev/null || return 0
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_CONTROL_DIR" 2>/dev/null || true
+  return 0
+}
+
+# Runs a remote command over the connection a launcher authenticated, with a
+# deadline, and leaves its output in lab_ssh_output.
+#
+# The output deliberately does not come back through command substitution.
+# $(...) runs in a subshell, so the exit status recorded there would never
+# reach the caller, and a caller reading a stale status cannot tell "the
+# workstation said no" from "the workstation said nothing" -- the one
+# distinction everything below depends on.
+lab_ssh() {
+  local -a options
+  local outfile
+
+  outfile="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-lab-out.XXXXXX")" ||
+    afws_die "could not create a temporary file for the remote call"
+  lab_ensure_control_dir
+  afws_control_ssh_options "$lab_ssh_host"
+  options=("${afws_ssh_control_options[@]}")
+  set +e
+  afws_run_with_timeout "$AFWS_LAB_PROBE_TIMEOUT_SECONDS" \
+    ssh "${options[@]}" "$lab_ssh_host" "$@" > "$outfile" 2>/dev/null
+  lab_ssh_status=$?
+  set -e
+  lab_ssh_output="$(<"$outfile")"
+  rm -f "$outfile"
+  afws_report_control_fallback "$lab_ssh_host" "$lab_ssh_status"
+  return "$lab_ssh_status"
+}
+
+# Same, with a script on standard input. Used for the runtime-file probe: the
+# token comes back down the pipe and never appears in any argument vector, so
+# the other accounts on the workstation cannot read it out of ps.
+#
+# The script is handed over through a file rather than a pipeline because the
+# call has to carry the same deadline as every other remote call here, and
+# afws_run_with_timeout supervises one command, not a pipeline.
+lab_ssh_script_file=""
+lab_ssh_script_arguments=()
+
+lab_ssh_script_invoke() {
+  local -a options
+
+  lab_ensure_control_dir
+  afws_control_ssh_options "$lab_ssh_host"
+  options=("${afws_ssh_control_options[@]}")
+  ssh "${options[@]}" "$lab_ssh_host" \
+    "python3 - ${lab_ssh_script_arguments[*]}" < "$lab_ssh_script_file"
+}
+
+lab_ssh_script() {
+  local script="$1" outfile
+  shift
+
+  lab_ssh_script_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-lab.XXXXXX")" ||
+    afws_die "could not create a temporary file for the remote probe"
+  print -rn -- "$script" > "$lab_ssh_script_file"
+  lab_ssh_script_arguments=("$@")
+  outfile="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-lab-out.XXXXXX")" ||
+    afws_die "could not create a temporary file for the remote probe"
+
+  set +e
+  afws_run_with_timeout "$AFWS_LAB_PROBE_TIMEOUT_SECONDS" \
+    lab_ssh_script_invoke > "$outfile" 2>/dev/null
+  lab_ssh_status=$?
+  set -e
+  lab_ssh_output="$(<"$outfile")"
+  rm -f "$lab_ssh_script_file" "$outfile"
+  lab_ssh_script_file=""
+  afws_report_control_fallback "$lab_ssh_host" "$lab_ssh_status"
+  return "$lab_ssh_status"
+}
+
+# The workstation's ps is readable by every other account on it, so a token
+# passed as an argument would be legible to all of them. JupyterLab is left to
+# generate its own and write it to its runtime file, which is owner-only, and
+# that file is read over the connection rather than reproduced on a command
+# line. The same file carries the port the server actually bound, which is the
+# only trustworthy answer once the server has been restarted.
+read -r -d '' LAB_RUNTIME_PROBE <<'PROBE' || true
+import glob, json, os, sys
+
+target = sys.argv[1]
+runtime_dir = ""
+try:
+    from jupyter_core.paths import jupyter_runtime_dir
+    runtime_dir = jupyter_runtime_dir()
+except Exception:
+    runtime_dir = os.path.expanduser("~/.local/share/jupyter/runtime")
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except Exception:
+        return False
+    return True
+
+
+def normalize(value):
+    return os.path.realpath(os.path.expanduser(value or "")).rstrip("/")
+
+
+target = normalize(target)
+found = None
+for name in sorted(glob.glob(os.path.join(runtime_dir, "jpserver-*.json"))):
+    try:
+        with open(name) as handle:
+            info = json.load(handle)
+    except Exception:
+        continue
+    if normalize(info.get("root_dir", "")) != target:
+        continue
+    pid = info.get("pid")
+    if not pid or not alive(pid):
+        continue
+    found = info
+
+if found is None:
+    print("state=absent")
+    raise SystemExit(0)
+
+print("state=running")
+print("pid=%s" % found.get("pid", ""))
+print("port=%s" % found.get("port", ""))
+print("token=%s" % (found.get("token") or ""))
+print("base_url=%s" % (found.get("base_url") or "/"))
+PROBE
+
+lab_remote_state=unknown
+lab_remote_pid=""
+lab_remote_port=""
+lab_remote_token=""
+lab_remote_base_url="/"
+
+# Sets lab_remote_state to one of:
+#   running  a JupyterLab for this project answered, with its port and token
+#   absent   the workstation answered and there is no such server
+#   unknown  the workstation could not be reached, or did not answer in time
+#
+# The third is kept apart from the second on purpose. Treating "I could not
+# ask" as "it is not there" is how a working server gets replaced during a
+# network blip, and a JupyterLab holds unsaved notebook state.
+lab_probe_remote() {
+  local output line key value
+
+  lab_remote_state=unknown
+  lab_remote_pid=""
+  lab_remote_port=""
+  lab_remote_token=""
+  lab_remote_base_url="/"
+
+  set +e
+  lab_ssh_script "$LAB_RUNTIME_PROBE" "${(q)lab_remote_dir}"
+  set -e
+  (( lab_ssh_status == 0 )) || return 0
+  output="$lab_ssh_output"
+
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      state) lab_remote_state="$value" ;;
+      pid) lab_remote_pid="$value" ;;
+      port) lab_remote_port="$value" ;;
+      token) lab_remote_token="$value" ;;
+      base_url) lab_remote_base_url="$value" ;;
+    esac
+  done <<< "$output"
+
+  [[ "$lab_remote_state" == running || "$lab_remote_state" == absent ]] ||
+    lab_remote_state=unknown
+  if [[ "$lab_remote_state" == running && -z "$lab_remote_port" ]]; then
+    lab_remote_state=unknown
+  fi
+}
+
+# Sets lab_tmux_state to present, absent, or unknown.
+#
+# tmux has-session exits 1 for "no such session", which is the same exit ssh
+# uses when it could not run anything at all. Collapsing those two would report
+# an unreachable workstation as an absent server, and absent is the answer that
+# authorizes starting a replacement. So the remote command always succeeds and
+# names the outcome instead.
+lab_tmux_state=unknown
+
+lab_probe_tmux() {
+  lab_tmux_state=unknown
+  set +e
+  lab_ssh "tmux has-session -t ${(q)1} >/dev/null 2>&1 && echo present || echo absent"
+  set -e
+  (( lab_ssh_status == 0 )) || return 0
+  case "$lab_ssh_output" in
+    *present*) lab_tmux_state=present ;;
+    *absent*) lab_tmux_state=absent ;;
+  esac
+}
+
+
+# --- local forward ---------------------------------------------------------
+# The forward rides on the shared connection rather than opening one of its
+# own: ssh -O forward adds it to the master that is already authenticated, so
+# there is no extra process to supervise and no second credential prompt.
+
+lab_forward_socket() {
+  afws_resolve_control_path "$lab_ssh_host"
+}
+
+lab_control_master_is_usable() {
+  local socket
+  socket="$(lab_forward_socket)"
+  [[ -n "$socket" && -S "$socket" ]] || return 1
+  ssh -S "$socket" -O check "$lab_ssh_host" >/dev/null 2>&1
+}
+
+lab_forward_is_open() {
+  local local_port="$1"
+  case "$local_port" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  # A listening socket on this Mac is the observable fact. Asking ssh which
+  # forwards it holds is not something -O check reports, so the port is probed
+  # instead; a stale forward and a live one are told apart by the HTTP check.
+  python3 - "$local_port" <<'PY' >/dev/null 2>&1
+import socket, sys
+probe = socket.socket()
+probe.settimeout(2)
+try:
+    probe.connect(("127.0.0.1", int(sys.argv[1])))
+except Exception:
+    sys.exit(1)
+finally:
+    probe.close()
+sys.exit(0)
+PY
+}
+
+lab_pick_local_port() {
+  local preferred="${1-}"
+
+  python3 - "$preferred" <<'PY'
+import socket, sys
+
+preferred = sys.argv[1] if len(sys.argv) > 1 else ""
+
+
+def free(port):
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", port))
+    except Exception:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+if preferred.isdigit() and free(int(preferred)):
+    print(preferred)
+    raise SystemExit(0)
+
+# Letting the kernel choose leaves a gap between closing the probe socket and
+# ssh binding it. Nothing here can close that gap; a collision simply means the
+# forward fails and start is run again, which is cheap.
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+chosen = probe.getsockname()[1]
+probe.close()
+print(chosen)
+PY
+}
+
+lab_add_forward() {
+  local local_port="$1" remote_port="$2" socket
+
+  socket="$(lab_forward_socket)"
+  if lab_control_master_is_usable; then
+    ssh -S "$socket" -O forward \
+      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$lab_ssh_host" \
+      >/dev/null 2>&1 && return 0
+    return 1
+  fi
+
+  # No master to ride on. A standalone forward is detached so it outlives this
+  # command, and it is given the same keepalive the mounts use so a dead link
+  # is noticed rather than leaving a socket that accepts and never answers.
+  mkdir -p "$AFWS_LOG_DIR"
+  chmod 700 "$AFWS_STATE_DIR" "$AFWS_LOG_DIR" 2>/dev/null || true
+  afws_detached "${AFWS_LOG_DIR}/lab-${lab_ssh_host}-${local_port}.forward.log" \
+    ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$lab_ssh_host"
+  local waited=0
+  while (( waited < 10 )); do
+    lab_forward_is_open "$local_port" && return 0
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+  return 1
+}
+
+lab_cancel_forward() {
+  local local_port="$1" remote_port="$2" socket
+
+  case "$local_port" in
+    ''|*[!0-9]*|0) return 0 ;;
+  esac
+  socket="$(lab_forward_socket)"
+  if [[ -n "$socket" && -S "$socket" ]]; then
+    ssh -S "$socket" -O cancel \
+      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$lab_ssh_host" \
+      >/dev/null 2>&1 || true
+  fi
+  # A standalone forward has no control channel to cancel through, so it is
+  # matched by the exact forward specification it was started with. Nothing
+  # else on this Mac carries that string.
+  local pattern="127.0.0.1:${local_port}:127.0.0.1:${remote_port}"
+  local process_pid process_command
+  while read -r process_pid process_command; do
+    [[ "$process_command" == ssh\ * || "$process_command" == */ssh\ * ]] || continue
+    [[ "$process_command" == *"$pattern"* ]] || continue
+    kill -TERM "$process_pid" 2>/dev/null || true
+  done < <(ps -axo pid=,command= 2>/dev/null)
+  return 0
+}
+
+# --- HTTP ------------------------------------------------------------------
+
+# /api/status is served without authentication, so this says whether a server
+# is answering without the token having to travel anywhere.
+lab_http_ok() {
+  local local_port="$1" base_url="${2:-/}"
+
+  case "$local_port" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  python3 - "http://127.0.0.1:${local_port}${base_url%/}/api/status" <<'PY' >/dev/null 2>&1
+import sys, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+        sys.exit(0 if response.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+lab_url() {
+  local local_port="$1" base_url="${2:-/}" token="${3-}"
+  local prefix="http://127.0.0.1:${local_port}${base_url%/}/lab"
+
+  if [[ -n "$token" ]]; then
+    print -r -- "${prefix}?token=${token}"
+  else
+    print -r -- "$prefix"
+  fi
+}
+
+# --- preflight -------------------------------------------------------------
+
+lab_check_remote_prerequisites() {
+  local output
+
+  set +e
+  lab_ssh "python3 -m jupyterlab --version 2>&1"
+  set -e
+  output="$lab_ssh_output"
+  if (( lab_ssh_status != 0 )); then
+    if (( lab_ssh_status == 124 )); then
+      afws_die "the workstation did not answer within ${AFWS_LAB_PROBE_TIMEOUT_SECONDS} seconds
+Nothing was started. Check the connection, then try again."
+    fi
+    afws_die "JupyterLab is not usable on ${lab_ssh_host} as 'python3 -m jupyterlab'
+It said:
+$(print -r -- "$output" | sed 's/^/  /')
+Note that a 'jupyter' on PATH is not enough: a distribution's /usr/bin/jupyter
+can be the classic notebook package, which contains no JupyterLab at all. This
+needs the interpreter that has jupyterlab installed:
+  afws-run python3 -m pip show jupyterlab"
+  fi
+}
+
+lab_warn_about_remote_disk() {
+  local usage_line used
+
+  set +e
+  lab_ssh "df -P ${(q)lab_remote_dir} 2>/dev/null | tail -1"
+  set -e
+  (( lab_ssh_status == 0 )) || return 0
+  usage_line="$lab_ssh_output"
+  used="$(print -r -- "$usage_line" | awk '{print $5}' | tr -d '%')"
+  case "$used" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  (( used >= 95 )) || return 0
+  print -u2 -r -- "${AFWS_PROGRAM}: the filesystem holding ${lab_remote_dir} is ${used}% full."
+  print -u2 -r -- "  JupyterLab writes settings, checkpoints, and its runtime file; a full"
+  print -u2 -r -- "  filesystem stops it shortly after it starts. Free space before relying on it."
+}
+
+# --- start -----------------------------------------------------------------
+
+lab_start_remote() {
+  local tmux_session="$1" inner start_command waited=0
+
+  # The pane runs the server directly, so the tmux session ending means the
+  # server ended -- a cheaper signal than any probe. Output is also written to
+  # a file, because a server that dies before writing its runtime file leaves
+  # nothing else to read, and a dead pane takes its scrollback with it.
+  inner="mkdir -p ${LAB_REMOTE_STATE_DIR} && cd ${(q)lab_remote_dir} && exec python3 -m jupyterlab"
+  inner+=" --no-browser"
+  # Bound to the loopback interface and never anything else. The workstation is
+  # shared -- other accounts are logged in -- and a notebook server reachable
+  # from the network is a shell for whoever finds it. The forward is what makes
+  # it reachable from this Mac, and that requires an authenticated connection.
+  inner+=" --ServerApp.ip=127.0.0.1"
+  inner+=" --ServerApp.open_browser=False"
+  # No port is chosen here. Asking for a specific one on a shared machine means
+  # racing every other account for it; letting the server walk upwards until it
+  # finds a free one, and then reading back what it took, cannot collide.
+  inner+=" --ServerApp.port_retries=100"
+  inner+=" 2>&1 | tee -a ${LAB_REMOTE_STATE_DIR}/${tmux_session}.log"
+
+  # tmux new-session -d fails when the name already exists. That failure is the
+  # exclusion this relies on: two sessions racing to start the same lab cannot
+  # both create one, and no lock file is needed to say so.
+  start_command="tmux new-session -d -s ${(q)tmux_session} ${(q)inner}"
+
+  set +e
+  lab_ssh "$start_command"
+  set -e
+  if (( lab_ssh_status != 0 )); then
+    # Losing the race is success: another session created the session this one
+    # was about to create, and tmux refused the duplicate name.
+    lab_probe_tmux "$tmux_session"
+    case "$lab_tmux_state" in
+      present) ;;
+      absent)
+        afws_die "could not start JupyterLab on ${lab_ssh_host}
+The tmux session ${tmux_session} was neither created nor found. Check the
+workstation's tmux, then try again:
+  afws-run tmux ls"
+        ;;
+      *)
+        afws_die "could not tell whether JupyterLab started on ${lab_ssh_host}
+The workstation stopped answering part-way through. A server may or may not be
+running; nothing here will guess. Check with: afws-lab status"
+        ;;
+    esac
+  fi
+
+  while (( waited < AFWS_LAB_START_TIMEOUT_SECONDS )); do
+    lab_probe_remote
+    [[ "$lab_remote_state" == running ]] && return 0
+    lab_probe_tmux "$tmux_session"
+    if [[ "$lab_tmux_state" == absent ]]; then
+      afws_die "JupyterLab exited immediately on ${lab_ssh_host}
+Its output was kept on the workstation; read it with:
+  afws-run tail -40 ${LAB_REMOTE_STATE_DIR#\~/}/${tmux_session}.log"
+    fi
+    afws_pause_seconds 2
+    waited=$(( waited + 2 ))
+  done
+
+  afws_die "JupyterLab did not report a port within ${AFWS_LAB_START_TIMEOUT_SECONDS} seconds
+The tmux session ${tmux_session} is still running on ${lab_ssh_host}; it was not
+stopped. Read its output with:
+  afws-run tail -40 ${LAB_REMOTE_STATE_DIR#\~/}/${tmux_session}.log
+Then either retry, or stop it with: afws-lab stop"
+}
+
+do_start() {
+  local record tmux_session local_port
+
+  resolve_session
+  record="$(lab_record_file "$lab_ssh_host" "$lab_remote_dir")"
+  tmux_session="$(lab_tmux_session_name "$lab_ssh_host" "$lab_remote_dir")"
+
+  if (( dry_run )); then
+    print -r -- "Would use JupyterLab for ${lab_ssh_host}:${lab_remote_dir}"
+    print -r -- "  remote tmux session: ${tmux_session}"
+    print -r -- "  started as: python3 -m jupyterlab --no-browser --ServerApp.ip=127.0.0.1"
+    print -r -- "  port and token read from the server's own runtime file"
+    print -r -- "  forwarded to this Mac over the shared SSH connection"
+    print -r -- "  record: ${record}"
+    return 0
+  fi
+
+  lab_probe_remote
+
+  if [[ "$lab_remote_state" == unknown ]]; then
+    if (( ! force )); then
+      afws_die "could not tell whether JupyterLab is running on ${lab_ssh_host}
+The workstation did not answer, so nothing was changed. A server may well be
+running with notebooks open; starting a second one or tearing this one down on
+a guess is worse than waiting. Retry when the connection is back, or override
+deliberately with: afws-lab start --force"
+    fi
+    print -r -- "The workstation could not be reached; --force was given, so continuing."
+  fi
+
+  if [[ "$lab_remote_state" != running ]]; then
+    lab_check_remote_prerequisites
+    lab_warn_about_remote_disk
+    print -r -- "Starting JupyterLab on ${lab_ssh_host}:${lab_remote_dir}"
+    lab_start_remote "$tmux_session"
+  else
+    print -r -- "Reusing the JupyterLab already running on ${lab_ssh_host} (pid ${lab_remote_pid})."
+  fi
+
+  # The port is taken from the record only as a preference, so a lab that keeps
+  # running keeps the same local address across repairs and the browser tab a
+  # person left open goes on working.
+  local_port=""
+  if lab_read_lab_record "$record"; then
+    local_port="$lab_record_local_port"
+  fi
+  if ! lab_forward_is_open "$local_port"; then
+    local_port="$(lab_pick_local_port "$local_port")"
+    lab_add_forward "$local_port" "$lab_remote_port" ||
+      afws_die "could not forward ${lab_remote_port} from ${lab_ssh_host} to this Mac
+JupyterLab is still running on the workstation and was not stopped. This is a
+local failure only; retry with: afws-lab start"
+    print -r -- "Forwarded ${lab_ssh_host}:${lab_remote_port} to 127.0.0.1:${local_port}"
+  fi
+
+  # A port that accepts a connection is not the same as a server that answers.
+  # A forward left over from a previous server accepts and then fails, and only
+  # an actual request tells the two apart.
+  if ! lab_http_ok "$local_port" "$lab_remote_base_url"; then
+    lab_cancel_forward "$local_port" "$lab_remote_port"
+    local_port="$(lab_pick_local_port)"
+    lab_add_forward "$local_port" "$lab_remote_port" ||
+      afws_die "could not replace the forward to ${lab_ssh_host}
+JupyterLab is still running on the workstation and was not stopped."
+    lab_http_ok "$local_port" "$lab_remote_base_url" ||
+      afws_die "the forward is open but JupyterLab did not answer on it
+The server is running on ${lab_ssh_host} (pid ${lab_remote_pid}, port
+${lab_remote_port}) and was not stopped. Read its output with:
+  afws-run tail -40 ${LAB_REMOTE_STATE_DIR#\~/}/${tmux_session}.log"
+  fi
+
+  lab_write_lab_record "$record" "$lab_ssh_host" "$lab_remote_dir" "$tmux_session" \
+    "$lab_remote_port" "$local_port" "$lab_remote_pid"
+
+  print -r -- ""
+  print -r -- "JupyterLab is ready:"
+  print -r -- "  $(lab_url "$local_port" "$lab_remote_base_url" "$lab_remote_token")"
+  print -r -- ""
+  print -r -- "Open it with: afws-lab open"
+  print -r -- "It serves every session on ${lab_ssh_host}:${lab_remote_dir} and is released"
+  print -r -- "when the last of them exits."
+}
+
+# --- stop ------------------------------------------------------------------
+
+# Returns 0 when the lab was released, 1 when it was deliberately left running.
+lab_stop_one() {
+  local record="$1" announce="${2:-1}"
+  local tmux_session remote_port local_port waited=0
+
+  lab_read_lab_record "$record" || {
+    rm -f "$record" 2>/dev/null || true
+    return 0
+  }
+  tmux_session="$lab_record_tmux"
+  remote_port="$lab_record_remote_port"
+  local_port="$lab_record_local_port"
+
+  lab_ssh_host="$lab_record_ssh_host"
+  lab_remote_dir="$lab_record_remote_dir"
+
+  if (( dry_run )); then
+    print -r -- "Would stop JupyterLab for ${lab_ssh_host}:${lab_remote_dir}"
+    print -r -- "  remote tmux session: ${tmux_session}"
+    print -r -- "  cancel forward 127.0.0.1:${local_port} -> ${remote_port}"
+    return 0
+  fi
+
+  lab_tmux_name_is_ours "$tmux_session" "$tmux_session" ||
+    afws_die "refusing to stop a tmux session outside this command's namespace: ${tmux_session}
+Every session afws-lab creates is named '${LAB_TMUX_PREFIX}...'. This record names
+something else, so it is not safe to act on. Remove the record by hand if it is
+stale: ${record}"
+
+  # Local first, because it always succeeds and because it is what makes the
+  # port on this Mac stop accepting connections.
+  lab_cancel_forward "$local_port" "$remote_port"
+
+  # Asking the server to shut down lets it write out what it is holding.
+  # Killing the pane is the fallback, not the first move.
+  set +e
+  if [[ -n "$remote_port" ]]; then
+    lab_ssh "python3 -m jupyter server stop ${(q)remote_port} >/dev/null 2>&1"
+  fi
+  set -e
+
+  while (( waited < AFWS_UNMOUNT_TIMEOUT_SECONDS )); do
+    lab_probe_tmux "$tmux_session"
+    [[ "$lab_tmux_state" == present ]] || break
+    afws_pause_seconds 1
+    waited=$(( waited + 1 ))
+  done
+
+  # Only a session this command can see, and has just confirmed is present,
+  # is killed. An unreachable workstation leaves lab_tmux_state at unknown, and
+  # unknown never authorizes destroying anything.
+  lab_probe_tmux "$tmux_session"
+  if [[ "$lab_tmux_state" == present ]]; then
+    set +e
+    lab_ssh "tmux kill-session -t ${(q)tmux_session}"
+    set -e
+  fi
+
+  # A stop that could not reach the workstation must leave the record behind.
+  # Deleting it would strand a JupyterLab holding a port on a shared machine
+  # with nothing left on this Mac that knows it exists; 'afws-lab list' and
+  # 'afws-lab stop --orphaned' are how it gets collected later.
+  lab_probe_tmux "$tmux_session"
+  case "$lab_tmux_state" in
+    present)
+      print -u2 -r -- "${AFWS_PROGRAM}: JupyterLab on ${lab_ssh_host} could not be stopped."
+      print -u2 -r -- "  Its record is kept so it can be collected later: ${record}"
+      print -u2 -r -- "  Retry with: afws-lab stop"
+      return 1
+      ;;
+    unknown)
+      print -u2 -r -- "${AFWS_PROGRAM}: the workstation could not be reached, so JupyterLab"
+      print -u2 -r -- "  may still be running and still holding a port on a shared machine."
+      print -u2 -r -- "  Its record is kept so it can be collected later: ${record}"
+      print -u2 -r -- "  Collect it once the connection is back: afws-lab stop --orphaned"
+      return 1
+      ;;
+  esac
+
+  rm -f "$record" 2>/dev/null || true
+  (( announce )) && print -r -- "Stopped JupyterLab for ${lab_ssh_host}:${lab_remote_dir}."
+  return 0
+}
+
+do_stop() {
+  local record users mount_point left=0
+
+  if (( orphaned )); then
+    for record in "${AFWS_LAB_RECORD_DIR}"/**/*.conf(N); do
+      lab_read_lab_record "$record" || continue
+      mount_point="$(lab_mount_point "$lab_record_ssh_host" "$lab_record_remote_dir")"
+      users=1
+      if [[ -x "$PEERS" ]]; then
+        users="$(env -u AFWS_SESSION_NAME "$PEERS" --users-of-mount "$mount_point" 2>/dev/null)" ||
+          users=1
+      fi
+      case "$users" in
+        ''|*[!0-9]*) users=1 ;;
+      esac
+      if (( users > 0 )); then
+        print -r -- "Leaving ${lab_record_ssh_host}:${lab_record_remote_dir} for ${users} live session(s)."
+        continue
+      fi
+      lab_stop_one "$record" || left=1
+    done
+    (( left == 0 )) || exit 1
+    return 0
+  fi
+
+  resolve_session
+  record="$(lab_record_file "$lab_ssh_host" "$lab_remote_dir")"
+  [[ -e "$record" ]] || {
+    print -r -- "No JupyterLab is recorded for ${lab_ssh_host}:${lab_remote_dir}."
+    return 0
+  }
+
+  mount_point="$(lab_mount_point "$lab_ssh_host" "$lab_remote_dir")"
+  users=0
+  if [[ -x "$PEERS" ]]; then
+    users="$("$PEERS" --users-of-mount "$mount_point" 2>/dev/null)" || users=0
+  fi
+  case "$users" in
+    ''|*[!0-9]*) users=0 ;;
+  esac
+  if (( users > 0 )); then
+    print -r -- "Leaving JupyterLab running for ${users} other live session(s) on this project."
+    print -r -- "It is released when the last of them exits."
+    return 0
+  fi
+
+  lab_stop_one "$record" || exit 1
+}
+
+# --- status ----------------------------------------------------------------
+
+do_status() {
+  local record tmux_session tmux_state=unknown local_port remote_port
+  local forward_ok=0 http_ok=0
+
+  resolve_session
+  record="$(lab_record_file "$lab_ssh_host" "$lab_remote_dir")"
+  tmux_session="$(lab_tmux_session_name "$lab_ssh_host" "$lab_remote_dir")"
+  local_port=""
+  if lab_read_lab_record "$record"; then
+    local_port="$lab_record_local_port"
+  fi
+
+  print -r -- "JupyterLab for ${lab_ssh_host}:${lab_remote_dir}"
+  print -r -- ""
+
+  # Cheapest first, and each layer is reported whether or not the one before it
+  # passed. Knowing which layer broke is the whole point: a workstation that is
+  # fine and a forward that is not needs no restart at all.
+  lab_probe_tmux "$tmux_session"
+  tmux_state="$lab_tmux_state"
+  case "$tmux_state" in
+    present) print -r -- "  [OK]   tmux session   ${tmux_session}" ;;
+    absent)  print -r -- "  [FAIL] tmux session   ${tmux_session} is not running on ${lab_ssh_host}" ;;
+    *)       print -r -- "  [??]   tmux session   ${lab_ssh_host} did not answer" ;;
+  esac
+
+  lab_probe_remote
+  remote_port="$lab_remote_port"
+  case "$lab_remote_state" in
+    running) print -r -- "  [OK]   jupyter        127.0.0.1:${remote_port} on ${lab_ssh_host} (pid ${lab_remote_pid})" ;;
+    absent)  print -r -- "  [FAIL] jupyter        no server for this project on ${lab_ssh_host}" ;;
+    *)       print -r -- "  [??]   jupyter        could not ask ${lab_ssh_host}" ;;
+  esac
+
+  if [[ -z "$local_port" ]]; then
+    print -r -- "  [--]   ssh forward    none recorded"
+  elif lab_forward_is_open "$local_port"; then
+    forward_ok=1
+    print -r -- "  [OK]   ssh forward    127.0.0.1:${local_port} -> ${remote_port:-${lab_record_remote_port}}"
+  else
+    print -r -- "  [FAIL] ssh forward    127.0.0.1:${local_port} is not accepting connections"
+  fi
+
+  if (( forward_ok )) && lab_http_ok "$local_port" "$lab_remote_base_url"; then
+    http_ok=1
+    print -r -- "  [OK]   http           JupyterLab answered on 127.0.0.1:${local_port}"
+  elif (( forward_ok )); then
+    print -r -- "  [FAIL] http           the port accepts connections but JupyterLab did not answer"
+  else
+    print -r -- "  [--]   http           not checked"
+  fi
+
+  print -r -- ""
+  if (( http_ok )); then
+    print -r -- "Ready. Open it with: afws-lab open"
+  elif [[ "$lab_remote_state" == running ]]; then
+    print -r -- "The workstation side is healthy. Only this Mac's forward needs rebuilding."
+    print -r -- "  afws-lab start        reattaches it without restarting JupyterLab"
+  elif [[ "$lab_remote_state" == absent ]]; then
+    print -r -- "No JupyterLab is running for this project."
+    print -r -- "  afws-lab start        starts one"
+  else
+    print -r -- "The workstation could not be reached, so nothing here is conclusive."
+    print -r -- "Nothing was changed. Retry when the connection is back:"
+    print -r -- "  afws-lab status"
+  fi
+  if [[ "$tmux_state" == present && "$lab_remote_state" == absent ]]; then
+    print -r -- ""
+    print -r -- "The tmux session is up but holds no live server, so 'afws-lab start' will"
+    print -r -- "not reuse it. Read what it said:"
+    print -r -- "  afws-run tail -40 ${LAB_REMOTE_STATE_DIR#\~/}/${tmux_session}.log"
+  fi
+}
+
+# --- open ------------------------------------------------------------------
+
+do_open() {
+  local record local_port
+
+  resolve_session
+  record="$(lab_record_file "$lab_ssh_host" "$lab_remote_dir")"
+  lab_read_lab_record "$record" ||
+    afws_die "no JupyterLab is recorded for ${lab_ssh_host}:${lab_remote_dir}
+Start one with: afws-lab start"
+  local_port="$lab_record_local_port"
+
+  lab_probe_remote
+  [[ "$lab_remote_state" == running ]] ||
+    afws_die "JupyterLab is not answering on ${lab_ssh_host}
+Check which layer is broken with: afws-lab status"
+  lab_http_ok "$local_port" "$lab_remote_base_url" ||
+    afws_die "the forward on this Mac is not carrying JupyterLab
+Rebuild it without restarting the server: afws-lab start"
+
+  if (( dry_run )); then
+    print -r -- "Would open $(lab_url "$local_port" "$lab_remote_base_url" "$lab_remote_token")"
+    return 0
+  fi
+  # The token is handed to the browser and never written down here.
+  open "$(lab_url "$local_port" "$lab_remote_base_url" "$lab_remote_token")"
+}
+
+# --- list ------------------------------------------------------------------
+
+do_list() {
+  local record live="" found=0 mount_point users
+
+  # Records and reality are printed side by side on purpose. A record with no
+  # remote session is what a crashed Mac leaves behind; a remote session with
+  # no record is what a stop that could not reach the workstation leaves.
+  for record in "${AFWS_LAB_RECORD_DIR}"/**/*.conf(N); do
+    lab_read_lab_record "$record" || continue
+    (( found )) || {
+      printf '%-24s %-34s %-8s %s\n' "HOST" "REMOTE DIRECTORY" "LOCAL" "REMOTE SESSION"
+      found=1
+    }
+    mount_point="$(lab_mount_point "$lab_record_ssh_host" "$lab_record_remote_dir")"
+    users=0
+    if [[ -x "$PEERS" ]]; then
+      users="$(env -u AFWS_SESSION_NAME "$PEERS" --users-of-mount "$mount_point" 2>/dev/null)" ||
+        users=0
+    fi
+    printf '%-24s %-34s %-8s %s\n' \
+      "$lab_record_ssh_host" "$lab_record_remote_dir" \
+      "${lab_record_local_port:--}" "${lab_record_tmux} (${users} session(s))"
+  done
+
+  (( found )) || print -r -- "No JupyterLab is recorded on this Mac."
+
+  # Only asked for when there is a session to ask through; outside one there is
+  # no authenticated connection to reuse and no host to guess.
+  if [[ -n "${AFWS_SESSION_NAME-}" ]]; then
+    resolve_session
+    set +e
+    lab_ssh "tmux ls 2>/dev/null | grep '^${LAB_TMUX_PREFIX}' || true"
+    set -e
+    live="$lab_ssh_output"
+    print -r -- ""
+    if (( lab_ssh_status != 0 )); then
+      print -r -- "Could not ask ${lab_ssh_host} what it is running."
+    elif [[ -z "$live" ]]; then
+      print -r -- "${lab_ssh_host} is running no afws-lab tmux session."
+    else
+      print -r -- "On ${lab_ssh_host}:"
+      print -r -- "$live" | sed 's/^/  /'
+    fi
+  fi
+}
+
+case "$action" in
+  start) do_start ;;
+  stop) do_stop ;;
+  status) do_status ;;
+  open) do_open ;;
+  list) do_list ;;
+esac

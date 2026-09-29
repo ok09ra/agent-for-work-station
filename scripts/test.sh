@@ -11,6 +11,9 @@ readonly PUSHER="${REPOSITORY_ROOT}/bin/afws-push"
 readonly PEERS="${REPOSITORY_ROOT}/bin/afws-peers"
 readonly MESSAGE="${REPOSITORY_ROOT}/bin/afws-message"
 readonly STATUS_HELPER="${REPOSITORY_ROOT}/bin/afws-status"
+readonly ORG="${REPOSITORY_ROOT}/bin/afws-org"
+readonly CLAUDE_HOOK="${REPOSITORY_ROOT}/bin/afws-claude-hook"
+readonly CLAUDE_INBOX="${REPOSITORY_ROOT}/bin/afws-claude-inbox"
 readonly REMOTE_HELPER="${REPOSITORY_ROOT}/bin/afws-remote"
 readonly CODEX_HOOK="${REPOSITORY_ROOT}/bin/afws-codex-hook"
 readonly ISOLATE="${REPOSITORY_ROOT}/bin/afws-isolate"
@@ -43,6 +46,7 @@ unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
   AFWS_AGENT AFWS_LOCAL_WORKSPACE AFWS_KEEP_MOUNT AFWS_NO_CONTROL_MASTER AFWS_NO_SHELL_MARKER \
   AFWS_REMOTE_FIRST AFWS_ALLOWED_LOCAL_DIRS \
   AFWS_PERMISSION_MODE AFWS_MOUNT_COMMAND AFWS_KEEP_CONTROL_MASTER \
+  AFWS_REMOTE_ASSUME_YES AFWS_VISIBILITY_MOUNT AFWS_ALLOW_HOME_MOUNT \
   AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
 unset SSH_ASKPASS 2>/dev/null || true
 
@@ -70,10 +74,15 @@ write_record() {
   local workspace="${7:-${AFWS_MOUNT_BASE}/${4}${5}}"
   local point="${8:-$workspace}"
   local agent_pid="${9:-}"
+  local instance_id="${name}-instance" token="${name}-token" token_hash
+  token_hash="$(print -rn -- "$token" | shasum -a 256 | awk '{print $1}')"
 
   mkdir -p "${AFWS_STATE_DIR}/sessions"
   {
     print -r -- "session_name=${name}"
+    print -r -- "instance_id=${instance_id}"
+    print -r -- "token_hash=${token_hash}"
+    print -r -- "afws_version=2"
     print -r -- "agent=${agent}"
     print -r -- "kind=interactive"
     print -r -- "pid=${pid}"
@@ -98,18 +107,25 @@ for script in \
   "$PEERS" \
   "$MESSAGE" \
   "$STATUS_HELPER" \
+  "$ORG" \
+  "$CLAUDE_HOOK" \
+  "$CLAUDE_INBOX" \
   "$REMOTE_HELPER" \
   "$CODEX_HOOK" \
   "$LOCK" \
   "$REMOUNT" \
   "$UMOUNT" \
   "${REPOSITORY_ROOT}/scripts/install.sh" \
+  "${REPOSITORY_ROOT}/bin/afws-lab" \
   "${REPOSITORY_ROOT}/bin/afws-doctor" \
   "${REPOSITORY_ROOT}/scripts/prepublish-check.sh"; do
   zsh -n "$script" || fail "syntax check failed: ${script:t}"
 done
 
 sh -n "$SHELL_WRAPPER" || fail "syntax check failed: ${SHELL_WRAPPER:t}"
+python3 -m py_compile "${REPOSITORY_ROOT}/lib/afws-orchestrator.py" \
+  "${REPOSITORY_ROOT}/lib/afws-fs-mcp.py" \
+  "${REPOSITORY_ROOT}/scripts/test_org_resilience.py" || fail "Python syntax check failed"
 
 # zsh ties 'path' to $PATH and makes 'status' read-only, so assigning to either
 # inside a function breaks command lookup or aborts outright. Both have bitten
@@ -118,7 +134,7 @@ special_parameter_hits=""
 for name in path status cdpath fpath manpath module_path argv options signals \
   psvar mailpath watch histchars prompt SECONDS RANDOM LINES COLUMNS pipestatus dirstack; do
   hits="$(grep -nE "(^|[[:space:];(&|]|local |readonly |typeset |integer |export )${name}=" \
-    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$REMOTE_HELPER" "$CODEX_HOOK" "$LOCK" "$REMOUNT" "$UMOUNT" \
+    "$LIBRARY" "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$ORG" "$CLAUDE_HOOK" "$CLAUDE_INBOX" "$REMOTE_HELPER" "$CODEX_HOOK" "$LOCK" "$REMOUNT" "$UMOUNT" \
     "${REPOSITORY_ROOT}/scripts/"*.sh 2>/dev/null || true)"
   [[ -n "$hits" ]] && special_parameter_hits+="${name}: ${hits}"$'\n'
 done
@@ -140,6 +156,16 @@ timeout_probe="$(zsh -c '
 ')"
 [[ "$timeout_probe" == $'failure=7\ntimeout=124' ]] || \
   fail "the bounded-command helper returned the wrong result (${timeout_probe})"
+
+terminal_title="$(zsh -c '
+  set -eu
+  source '"$LIBRARY"'
+  afws_session_name=ngof-1
+  afws_remote_dir=/data3/okuda/ngof
+  afws_terminal_title_text
+')"
+[[ "$terminal_title" == '[ngof-1] ngof | agent-for-work-station' ]] || \
+  fail "the terminal title does not begin with the session name (${terminal_title})"
 
 # The detached rclone wrapper and the macOS mount table become visible on
 # independent schedules. A mount-table entry must never make the parent read a
@@ -220,6 +246,50 @@ visibility_failure="$(zsh -c '
 [[ "$visibility_failure" == *"result=1 alive=0 mounted=0 record=0"* ]] || \
   fail "a failed visibility mount leaked state (${visibility_failure})"
 
+# Healthy legacy views are shared even with live sessions. Reusing them must
+# neither detach a mount nor create a fictitious rclone management record.
+cat >| "${SANDBOX}/visibility-peers" <<'STUB_PEERS'
+#!/bin/zsh
+print -r -- "${STUB_VIEW_USERS:-2}"
+STUB_PEERS
+chmod +x "${SANDBOX}/visibility-peers"
+for view_users in 0 2; do
+  legacy_reuse="$(STUB_VIEW_USERS="$view_users" zsh -c '
+    set -eu
+    AFWS_PROGRAM=test
+    AFWS_STATE_DIR='"$SANDBOX"'/legacy-visibility-state
+    AFWS_MOUNT_BASE='"$SANDBOX"'/legacy-visibility-mounts
+    source '"$LIBRARY"'
+    afws_mount_is_present() { return 0 }
+    afws_directory_responds() { return 0 }
+    afws_unmount_visibility_mount() { print unexpected-unmount; return 1 }
+    afws_visibility_mount() { print unexpected-mount; return 1 }
+    afws_establish_visibility_mount host /project "" 0 test '"$SANDBOX"'/visibility-peers
+    record="$(afws_visibility_record host /project)"
+    print -r -- "point=${afws_mount_point} record=$([[ -e "$record" ]] && print 1 || print 0)"
+  ' 2>&1)" || fail "a healthy legacy view blocked launch with ${view_users} users (${legacy_reuse})"
+  [[ "$legacy_reuse" == *"Reusing existing Finder/VS Code view:"*"record=0" ]] || \
+    fail "legacy reuse did not preserve the view without rclone state (${legacy_reuse})"
+  [[ "$legacy_reuse" != *"unexpected-"* ]] || fail "legacy reuse remounted the view"
+done
+
+# An unresponsive legacy mount with live users must still be left intact.
+legacy_busy="$(zsh -c '
+  set -eu
+  AFWS_PROGRAM=test
+  AFWS_STATE_DIR='"$SANDBOX"'/legacy-visibility-state
+  AFWS_MOUNT_BASE='"$SANDBOX"'/legacy-visibility-mounts
+  source '"$LIBRARY"'
+  afws_mount_is_present() { return 0 }
+  afws_directory_responds() { return 1 }
+  afws_unmount_visibility_mount() { print unexpected-unmount; return 1 }
+  afws_visibility_mount() { print unexpected-mount; return 1 }
+  afws_establish_visibility_mount host /project "" 0 test '"$SANDBOX"'/visibility-peers
+' 2>&1)" && fail "replaced an unresponsive legacy view with live users"
+[[ "$legacy_busy" == *"not responding and is still used by 2 live session(s)"* ]] || \
+  fail "an unresponsive legacy view lost its repair guidance (${legacy_busy})"
+[[ "$legacy_busy" != *"unexpected-"* ]] || fail "detached a busy legacy view"
+
 # --- documentation --------------------------------------------------------
 
 for document in \
@@ -259,7 +329,7 @@ grep -Fq '[English](README.md)' "${REPOSITORY_ROOT}/README.ja.md" || \
 
 # --- help -----------------------------------------------------------------
 
-for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$REMOTE_HELPER" "$ISOLATE" "$LOCK" "$REMOUNT" "$UMOUNT"; do
+for command_path in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER" "$RUNNER" "$PUSHER" "$PEERS" "$MESSAGE" "$STATUS_HELPER" "$ORG" "$CLAUDE_INBOX" "$REMOTE_HELPER" "$ISOLATE" "$LOCK" "$REMOUNT" "$UMOUNT"; do
   "$command_path" --help >/dev/null || fail "${command_path:t} --help failed"
 done
 
@@ -270,10 +340,13 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-remote afws-codex-hook afws-isolate afws-lock afws-remount afws-umount afws-shell afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-org afws-remote afws-codex-hook afws-claude-hook afws-claude-inbox afws-isolate afws-lock afws-remount afws-umount afws-shell afws-lab afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
+[[ -f "${prefix}/lib/afws-orchestrator.py" ]] || fail "the installer did not place the organization backend"
+[[ -f "${prefix}/lib/afws-fs-mcp.py" ]] || fail "the installer did not place the remote-filesystem MCP server"
+"${prefix}/bin/afws-org" --help >/dev/null || fail "the installed organization command cannot load its backend"
 [[ ! -x "${prefix}/lib/afws-common.zsh" ]] || fail "the installed library must not be executable"
 
 "${prefix}/bin/afws-run" --help >/dev/null || \
@@ -504,29 +577,150 @@ AFWS_MOUNT_COMMAND="cat ${SANDBOX}/empty-table" "$PEERS" --count >/dev/null || \
 
 # --- launchers: dry run ---------------------------------------------------
 
-operating_rules="$(zsh -c 'source '"$LIBRARY"'; afws_shared_operating_rules')"
-[[ "$operating_rules" == *"two paths to the same project tree"* ]] || \
-  fail "the session instructions do not explain that the mount is the remote project"
-[[ "$operating_rules" == *"create a worktree or alternate checkout unless the user explicitly asks"* ]] || \
-  fail "the session instructions allow unsolicited Git worktrees"
-[[ "$operating_rules" == *"Use afws-run only"* ]] || \
-  fail "the session instructions do not limit afws-run to remote execution needs"
-[[ "$operating_rules" == *"Use afws-remount to repair the mount"* ]] || \
-  fail "the session instructions do not name the supported mount recovery command"
-[[ "$operating_rules" != *"prefer one remote command over many small local file operations"* ]] || \
-  fail "the session instructions still push project inspection through the remote shell"
+# Both launchers are remote-first now, so they share one set of rules and the
+# agent names itself. Naming one agent in the shared text used to leave the
+# other reading instructions addressed to something else.
+operating_rules="$(zsh -c 'source '"$LIBRARY"'; afws_remote_first_operating_rules Claude')"
+[[ "$operating_rules" == *"The remote working directory is the authoritative project"* ]] || \
+  fail "the session instructions do not say which tree is authoritative"
+[[ "$operating_rules" == *"Run every project read, search, edit, file-management, and Git operation through afws-run"* ]] || \
+  fail "the session instructions do not route project work through afws-run"
+[[ "$operating_rules" == *"do not use it for Claude project work"* ]] || \
+  fail "the shared rules did not take the agent's own name"
+[[ "$operating_rules" != *Codex* ]] || \
+  fail "a Claude session was handed rules addressed to Codex"
+
+codex_rules="$(zsh -c 'source '"$LIBRARY"'; afws_remote_first_operating_rules Codex')"
+[[ "$codex_rules" == *"do not use it for Codex project work"* ]] || \
+  fail "the shared rules did not take Codex's name"
+[[ "$codex_rules" != *Claude* ]] || \
+  fail "a Codex session was handed rules addressed to Claude"
+
+# The mounted session type is gone, and so are the functions that served it.
+for removed in afws_establish_mount afws_session_preamble \
+  afws_shared_operating_rules afws_warn_about_home_workspace; do
+  if grep -q "^${removed}()" "$LIBRARY"; then
+    fail "${removed} outlived the mounted session type it served"
+  fi
+  if grep -rq "${removed}" "${REPOSITORY_ROOT}/bin"; then
+    fail "something still calls ${removed}"
+  fi
+done
 
 reset_state
 claude_plan="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$claude_plan" == *"Would mount"* ]] || fail "claudefws dry run did not plan a mount"
+# Nothing is mounted by default any more. SSHFS aborts in its own readdir path
+# on a bug this repository cannot fix, and the rclone view it was stacked on
+# cannot represent remote symlinks; afws-run reaches the real tree through
+# neither. The view is still available, but it has to be asked for.
+[[ "$claude_plan" != *"Would mount"* ]] || \
+  fail "claudefws planned a mount without being asked for one"
+[[ "$claude_plan" == *"Nothing will be mounted"* ]] || \
+  fail "claudefws did not say that it mounts nothing"
+[[ "$claude_plan" == *"Add --view"* ]] || \
+  fail "claudefws did not say how to get a Finder/VS Code view"
+# The empty control workspace is what confines Claude's file tools: they are
+# limited to the working directory, and the project is not in it.
+[[ "$claude_plan" == *"cd ${AFWS_STATE_DIR}/workspaces/example-workstation/remote/project"* ]] || \
+  fail "claudefws did not start Claude in the empty control workspace"
+[[ "$claude_plan" != *--add-dir* ]] || \
+  fail "claudefws handed Claude a directory beyond its control workspace"
 [[ "$claude_plan" == *"Would start Claude with"* ]] || fail "claudefws dry run did not plan a launch"
 [[ "$claude_plan" == *"--permission-mode auto"* ]] || fail "claudefws dry run did not plan the auto permission mode"
 [[ "$claude_plan" == *"--name fws-example-workstation-project-1"* ]] || fail "claudefws dry run did not plan a session name"
 [[ "$claude_plan" == *"--append-system-prompt"* ]] || fail "claudefws dry run did not plan session instructions"
+[[ "$claude_plan" == *"Would enable Claude Agent Teams"* ]] ||
+  fail "claudefws did not enable the Claude execution layer by default"
 [[ "$claude_plan" == *"shared SSH connection at ${AFWS_STATE_DIR}/control/example-workstation.sock"* ]] || \
   fail "claudefws dry run did not plan the shared SSH connection"
 [[ "$claude_plan" == *"Would label locally-run shell commands"* ]] || \
   fail "claudefws dry run did not mention labelling local shell commands"
+
+grep -q 'afws_remote_first=1' "$CLAUDE_LAUNCHER" || \
+  fail "claudefws is not a remote-first launcher"
+grep -Fq 'afws_remote_first_operating_rules Claude' "$CLAUDE_LAUNCHER" || \
+  fail "claudefws handed its session rules addressed to some other agent"
+grep -Fq 'afws_remote_first_operating_rules Codex' "$CODEX_LAUNCHER" || \
+  fail "codexfws handed its session rules addressed to some other agent"
+
+# Without a mount, the structured file tools would be gone and every read
+# would become a shell command. The MCP server is what keeps them, reaching
+# the real tree over SSH -- symlinks and all, which the rclone view cannot do.
+[[ "$claude_plan" == *"Would give Claude the remote filesystem through"* ]] || \
+  fail "claudefws did not plan the remote filesystem tools"
+[[ "$claude_plan" == *"--mcp-config"* ]] || \
+  fail "claudefws did not pass the MCP server to Claude"
+without_mcp="$(AFWS_NO_FS_MCP=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$without_mcp" != *--mcp-config* ]] || \
+  fail "AFWS_NO_FS_MCP did not turn the remote filesystem tools off"
+[[ "$without_mcp" == *"Would start Claude with"* ]] || \
+  fail "turning the filesystem tools off stopped the launch as well"
+
+# The launcher builds that configuration inline. It has to be JSON, and it has
+# to tell the server which directory it is serving, or the tools come up
+# pointing at nothing.
+# The dry run prints a placeholder rather than the configuration itself, so
+# run the generator the launcher embeds and check what it actually emits. A
+# server that comes up without AFWS_REMOTE_DIR is pointed at nothing.
+mcp_generator="${SANDBOX}/mcp-generator.py"
+python3 - "$CLAUDE_LAUNCHER" "$mcp_generator" <<'EXTRACT_MCP_GENERATOR'
+import io
+import sys
+
+launcher = io.open(sys.argv[1], encoding="utf-8").read()
+opening = "mcp_config=\"$(python3 -c '"
+start = launcher.index(opening) + len(opening)
+end = launcher.index("\n' \"$afws_fs_mcp\"", start)
+io.open(sys.argv[2], "w", encoding="utf-8").write(launcher[start:end])
+EXTRACT_MCP_GENERATOR
+[[ -s "$mcp_generator" ]] || fail "could not find the MCP configuration the launcher builds"
+
+mcp_emitted="$(python3 "$mcp_generator" /lib/afws-fs-mcp.py example-workstation \
+  /remote/project /tmp/socket.sock 600)" || fail "the MCP configuration generator failed"
+python3 -c '
+import json, sys
+config = json.loads(sys.argv[1])
+server = config["mcpServers"]["afws-fs"]
+assert server["command"] == "python3", server
+assert server["args"] == ["/lib/afws-fs-mcp.py"], server
+environment = server["env"]
+assert environment["AFWS_SSH_HOST"] == "example-workstation", environment
+assert environment["AFWS_REMOTE_DIR"] == "/remote/project", environment
+assert environment["AFWS_CONTROL_PATH"] == "/tmp/socket.sock", environment
+' "$mcp_emitted" || fail "the injected MCP configuration is not what the server expects (${mcp_emitted})"
+
+# With no shared connection yet there is nothing to point the server at, but
+# it must still be given the host and directory rather than dropped.
+mcp_socketless="$(python3 "$mcp_generator" /lib/afws-fs-mcp.py example-workstation \
+  /remote/project "" 600)" || fail "the MCP configuration generator failed without a socket"
+python3 -c '
+import json, sys
+environment = json.loads(sys.argv[1])["mcpServers"]["afws-fs"]["env"]
+assert environment["AFWS_REMOTE_DIR"] == "/remote/project", environment
+assert "AFWS_CONTROL_PATH" not in environment, environment
+' "$mcp_socketless" || fail "the MCP configuration mishandled a missing shared connection"
+
+grep -Fq 'AFWS_NO_FS_MCP' "$CLAUDE_LAUNCHER" || \
+  fail "there is no way to turn the remote filesystem tools off"
+
+# Asked for, the view appears -- and the file tools are denied it, so it stays
+# a view rather than quietly becoming the data path again.
+view_plan="$("$CLAUDE_LAUNCHER" --dry-run --view example-workstation /remote/project)"
+[[ "$view_plan" == *"Would mount a Finder/VS Code view"* ]] || \
+  fail "--view did not plan the Finder/VS Code view"
+[[ "$view_plan" == *"with rclone NFS"* ]] || \
+  fail "--view planned something other than the rclone view"
+[[ "$view_plan" == *--disallowedTools* ]] || \
+  fail "--view left the file tools free to treat the view as the project"
+[[ "$view_plan" != *--add-dir* ]] || \
+  fail "--view added the view to the directories Claude may work in"
+
+env_view_plan="$(AFWS_VISIBILITY_MOUNT=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$env_view_plan" == *"Would mount a Finder/VS Code view"* ]] || \
+  fail "AFWS_VISIBILITY_MOUNT did not ask for the view"
+overridden="$(AFWS_VISIBILITY_MOUNT=1 "$CLAUDE_LAUNCHER" --dry-run --no-view example-workstation /remote/project)"
+[[ "$overridden" != *"Would mount"* ]] || \
+  fail "--no-view did not override AFWS_VISIBILITY_MOUNT"
 
 [[ -d "$AFWS_MOUNT_BASE" ]] && fail "claudefws dry run created a mount directory"
 [[ -e "${AFWS_STATE_DIR}/control" ]] && fail "claudefws dry run created a control directory"
@@ -534,12 +728,77 @@ claude_plan="$("$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)
   fail "claudefws dry run wrote a session record"
 
 codex_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$codex_plan" == *"Would mount"* ]] || fail "codexfws dry run did not plan a mount"
+[[ "$codex_plan" != *"Would mount"* ]] || \
+  fail "codexfws planned a mount without being asked for one"
+[[ "$codex_plan" == *"Nothing will be mounted"* ]] || \
+  fail "codexfws did not say that it mounts nothing"
+[[ "$codex_plan" == *"Add --view"* ]] || \
+  fail "codexfws did not say how to get a Finder/VS Code view"
+codex_view_plan="$("$CODEX_LAUNCHER" --dry-run --view example-workstation /remote/project)"
+[[ "$codex_view_plan" == *"Would mount a Finder/VS Code view"* ]] || \
+  fail "codexfws --view did not plan the Finder/VS Code view"
+codex_overridden="$(AFWS_VISIBILITY_MOUNT=1 "$CODEX_LAUNCHER" --dry-run --no-view example-workstation /remote/project)"
+[[ "$codex_overridden" != *"Would mount"* ]] || \
+  fail "codexfws --no-view did not override AFWS_VISIBILITY_MOUNT"
 [[ "$codex_plan" == *"Would start Codex with"* ]] || fail "codexfws dry run did not plan a launch"
 [[ "$codex_plan" == *"--sandbox workspace-write"* ]] || fail "codexfws dry run lost the sandbox flag"
 [[ "$codex_plan" == *"--ask-for-approval on-request"* ]] || fail "codexfws dry run lost the approval flag"
+
+# Leaving Codex to decide when its own action deserves review is the judgement
+# being checked, so the reviewing agent is available. It is opt-in because a
+# managed configuration can refuse the policy outright.
+[[ "$codex_plan" != *"approvals_reviewer"* ]] || \
+  fail "codexfws planned the reviewing agent without being asked for it"
+codex_reviewed_plan="$(AFWS_CODEX_AUTO_REVIEW=1 "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_reviewed_plan" == *'approvals_reviewer="auto_review"'* ]] || \
+  fail "AFWS_CODEX_AUTO_REVIEW did not route approvals to the reviewing agent"
+
+# A write scope that is only written down is not a write scope. Both launchers
+# state that the workstation tree is compared against it before a turn ends.
+for launcher_plan_source in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  if ! grep -q "The write scope on an assignment is checked, not trusted" "$launcher_plan_source"; then
+    fail "${launcher_plan_source:t} does not tell the session its write scope is checked"
+  fi
+  if ! grep -q "done_when" "$launcher_plan_source"; then
+    fail "${launcher_plan_source:t} does not tell the session how an assignment is closed"
+  fi
+done
+
+# A session that can rewrite this Mac's configuration can undo its own limits.
+for protected_path in '~/.claude/\*\*' '~/.afws/\*\*' '~/.ssh/\*\*'; do
+  if ! grep -q "$protected_path" "$CLAUDE_LAUNCHER"; then
+    fail "claudefws does not deny the file tools ${protected_path}"
+  fi
+done
+grep -q '"ConfigChange"' "$CLAUDE_LAUNCHER" || \
+  fail "claudefws does not report configuration changes made during a session"
+
+# Widening a daemon shared by the whole Mac needs a person, not a session.
+remote_state="$(mktemp -d)"
+mkdir -p "${remote_state}/sessions"
+cat > "${remote_state}/sessions/cx-guard.conf" <<REMOTE_RECORD
+session_name=cx-guard
+instance_id=cx-guard-instance
+token_hash=unused
+afws_version=2
+agent=codex
+kind=interactive
+pid=$$
+ssh_host=example-workstation
+remote_dir=/remote/project
+started_epoch=$(date +%s)
+REMOTE_RECORD
+remote_refusal="$(AFWS_STATE_DIR="$remote_state" AFWS_SESSION_NAME=cx-guard \
+  "${REPOSITORY_ROOT}/bin/afws-remote" on < /dev/null 2>&1 || true)"
+[[ "$remote_refusal" == *"needs a person at the terminal"* ]] || \
+  fail "afws-remote enabled Remote Control without a person at the terminal"
+remote_refusal="$(AFWS_STATE_DIR="$remote_state" AFWS_SESSION_NAME=cx-guard \
+  "${REPOSITORY_ROOT}/bin/afws-remote" pair < /dev/null 2>&1 || true)"
+[[ "$remote_refusal" == *"needs a person at the terminal"* ]] || \
+  fail "afws-remote paired a device without a person at the terminal"
+rm -rf "$remote_state"
 [[ "$codex_plan" == *"developer_instructions="* ]] || fail "codexfws dry run did not plan session instructions"
-[[ "$codex_plan" == *"with rclone NFS"* ]] || fail "codexfws did not plan the stable visibility mount"
+[[ "$codex_view_plan" == *"with rclone NFS"* ]] || fail "codexfws did not plan the stable visibility mount"
 [[ "$codex_plan" == *"${AFWS_STATE_DIR}/workspaces/example-workstation/remote/project"* ]] || \
   fail "codexfws did not use a separate local control workspace"
 codex_resume_plan="$("$CODEX_LAUNCHER" --dry-run --resume example-workstation /remote/project)"
@@ -552,9 +811,11 @@ codex_trailing_resume_plan="$("$CODEX_LAUNCHER" --dry-run example-workstation /r
 [[ "$codex_plan" == *"Would label locally-run shell commands"* ]] && \
   fail "codexfws planned a shell marker that Codex cannot use"
 
-# Both launchers must agree on where the mount and the socket go.
-[[ "$codex_plan" == *"${AFWS_MOUNT_BASE}/example-workstation/remote/project"* ]] || \
+# Both launchers must agree on where the view and the socket go.
+[[ "$codex_view_plan" == *"${AFWS_MOUNT_BASE}/example-workstation/remote/project"* ]] || \
   fail "codexfws planned a different mount point from claudefws"
+[[ "$view_plan" == *"${AFWS_MOUNT_BASE}/example-workstation/remote/project"* ]] || \
+  fail "claudefws --view planned a different mount point from codexfws"
 [[ "$codex_plan" == *"${AFWS_STATE_DIR}/control/example-workstation.sock"* ]] || \
   fail "codexfws planned a different shared connection from claudefws"
 [[ "$codex_plan" == *"session: cx-example-workstation-project-1"* ]] || \
@@ -576,11 +837,27 @@ export AFWS_TEST_REMOTE_LOG="${SANDBOX}/remote-codex.log"
 : > "$AFWS_TEST_REMOTE_LOG"
 expect_rejected "Remote Control outside a session" env PATH="${STUB_BIN}:$PATH" "$REMOTE_HELPER" on
 expect_rejected "Remote Control from Claude" env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=fws-remote "$REMOTE_HELPER" on
-env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" on >/dev/null ||
+
+# 'on' and 'pair' widen access to a daemon shared by the whole Mac, so they ask
+# at the controlling terminal. The suite has none, which is the same position
+# an agent session is in -- so they must refuse here, and say why.
+for widening in on pair; do
+  refusal="$(env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote \
+    "$REMOTE_HELPER" "$widening" 2>&1 >/dev/null || true)"
+  [[ "$refusal" == *"needs a person at the terminal"* ]] || \
+    fail "afws-remote ${widening} widened shared access with nobody to confirm it (${refusal})"
+done
+[[ ! -s "$AFWS_TEST_REMOTE_LOG" ]] || \
+  fail "afws-remote reached Codex despite refusing to confirm"
+
+# The two that widen nothing need no confirmation, terminal or not.
+env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote AFWS_REMOTE_ASSUME_YES=1 \
+  "$REMOTE_HELPER" on >/dev/null ||
   fail "afws-remote on failed"
 env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" off >/dev/null ||
   fail "afws-remote off failed"
-pair_output="$(env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote "$REMOTE_HELPER" pair)" ||
+pair_output="$(env PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-remote \
+  AFWS_REMOTE_ASSUME_YES=1 "$REMOTE_HELPER" pair)" ||
   fail "afws-remote pair failed"
 [[ "$pair_output" == "PAIR-CODE" ]] || fail "afws-remote did not pass through the pairing code"
 [[ "$(cat "$AFWS_TEST_REMOTE_LOG")" == $'app-server daemon enable-remote-control\napp-server daemon disable-remote-control\nremote-control pair' ]] ||
@@ -687,6 +964,10 @@ codex_named="$(AFWS_SESSION_NAME=gpu-watcher "$CODEX_LAUNCHER" --dry-run example
 mode_plan="$(AFWS_PERMISSION_MODE=manual "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
 [[ "$mode_plan" == *"--permission-mode manual"* ]] || fail "claudefws ignored AFWS_PERMISSION_MODE"
 
+no_teams_plan="$(AFWS_NO_AGENT_TEAMS=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$no_teams_plan" == *"Agent Teams would remain disabled"* ]] ||
+  fail "AFWS_NO_AGENT_TEAMS did not disable the Claude execution layer"
+
 quiet_plan="$(AFWS_NO_SHELL_MARKER=1 "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
 [[ "$quiet_plan" != *"Would label locally-run shell commands"* ]] || \
   fail "AFWS_NO_SHELL_MARKER did not disable labelling"
@@ -715,7 +996,7 @@ expect_rejected "a socket path that cannot fit in a Unix socket" \
   env AFWS_STATE_DIR="$long_state" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
 long_ok="$(AFWS_STATE_DIR="$long_state" AFWS_NO_CONTROL_MASTER=1 \
   "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$long_ok" == *"Would mount"* ]] || \
+[[ "$long_ok" == *"Would start Claude with"* ]] || \
   fail "the socket-length guard fired even with the shared connection disabled"
 
 # --- extra local directories ---------------------------------------------
@@ -781,6 +1062,12 @@ for phrase in 'nothing asks the user first' 'only when the user asked you to' \
     fail "the session instructions no longer constrain messaging a peer: ${phrase}"
 done
 
+for phrase in '[AFWS organization assignment]' 'Queueing is not acknowledgement' \
+  'redelegation: forbidden' 'the task matches the ledger'; do
+  grep -Fq "$phrase" "$CODEX_LAUNCHER" ||
+    fail "Codex organization delegation lost a required guard: ${phrase}"
+done
+
 # --- mount table ----------------------------------------------------------
 # The launchers read the mount table through AFWS_MOUNT_COMMAND, so reuse and
 # nesting can be checked without mounting anything.
@@ -792,78 +1079,131 @@ mkdir -p "${FAKE_ROOT}/inner"
 
 print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
 
-for launcher in "$CLAUDE_LAUNCHER"; do
-  reuse="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$launcher" --dry-run example-workstation /remote/project/inner)"
-  [[ "$reuse" == *"Reusing SSHFS mount: example-workstation:/remote/project"* ]] || \
-    fail "${launcher:t} did not reuse a mount that already covers the requested directory"
-  [[ "$reuse" == *"${FAKE_ROOT}/inner"* ]] || \
-    fail "${launcher:t} did not point the workspace at the subdirectory of the reused mount"
+# Neither launcher mounts a project tree any more, so these are library
+# behaviours rather than launcher behaviours. Driving the functions directly
+# keeps them covered without a launcher that would mount anything, and follows
+# the same shape as the visibility-mount probes above.
+mount_probe() {
+  # mount_probe MOUNT_TABLE SNIPPET
+  zsh -c '
+    set -eu
+    AFWS_PROGRAM=test
+    AFWS_STATE_DIR='"${AFWS_STATE_DIR}"'
+    AFWS_MOUNT_BASE='"${AFWS_MOUNT_BASE}"'
+    AFWS_MOUNT_COMMAND="cat '"$1"'"
+    source '"$LIBRARY"'
+    '"$2"'
+  ' 2>&1
+}
+
+find_existing() {
+  mount_probe "$1" '
+    if afws_find_existing_mount "'"$2"'" "'"$3"'"; then
+      print -r -- "FOUND source=${afws_mount_source} workspace=${afws_local_workspace}"
+    else
+      print -r -- "NONE stale=${afws_stale_mount} reason=${afws_stale_mount_reason}"
+    fi'
+}
+
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
+
+reuse="$(find_existing "$FAKE_MOUNTS" example-workstation /remote/project/inner)"
+[[ "$reuse" == *"FOUND source=example-workstation:/remote/project"* ]] || \
+  fail "a mount that already covers the requested directory was not reused (${reuse})"
+[[ "$reuse" == *"workspace=${FAKE_ROOT}/inner"* ]] || \
+  fail "the workspace did not point at the subdirectory of the reused mount (${reuse})"
+
+other_host="$(find_existing "$FAKE_MOUNTS" other-workstation /remote/project)"
+[[ "$other_host" == NONE* ]] || \
+  fail "a mount belonging to another host was reused (${other_host})"
+
+# A mount below the one about to be made would be hidden by it, and the session
+# that owns it would silently start resolving its workspace through ours.
+print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
+nested="$(mount_probe "$FAKE_MOUNTS" '
+  if afws_find_nested_mount "'"${FAKE_ROOT}"'"; then
+    print -r -- "NESTED ${afws_nested_mount}"
+  else
+    print -r -- "NONE"
+  fi')"
+[[ "$nested" == "NESTED ${FAKE_ROOT}/inner" ]] || \
+  fail "a mount underneath the requested path was not noticed (${nested})"
+
+sibling="$(mount_probe "$FAKE_MOUNTS" '
+  if afws_find_nested_mount "'"${AFWS_MOUNT_BASE}"'/example-workstation/remote/other"; then
+    print -r -- "NESTED ${afws_nested_mount}"
+  else
+    print -r -- "NONE"
+  fi')"
+[[ "$sibling" == NONE ]] || \
+  fail "a sibling directory was mistaken for a nested mount (${sibling})"
+
+# A Finder/VS Code view mounts as "localhost:/", not "example-workstation:",
+# and it sits on exactly the path a new SSHFS mount would take. The
+# existing-mount search filters on the host-spelled source and the nested-mount
+# search only looks strictly below the path, so neither sees it. An SSHFS mount
+# was laid straight on top of a live view, and once its process died the corpse
+# answered ENXIO for everything while the healthy mount underneath could not be
+# reached. Peeling one layer only uncovered the next, so a repair looked like it
+# had worked and failed again hours later.
+print -r -- "localhost:/ on ${FAKE_ROOT} (nfs, nodev, nosuid)" > "$FAKE_MOUNTS"
+
+invisible="$(find_existing "$FAKE_MOUNTS" example-workstation /remote/project)"
+[[ "$invisible" == NONE* ]] || \
+  fail "the test no longer reproduces the blind spot the guard exists for (${invisible})"
+blind="$(mount_probe "$FAKE_MOUNTS" '
+  if afws_find_nested_mount "'"${FAKE_ROOT}"'"; then print -r -- NESTED; else print -r -- NONE; fi')"
+[[ "$blind" == NONE ]] || \
+  fail "the nested search now sees a mount at exactly the path, so the guard is untested"
+
+stacked="$(mount_probe "$FAKE_MOUNTS" '
+  afws_refuse_to_stack sshfs "example-workstation:/remote/project" "'"${FAKE_ROOT}"'"
+  print -r -- ALLOWED' || true)"
+[[ "$stacked" != *ALLOWED* ]] || \
+  fail "an SSHFS mount was allowed on top of a live Finder/VS Code view"
+[[ "$stacked" == *"already mounted on exactly that path"* ]] || \
+  fail "the refusal did not say the path is already taken (${stacked})"
+[[ "$stacked" == *"localhost:/"* ]] || \
+  fail "the refusal did not name what is already mounted there (${stacked})"
+[[ "$stacked" == *"only uncovers the next"* ]] || \
+  fail "the refusal did not warn that releasing one layer uncovers the next"
+[[ "$stacked" == *afws-umount* ]] || \
+  fail "the refusal did not say how to release what is there (${stacked})"
+
+# Both mount functions have to pass through the guard. afws-remount calls
+# afws_mount directly rather than going through a launcher, and the rclone view
+# can be stacked just as an SSHFS mount can, so covering only one leaves the
+# failure above reachable by the other route.
+for mount_function in afws_mount afws_visibility_mount; do
+  awk -v target="${mount_function}() {" '
+    index($0, target) == 1 { inside = 1 }
+    inside && /afws_refuse_to_stack/ { found = 1 }
+    inside && /^}/ { exit }
+    END { exit found ? 0 : 1 }
+  ' "$LIBRARY" || fail "${mount_function} can stack a filesystem on an occupied path"
 done
 
-# Mounting a home directory is allowed but must say what it costs.
-print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
-[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" != *"looks like a home directory"* ]] || \
-  fail "a plain project workspace was reported as a home directory"
+empty_path="$(mount_probe "$FAKE_MOUNTS" '
+  afws_refuse_to_stack sshfs "example-workstation:/remote/elsewhere" "'"${AFWS_MOUNT_BASE}"'/unused"
+  print -r -- ALLOWED')"
+[[ "$empty_path" == ALLOWED ]] || \
+  fail "the guard refused a path that carries no mount (${empty_path})"
 
-# A project keeps its own .claude next to .git, so that is not a home signal.
-mkdir -p "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
-print -r -- '{"permissions":{"allow":[]}}' > "${FAKE_ROOT}/.claude/settings.json"
-[[ "$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)" != *"looks like a home directory"* ]] || \
-  fail "a project with its own .claude was mistaken for a home directory"
-
-mkdir -p "${FAKE_ROOT}/.ssh"
-
-home_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$home_warning" == *"looks like a home directory"* ]] || \
-  fail "a workspace containing .ssh and .claude was not flagged as a home directory"
-[[ "$home_warning" == *".claude/settings.json"* ]] || \
-  fail "the home-directory warning did not mention the project settings it pulls in"
-[[ "$home_warning" == *AFWS_ALLOW_HOME_MOUNT* ]] || \
-  fail "the home-directory warning did not say how to silence it"
-
-silenced="$(AFWS_ALLOW_HOME_MOUNT=1 AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$silenced" != *"looks like a home directory"* ]] || \
-  fail "AFWS_ALLOW_HOME_MOUNT did not silence the home-directory warning"
-
-codex_warning="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project 2>&1 >/dev/null)"
-[[ "$codex_warning" != *"looks like a home directory"* ]] || \
-  fail "codexfws inspected the visibility mount as its workspace"
-
-rm -rf "${FAKE_ROOT}/.ssh" "${FAKE_ROOT}/.claude" "${FAKE_ROOT}/.git"
-
-print -r -- "example-workstation:/remote/project/inner on ${FAKE_ROOT}/inner (macfuse, nodev, nosuid)" > "$FAKE_MOUNTS"
-
-expect_rejected "a mount that would hide another session's mount underneath it" \
-  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project
-
-sibling="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project/other)"
-[[ "$sibling" == *"Would mount"* ]] || fail "a sibling directory did not get its own mount"
-
-print -r -- "other-host:/remote/project on ${AFWS_MOUNT_BASE}/other-host/remote/project (macfuse)" > "$FAKE_MOUNTS"
-other_host="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/project)"
-[[ "$other_host" == *"Would mount"* ]] || fail "a mount belonging to another host was reused"
-
-# A mount that exists but cannot be read stands for a dead macFUSE mount.
+# A mount that exists but cannot be read stands for a dead macFUSE mount. It is
+# still found, but reported as stale rather than reusable, which is what sends
+# the caller to afws-remount instead of straight into a broken workspace.
 unreadable="${AFWS_MOUNT_BASE}/example-workstation/remote/dead"
 mkdir -p "$unreadable"
 chmod 000 "$unreadable"
 if ! ls -1 "$unreadable" >/dev/null 2>&1; then
   print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
-  for launcher in "$CLAUDE_LAUNCHER"; do
-    stale="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-      "$launcher" --dry-run example-workstation /remote/dead)"
-    [[ "$stale" == *"disconnected; reconnecting it before launch"* ]] || \
-      fail "${launcher:t} did not automatically repair a disconnected mount"
-    [[ "$stale" == *"Using a fresh SSH connection"* ]] || \
-      fail "${launcher:t} planned reconnection over the failed transport"
-    [[ "$stale" == *"Would unmount ${unreadable}"* ]] || \
-      fail "${launcher:t} did not plan to replace the disconnected mount"
-    [[ "$stale" == *"Would start "* ]] || \
-      fail "${launcher:t} stopped instead of continuing after planned repair"
-  done
+  dead="$(find_existing "$FAKE_MOUNTS" example-workstation /remote/dead)"
+  [[ "$dead" == NONE* ]] || \
+    fail "a disconnected mount was offered for reuse (${dead})"
+  [[ "$dead" == *"stale=${unreadable}"* ]] || \
+    fail "a disconnected mount was not reported as stale (${dead})"
+  [[ "$dead" == *"reason=error"* ]] || \
+    fail "a mount that answers with an error was not told apart from one that says nothing (${dead})"
 fi
 chmod 755 "$unreadable"
 
@@ -893,14 +1233,25 @@ probe_elapsed=$(( SECONDS - probe_started ))
 (( probe_elapsed < 5 )) || \
   fail "AFWS_PROBE_TIMEOUT_SECONDS was ignored; the probe took ${probe_elapsed}s"
 
+# Repair is afws-remount's job now that no launcher mounts a project tree.
+# A timeout must not be treated as proof of death there either: unmounting a
+# cold mount that was still setting up its first read costs a working mount.
 print -r -- "example-workstation:/remote/dead on ${unreadable} (macfuse)" > "$FAKE_MOUNTS"
-slow_launch="$(PATH="${SLOW_BIN}:$PATH" AFWS_PROBE_TIMEOUT_SECONDS=1 \
+slow_repair="$(PATH="${SLOW_BIN}:$PATH" AFWS_PROBE_TIMEOUT_SECONDS=1 \
   AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
-  "$CLAUDE_LAUNCHER" --dry-run example-workstation /remote/dead 2>&1 || true)"
-[[ "$slow_launch" == *"did not answer within 1 seconds"* ]] || \
-  fail "a launcher did not report an ambiguous mount timeout"
-[[ "$slow_launch" != *"reconnecting it before launch"* ]] || \
-  fail "a launcher automatically replaced a mount on timeout alone"
+  "$REMOUNT" --dry-run example-workstation /remote/dead 2>&1 || true)"
+[[ "$slow_repair" == *"does not prove it is disconnected"* ]] || \
+  fail "afws-remount did not report an ambiguous mount timeout (${slow_repair})"
+[[ "$slow_repair" == *"AFWS_PROBE_TIMEOUT_SECONDS=60"* ]] || \
+  fail "afws-remount did not offer a longer probe before replacing the mount"
+[[ "$slow_repair" != *"Would unmount"* ]] || \
+  fail "afws-remount replaced a mount on timeout alone"
+[[ "$slow_repair" == *"--force"* ]] || \
+  fail "afws-remount did not say what to do when the mount really is stuck"
+
+timeout_message="$(zsh -c 'AFWS_PROGRAM=test; source '"$LIBRARY"'; afws_stale_mount_message /some/path timeout')"
+[[ "$timeout_message" == *"not proof that it is dead"* ]] || \
+  fail "the timeout message stated more than the probe established"
 
 healthy_probe="$(zsh -c '
   set -eu
@@ -1306,17 +1657,17 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
     fail "could not create a test socket"
 
   shared="$(AFWS_STATE_DIR="$short_state" "$RUNNER" example-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$shared" == *"-S ${socket_path}"* ]] || fail "afws-run did not reuse the shared SSH connection"
+  [[ "$shared" == *"ControlPath=${socket_path}"* ]] || fail "afws-run did not reuse the shared SSH connection"
 
   shared_lock="$(AFWS_STATE_DIR="$short_state" "$LOCK" status --host example-workstation --dry-run)"
-  [[ "$shared_lock" == *"-S ${socket_path}"* ]] || fail "afws-lock did not reuse the shared SSH connection"
+  [[ "$shared_lock" == *"ControlPath=${socket_path}"* ]] || fail "afws-lock did not reuse the shared SSH connection"
 
   other="$(AFWS_STATE_DIR="$short_state" "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$other" != *"-S "* ]] || fail "afws-run reused a connection belonging to another host"
+  [[ "$other" != *"ControlPath=${socket_path}"* ]] || fail "afws-run reused a connection belonging to another host"
 
   mismatch="$(AFWS_STATE_DIR="$short_state" AFWS_CONTROL_PATH="$socket_path" \
     AFWS_SSH_HOST=example-workstation "$RUNNER" other-workstation --cwd /remote/project --dry-run -- pwd)"
-  [[ "$mismatch" != *"-S "* ]] || fail "afws-run applied the session socket to a different host"
+  [[ "$mismatch" != *"ControlPath=${socket_path}"* ]] || fail "afws-run applied the session socket to a different host"
 
   # Falling back to a separate connection is allowed and usually works: a
   # key-authenticated host takes that path on every call and gets where it was
@@ -1382,10 +1733,27 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
   [[ "$with_terminal" == *"FALLBACK=terminal"* ]] || fail "the fallback on a terminal was not recorded as such"
 
   reusing="$(fallback_state 1 example-workstation)"
-  [[ "$reusing" == *"-S ${socket_path}"* ]] || fail "the shared connection was not reused (${reusing})"
+  [[ "$reusing" == *"ControlPath=${socket_path}"* ]] || fail "the shared connection was not reused (${reusing})"
   [[ "$reusing" != *BatchMode* ]] || fail "a reused connection was given BatchMode it does not need"
   [[ "$reusing" == *"FALLBACK=" ]] || \
     fail "reusing a connection was recorded as a fallback (${reusing})"
+
+  # A master that dies must be replaced by whoever needs it next. -S alone only
+  # ever reuses, so a consumer that outlives its launcher -- the rclone view, an
+  # SSHFS mount -- was left holding a path to a socket nothing would recreate.
+  for state in "$no_terminal" "$with_terminal" "$reusing"; do
+    [[ "$state" == *"ControlMaster=auto"* ]] || \
+      fail "a consumer was left unable to re-open the shared connection (${state})"
+  done
+  [[ "$no_terminal" == *"ControlPath="* ]] || \
+    fail "the no-terminal fallback was given no control path to re-open"
+
+  grep -q 'ControlMaster=auto' "$LIBRARY" || \
+    fail "the shared connection is reused but never re-opened"
+  grep -Fq 'sshfs_options+=("${afws_control_master_option_list[@]}")' "$LIBRARY" || \
+    fail "an SSHFS mount cannot re-open the shared connection it outlives"
+  grep -q 'ssh_command+=" -o ControlMaster=auto' "$LIBRARY" || \
+    fail "the rclone view cannot re-open the shared connection it outlives"
 
   # Asking for separate connections on purpose is not a thing to report on.
   opted_out="$(PATH="${STUB_BIN}:$PATH" STUB_SSH_EXIT=255 AFWS_STATE_DIR="$short_state" \
@@ -1396,6 +1764,43 @@ s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$socket_path
 
   rm -rf "$short_state"
 fi
+
+# --- afws-doctor: failures that otherwise look like health ----------------
+# Both of these leave a mount that is present and a process that is running, so
+# nothing else in the suite -- or in the doctor as it stood -- reports them. The
+# first sign used to be a person noticing that a directory listing had got slow.
+
+reset_state
+doctor_mounts="${SANDBOX}/doctor-mounts.txt"
+stacked_path="${AFWS_MOUNT_BASE}/example-workstation/remote/project"
+{
+  print -r -- "localhost:/ on ${stacked_path} (nfs, nodev, nosuid)"
+  print -r -- "example-workstation:/remote/project on ${stacked_path} (macfuse, nodev, nosuid)"
+} > "$doctor_mounts"
+stacked_doctor="$(AFWS_MOUNT_COMMAND="cat ${doctor_mounts}" \
+  "${REPOSITORY_ROOT}/bin/afws-doctor" 2>&1 || true)"
+[[ "$stacked_doctor" == *"stacked on the same path"* ]] || \
+  fail "afws-doctor did not notice two filesystems mounted on one path"
+[[ "$stacked_doctor" == *"${stacked_path}"* ]] || \
+  fail "afws-doctor did not name the path that carries both"
+[[ "$stacked_doctor" == *"2 layers"* ]] || \
+  fail "afws-doctor did not say how many layers there are"
+[[ "$stacked_doctor" == *"Release every layer"* ]] || \
+  fail "afws-doctor did not warn that unmounting one layer uncovers the next"
+
+print -r -- "example-workstation:/remote/project on ${stacked_path} (macfuse)" > "$doctor_mounts"
+single_doctor="$(AFWS_MOUNT_COMMAND="cat ${doctor_mounts}" \
+  "${REPOSITORY_ROOT}/bin/afws-doctor" 2>&1 || true)"
+[[ "$single_doctor" == *"no mount is stacked"* ]] || \
+  fail "afws-doctor reported stacking where a single mount stands alone"
+
+# An arbitrary command must not be run here either, exactly as afws-peers
+# refuses one; the doctor falls back to 'mount' rather than obeying it.
+rm -f /tmp/afws-doctor-should-not-exist
+AFWS_MOUNT_COMMAND='touch /tmp/afws-doctor-should-not-exist' \
+  "${REPOSITORY_ROOT}/bin/afws-doctor" >/dev/null 2>&1 || true
+[[ ! -e /tmp/afws-doctor-should-not-exist ]] || \
+  fail "afws-doctor ran an arbitrary command from AFWS_MOUNT_COMMAND"
 
 # --- afws-peers -----------------------------------------------------------
 
@@ -1524,10 +1929,37 @@ direct_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
   fail "direct queue used the wrong thread ID"
 [[ "$(< "${AFWS_TEST_QUEUE_LOG}.messages")" == *'[AFWS peer message from cx-sender]'* ]] ||
   fail "queued message did not identify its sender"
-expect_rejected "direct queue to a Claude session" env PATH="${STUB_BIN}:$PATH" \
-  AFWS_SESSION_NAME=cx-sender "$MESSAGE" --to fws-review --message hello
+claude_direct_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
+  "$MESSAGE" --to fws-review --message 'Hello Claude')" || fail "direct Claude queue failed"
+[[ "$claude_direct_result" == 'Queued for fws-review.' ]] || fail "direct Claude queue output was wrong"
+claude_inbox_output="$(AFWS_SESSION_NAME=fws-review \
+  AFWS_INSTANCE_ID=fws-review-instance AFWS_SESSION_TOKEN=fws-review-token \
+  "$CLAUDE_INBOX" poll)" || fail "Claude inbox poll failed"
+[[ "$claude_inbox_output" == *'[AFWS peer message from cx-sender]'* &&
+   "$claude_inbox_output" == *'Hello Claude'* ]] || fail "Claude inbox lost its peer message"
+[[ -z "$(AFWS_SESSION_NAME=fws-review \
+  AFWS_INSTANCE_ID=fws-review-instance AFWS_SESSION_TOKEN=fws-review-token \
+  "$CLAUDE_INBOX" poll)" ]] || fail "Claude inbox did not consume its message once"
 expect_rejected "queue to a Codex session before its first turn" env PATH="${STUB_BIN}:$PATH" \
   AFWS_SESSION_NAME=cx-training "$MESSAGE" --to cx-sender --message hello
+
+PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
+  "$MESSAGE" --to fws-review --message 'Continue the review' >/dev/null ||
+  fail "Claude hook test message could not be queued"
+claude_hook_output="$(print -r -- '{"hook_event_name":"SessionStart","session_id":"claude-session-id","source":"startup"}' |
+  AFWS_SESSION_NAME=fws-review AFWS_INSTANCE_ID=fws-review-instance \
+  AFWS_SESSION_TOKEN=fws-review-token AFWS_SSH_HOST=alpha \
+  AFWS_REMOTE_DIR=/remote/project "$CLAUDE_HOOK")" || fail "Claude SessionStart hook failed"
+[[ "$claude_hook_output" == *'Continue the review'* ]] || fail "Claude hook did not inject its inbox"
+[[ "$(< "${AFWS_STATE_DIR}/session-meta/fws-review.thread")" == claude-session-id ]] ||
+  fail "Claude hook did not record its session ID"
+[[ "$(< "${AFWS_STATE_DIR}/session-meta/fws-review.state")" == idle ]] ||
+  fail "Claude SessionStart hook state was wrong"
+claude_stop_output="$(print -r -- '{"hook_event_name":"Stop","session_id":"claude-session-id","stop_hook_active":false}' |
+  AFWS_SESSION_NAME=fws-review AFWS_INSTANCE_ID=fws-review-instance \
+  AFWS_SESSION_TOKEN=fws-review-token AFWS_SSH_HOST=alpha \
+  AFWS_REMOTE_DIR=/remote/project "$CLAUDE_HOOK")" || fail "Claude Stop hook failed"
+[[ "$claude_stop_output" == '{}' ]] || fail "idle Claude Stop hook attempted to continue"
 
 : > "$AFWS_TEST_QUEUE_LOG"
 broadcast_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
@@ -1540,6 +1972,42 @@ broadcast_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
 PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \
   "$MESSAGE" --all --message 'Status please' >/dev/null || fail "all-peer broadcast failed"
 [[ "$(wc -l < "$AFWS_TEST_QUEUE_LOG" | tr -d ' ')" == 2 ]] || fail "broadcast missed a Codex peer"
+
+# The organization ledger is project-scoped, retains declared membership when
+# a session is offline, and overlays live state only when displayed.
+org() {
+  AFWS_SSH_HOST=alpha AFWS_REMOTE_DIR=/remote/project AFWS_SESSION_NAME=cx-sender \
+    AFWS_INSTANCE_ID=cx-sender-instance AFWS_SESSION_TOKEN=cx-sender-token "$ORG" "$@"
+}
+# Re-register the second test agent in this project; cross-project members are
+# deliberately rejected by the organization ledger.
+write_record cx-other codex "$$" alpha /remote/project 1000000002
+org init >/dev/null || fail "organization initialization failed"
+org add-team task-a cx-sender >/dev/null || fail "organization team creation failed"
+org add-member task-a cx-training 'Run regression tests' >/dev/null || fail "organization member creation failed"
+org add-team task-b cx-other >/dev/null || fail "second organization team creation failed"
+org set-scope cx-training 'tests/auth/**' >/dev/null || fail "organization write scope update failed"
+org set-state cx-training delivered >/dev/null || fail "organization delivery state update failed"
+org set-state cx-training acknowledged >/dev/null || fail "organization acknowledgement failed"
+org set-state cx-training running >/dev/null || fail "organization state update failed"
+org validate >/dev/null || fail "a valid organization failed validation"
+org_tree="$(org show)"
+[[ "$org_tree" == *'Coordinator: cx-sender'* && "$org_tree" == *'Team task-a'* &&
+   "$org_tree" == *'cx-training'*'running'*'Run regression tests'* ]] ||
+  fail "organization tree omitted structure or assignment (${org_tree})"
+org_json="$(org show --json)"
+[[ "$org_json" == *'"name":"task-a"'* && "$org_json" == *'"write_scope":"tests/auth"'* ]] ||
+  fail "organization JSON omitted machine-readable state (${org_json})"
+org move-member cx-training task-b --cancel-active >/dev/null || fail "organization member move failed"
+[[ "$(org show --team task-b)" == *cx-training* ]] || fail "moved member did not appear in the destination team"
+expect_rejected "removing a team lead" env AFWS_SSH_HOST=alpha AFWS_REMOTE_DIR=/remote/project \
+  AFWS_SESSION_NAME=cx-sender AFWS_INSTANCE_ID=cx-sender-instance AFWS_SESSION_TOKEN=cx-sender-token \
+  "$ORG" remove-member cx-other
+expect_rejected "an invalid organization task state" env AFWS_SSH_HOST=alpha AFWS_REMOTE_DIR=/remote/project \
+  AFWS_SESSION_NAME=cx-sender AFWS_INSTANCE_ID=cx-sender-instance AFWS_SESSION_TOKEN=cx-sender-token \
+  "$ORG" set-state cx-training invented
+python3 "${REPOSITORY_ROOT}/scripts/test_org_resilience.py" >/dev/null || \
+  fail "organization resilience tests failed"
 
 "$STATUS_HELPER" --help >/dev/null || fail "afws-status help failed"
 AFWS_SESSION_NAME=cx-training "$STATUS_HELPER" clear >/dev/null || fail "afws-status clear failed"
@@ -1811,5 +2279,108 @@ released_report="$(run_remote_lock release gpu0 session-b 0)"
 
 free_report="$(run_remote_lock status gpu0 session-b 0)"
 [[ "$free_report" == free\ gpu0* ]] || fail "lock status did not report a free lock"
+
+# --- afws-lab -------------------------------------------------------------
+# The work station is shared: 21 accounts, and ps is not restricted, so every
+# one of them can read another's command line. Two of these are about that, and
+# one is about not killing a tmux session the user made themselves.
+
+readonly LAB="${REPOSITORY_ROOT}/bin/afws-lab"
+
+reset_state
+[[ -x "$LAB" ]] || fail "afws-lab is not installed next to the other commands"
+"$LAB" --help >/dev/null || fail "afws-lab has no usage text"
+
+# A token on the command line is readable by every other account on the host,
+# so it is never put there: Jupyter generates one and it is read back out of
+# the runtime file it writes. This checks for something NOT being present,
+# which is the only way to keep it from quietly coming back.
+if grep -q 'ServerApp.token' "$LAB"; then
+  fail "afws-lab passes a token on the command line, where ps exposes it to every other account"
+fi
+grep -Fq 'ServerApp.ip=127.0.0.1' "$LAB" || \
+  fail "afws-lab does not pin JupyterLab to the loopback address"
+if grep -q '0\.0\.0\.0' "$LAB"; then
+  fail "afws-lab has a route to binding JupyterLab on every interface"
+fi
+
+# The user's own long-running tmux sessions live beside these. Killing by a
+# name that came from a record is not enough on its own.
+grep -Fq 'lab_tmux_name_is_ours' "$LAB" || \
+  fail "afws-lab kills a tmux session without checking the name is one of its own"
+
+# Reachability is not liveness. A dropped connection must never be read as
+# permission to tear down a session that is still running on the work station.
+grep -Fq 'lab_tmux_state" == present' "$LAB" || \
+  fail "afws-lab acts on a tmux session whose state it could not determine"
+
+# Sessions using one directory share one JupyterLab, counted the same way the
+# mounts are. A second counter would drift from the first.
+grep -Fq 'users-of-mount' "$LAB" || \
+  fail "afws-lab counts its users separately from the rest of the registry"
+
+lab_outside=0
+"$LAB" status >/dev/null 2>&1 || lab_outside=$?
+(( lab_outside == 2 )) || \
+  fail "afws-lab did not refuse to run outside a session (status ${lab_outside})"
+
+write_record fws-lab-session claude "$$" example-workstation /remote/project "$(date +%s)"
+lab_plan="$(AFWS_SESSION_NAME=fws-lab-session "$LAB" --dry-run 2>&1 || true)"
+[[ "$lab_plan" == *example-workstation* ]] || \
+  fail "afws-lab did not take the host from the session record (${lab_plan})"
+[[ "$lab_plan" == *afws-lab-* ]] || \
+  fail "afws-lab planned a tmux session outside its own namespace (${lab_plan})"
+
+# --- lib/afws-fs-mcp.py ---------------------------------------------------
+# The MCP server is what lets a remote-first Claude session keep structured
+# file tools without a mount. Its one hard boundary is the project directory,
+# and a path that climbs out must be refused before it can reach ssh at all.
+
+readonly FS_MCP="${REPOSITORY_ROOT}/lib/afws-fs-mcp.py"
+[[ -f "$FS_MCP" ]] || fail "the remote-filesystem MCP server is missing"
+
+mcp_call() {
+  # mcp_call TOOL JSON_ARGUMENTS -> the text of the single tool result
+  {
+    print -r -- '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+    print -r -- "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"${1}\",\"arguments\":${2}}}"
+  } | AFWS_SSH_HOST=afws-test-unreachable-host AFWS_REMOTE_DIR=/remote/project \
+      python3 "$FS_MCP" 2>&1 | tail -1
+}
+
+mcp_missing=0
+print -r -- '{}' | python3 "$FS_MCP" >/dev/null 2>&1 || mcp_missing=$?
+(( mcp_missing == 2 )) || \
+  fail "the MCP server started without being told which host and directory to serve"
+
+mcp_tools="$(print -r -- '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
+  AFWS_SSH_HOST=example AFWS_REMOTE_DIR=/remote/project python3 "$FS_MCP" 2>&1)"
+for tool in read_file write_file edit_file list_directory glob grep stat; do
+  [[ "$mcp_tools" == *"\"${tool}\""* ]] || \
+    fail "the MCP server does not offer ${tool}, so that work falls back to the shell"
+done
+
+# The host below does not exist. A refusal that still arrives proves the path
+# was rejected here rather than out on the work station.
+climbing="$(mcp_call read_file '{"path":"../../../etc/passwd"}')"
+[[ "$climbing" == *'"isError": true'* ]] || \
+  fail "a path climbing out of the project was accepted (${climbing})"
+[[ "$climbing" == *"climb out of the project"* ]] || \
+  fail "the refusal did not say why the path was rejected (${climbing})"
+
+absolute="$(mcp_call read_file '{"path":"/etc/passwd"}')"
+[[ "$absolute" == *'"isError": true'* ]] || \
+  fail "an absolute path outside the project was accepted (${absolute})"
+
+for confined_tool in write_file list_directory glob stat; do
+  case "$confined_tool" in
+    write_file) arguments='{"path":"../escaped","content":"x"}' ;;
+    glob)       arguments='{"pattern":"../*"}' ;;
+    *)          arguments='{"path":"../.."}' ;;
+  esac
+  refused="$(mcp_call "$confined_tool" "$arguments")"
+  [[ "$refused" == *'"isError": true'* ]] || \
+    fail "${confined_tool} accepted a path outside the project (${refused})"
+done
 
 print -r -- "All tests passed."

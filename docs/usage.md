@@ -26,19 +26,26 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 
 ## What happens at startup
 
-1. Claude looks for an SSHFS working tree; Codex looks for a Finder/VS Code rclone NFS view.
-2. Codex itself starts in an empty local control directory and treats the remote project as authoritative.
-3. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
+1. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
+2. `codexfws` brings up a Finder/VS Code rclone NFS view, reusing a healthy one that is already there. `claudefws` mounts nothing unless given `--view`.
+3. Both agents start in an empty local control directory and treat the remote project as authoritative.
 4. It picks an unused session name of the form `fws-HOST-PROJECT-N` for Claude
    or `cx-HOST-PROJECT-N` for Codex.
 5. It records the session in `~/.afws/sessions/` so other sessions can see what this one is working on.
-6. Claude starts in its mount; Codex starts in the control directory and performs every project operation through `afws-run`.
+6. The agent performs every project operation through `afws-run`, which starts in the remote project directory.
 
 Codex also attaches four local lifecycle hooks. Review and trust them when
 Codex prompts. They record the thread ID, status, and short task label after
 the first turn so another session can address this one.
 
-Both agents run on the Mac. Under Codex, project reads, edits, Git, tests and builds all run on the SSH host. Its work continues if the visibility mount drops.
+Both agents run on the Mac. Project reads, edits, Git, tests and builds all run
+on the SSH host. The work continues if a view drops, because no view is a data
+path: the empty control directory is the agent's own working directory, which is
+what keeps its file tools off a local copy that could be stale or incomplete.
+
+An interactive session sets its terminal title to `[session] project | agent-for-work-station`; for example, `AFWS_SESSION_NAME=ngof-1` produces `[ngof-1] ngof | agent-for-work-station`. Set `AFWS_NO_TERMINAL_TITLE=1` at launch when the terminal should manage its own title. Background sessions do not change it.
+
+Additional sessions reuse a healthy view at the same mount point, including an existing SSHFS mount. They do not remount it or require existing sessions to exit just to switch to rclone. A new view uses rclone when no mount is present. A launcher refuses to mount anything on a path that already carries a filesystem: stacking a second one there hides the first rather than replacing it, and releasing the top layer afterwards only uncovers the next.
 
 ## Control a session from another device
 
@@ -46,13 +53,21 @@ In an interactive `claudefws` session, enter `/remote-control` (or `/rc`) in
 Claude's prompt. It makes that conversation available through Claude on the web
 or mobile app. Enter the command again to check its status or disconnect.
 
-Inside a `codexfws` session, ask Codex to turn Remote Control on or off, or run:
+Inside a `codexfws` session, ask Codex to turn Remote Control off or report its
+status, or run:
+
+```zsh
+afws-remote status   # check the connection
+afws-remote off      # disable Remote Control; keep local sessions running
+```
+
+`on` and `pair` widen access to a daemon shared by this whole Mac, so they ask
+for confirmation on the controlling terminal and refuse when there is none. An
+agent session has none, which is the point: run these two in your own shell.
 
 ```zsh
 afws-remote on       # enable the shared Codex app server on this Mac
-afws-remote status   # check the connection
 afws-remote pair     # print a short-lived device pairing code
-afws-remote off      # disable Remote Control; keep local sessions running
 ```
 
 Codex Remote Control applies to other Codex sessions on this Mac and stays set
@@ -245,18 +260,19 @@ claudefws --bg SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY "watch the training job
 ## Ending a session
 
 When a session exits, the launcher releases what that session was the last user
-of: its registry record, the SSHFS mount when no other session is working inside
-it, and the shared SSH connection when no other session is on that host. A mount
-that another session is still using is kept, and so is any mount outside
-`~/afws-mounts`, which claudefws did not create.
+of: its registry record, any view it started when no other session is using it,
+the JupyterLab `afws-lab` started when no other session needs it, and the shared
+SSH connection when no other session is on that host. A view another session is
+still using is kept, and so is any mount outside `~/afws-mounts`, which the
+launchers did not create.
 
 Interactive sessions also start a detached watchdog. If a `claudefws` or
 `codexfws` launcher is killed outright or crashes, the watchdog waits for any
 surviving agent process, then performs the same last-user checks and cleanup.
 It never unmounts a workspace another registered session is using.
 
-A background Claude session has no launcher watchdog and leaves its mount in
-place. A watchdog can also fail to clean up when it is killed too or when macOS
+A background Claude session has no launcher watchdog and leaves any view it
+started in place. A watchdog can also fail to clean up when it is killed too or when macOS
 refuses the unmount. Release leftovers explicitly:
 
 ```zsh
@@ -295,12 +311,75 @@ unusable to all of them. Replacing a responding or merely timed-out shared mount
 is refused unless the user explicitly approves interrupting all sessions with
 `--force-shared`.
 
-To keep the mount after the session ends, for example because you are about to
+To keep a view after the session ends, for example because you are about to
 start another session on it, set `AFWS_KEEP_MOUNT=1` for that launch.
+
+## Reading the project: JupyterLab
+
+A view is for looking at file names; `afws-lab` is for reading content. It runs
+JupyterLab on the workstation, inside a `tmux` session of its own, and forwards
+it to a local port:
+
+```zsh
+afws-lab                    # start, or repair and reuse the one already running
+afws-lab --force            # rebuild even a layer whose state is undetermined
+afws-lab status             # per-layer health, and the next step for the broken one
+afws-lab open               # open it in the browser
+afws-lab list               # every lab, and the sessions using each
+afws-lab stop
+afws-lab stop --orphaned    # stop the labs no live session is using
+afws-lab -n                 # print what would change, change nothing
+```
+
+Because the server runs on the workstation, it reads the project as the
+workstation has it: symlinks resolve, images and PDFs render, notebooks run
+against the remote kernel, and Markdown renders with its images in place. A
+mount that is slow, stale or absent has no bearing on it.
+
+One lab serves every session on the same host and remote directory — the same
+sharing rule a view follows — and it is released when the last of those sessions
+exits. `start` is also the repair path: it checks the `tmux` session, the server
+process, the forwarded port and the HTTP endpoint in turn, and rebuilds only the
+layers that are actually broken. A dropped connection therefore costs a
+reconnect rather than a restart, and open notebooks keep their state.
+
+Two details matter on a shared machine. The port is not fixed: JupyterLab picks
+a free one and `afws-lab` reads it back, so two people cannot collide. And the
+token is never passed on the command line, because `ps` is readable by other
+users on most systems; it is read from the server's own runtime file instead.
+
+`afws-lab` needs JupyterLab on the workstation, invoked as `python3 -m
+jupyterlab`. A distribution's `jupyter` command is often the classic notebook
+package without JupyterLab in it, so the check is deliberately for the module
+rather than for a command called `jupyter`.
+
+## Structured file tools without a mount: the MCP server
+
+`lib/afws-fs-mcp.py` is a stdio MCP server that runs on this Mac and reaches the
+remote project over the session's shared SSH connection. It gives an agent
+`read_file`, `write_file`, `edit_file`, `list_directory`, `glob`, `grep` and
+`stat` — the structured operations that would otherwise be lost when the project
+is only reachable as shell output.
+
+It reads `AFWS_SSH_HOST`, `AFWS_REMOTE_DIR`, and optionally `AFWS_CONTROL_PATH`
+and `AFWS_CONTROL_PERSIST`, all of which a session already exports. It is not
+wired into the launchers, so point Claude Code at it explicitly:
+
+```zsh
+claude --mcp-config '{"mcpServers":{"afws-fs":{"command":"python3",
+  "args":["'"$HOME"'/.local/lib/afws-fs-mcp.py"]}}}'
+```
+
+Every path is confined to `AFWS_REMOTE_DIR`. The check happens on the remote
+after the path is resolved, not as a string test here, because a path can leave
+the project through a symlink that no amount of local checking would reveal.
+`stat` is the one operation that does not follow a link: it reports the link and
+its target instead, so a `venv` whose `bin/python3` points outside the project
+is still visible for what it is.
 
 ## Preview without making changes
 
-Use dry-run mode to print the planned operation without mounting SSHFS, writing to the registry, or starting the agent:
+Use dry-run mode to print the planned operation without mounting anything, writing to the registry, or starting the agent:
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
@@ -323,13 +402,16 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_MOUNT_BASE` | Root for new mounts (default: `~/afws-mounts`) |
 | `AFWS_STATE_DIR` | Session registry root (default: `~/.afws`) |
 | `AFWS_PERMISSION_MODE` | Claude Code permission mode, `claudefws` only (default: `auto`) |
+| `AFWS_NO_AGENT_TEAMS` | Leave Claude Code's experimental Agent Teams disabled for this launch |
 | `AFWS_SESSION_NAME` | Use this session name instead of a generated one |
 | `AFWS_REMOTE_LOCK_DIR` | Remote lock root (default: `~/.afws-locks`) |
 | `AFWS_NO_CONTROL_MASTER` | Set to any value to authenticate separately for every connection |
-| `AFWS_KEEP_MOUNT` | Set to any value to leave the mount in place when the session ends |
+| `AFWS_KEEP_MOUNT` | Set to any value to leave the Finder/VS Code view in place when the session ends |
+| `AFWS_VISIBILITY_MOUNT` | Set to any value to mount the Finder/VS Code view by default (`claudefws` only; `--no-view` overrides it) |
 | `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
-| `AFWS_ALLOW_HOME_MOUNT` | Set to any value to silence the home-directory warning |
 | `AFWS_ADD_DIR` | Extra local directories the session may read, colon-separated (`claudefws` only) |
+| `AFWS_REMOTE_ASSUME_YES` | Skip the terminal confirmation `afws-remote on` and `pair` require. For your own scripts, not for getting an agent session past the check |
+| `AFWS_CODEX_AUTO_REVIEW` | Set to any value to route Codex approval requests to its own reviewing agent instead of deciding them in-session (`codexfws` only) |
 | `AFWS_KEEP_CONTROL_MASTER` | Set to any value to keep the shared connection open after the last session exits |
 | `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600, or 28800 with `AFWS_KEEP_CONTROL_MASTER`) |
 | `AFWS_PROBE_TIMEOUT_SECONDS` | Seconds an existing mount is given to answer its first read (default: 20) |
@@ -338,6 +420,11 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 Inside a running session the launcher also exports `AFWS_SSH_HOST`, `AFWS_REMOTE_DIR`, and `AFWS_LOCAL_WORKSPACE`, which is how `afws-run` and `afws-lock` can be used without repeating the host.
 
 To give a session a different permission mode, set the variable for that launch only. The accepted values are the ones Claude Code accepts: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, and `plan`. An unrecognised value is rejected before anything is mounted.
+
+`claudefws` enables Claude Code Agent Teams and a project-shared native task
+list by default. Set `AFWS_NO_AGENT_TEAMS=1` when a policy or compatibility
+issue requires the experimental feature to remain off. AFWS organization,
+peer delivery, and lifecycle hooks continue to work without Agent Teams.
 
 ```zsh
 AFWS_PERMISSION_MODE=manual claudefws SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY

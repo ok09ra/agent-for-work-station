@@ -1,0 +1,8 @@
+#!/bin/zsh
+set -eu
+readonly SCRIPT_DIR="${0:A:h}"
+for backend in "${SCRIPT_DIR}/../lib/afws-orchestrator.py" "${HOME}/.local/lib/afws-orchestrator.py"; do
+  [[ -r "$backend" ]] && exec python3 "$backend" "$@"
+done
+print -u2 -r -- "afws-org: cannot find lib/afws-orchestrator.py; run ./scripts/install.sh"
+exit 2

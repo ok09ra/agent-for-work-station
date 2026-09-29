@@ -13,7 +13,22 @@ This guide covers the path from a mostly clean Mac to a working `claudefws` inst
 
 This setup does not modify software or shell configuration on the remote host.
 
-## 2. Install macFUSE
+## 2. Install rclone, for the Finder/VS Code view
+
+Neither agent needs a mount to reach the project, so this is only for looking
+at the tree in Finder or VS Code. `codexfws` mounts that view on every launch
+and `claudefws` does so with `--view`.
+
+```zsh
+rclone version
+```
+
+## 3. macFUSE and SSHFS, only to repair an older mount
+
+Nothing creates an SSHFS mount any more. Install these two only if you still
+have one to repair with `afws-remount`; otherwise skip to the next step.
+
+### macFUSE
 
 1. Open the [official macFUSE website](https://macfuse.github.io/).
 2. Download and run the latest stable installer.
@@ -22,7 +37,7 @@ This setup does not modify software or shell configuration on the remote host.
 
 Because macFUSE interacts with macOS security controls, this part is intentionally not automated by the repository.
 
-## 3. Install SSHFS
+### SSHFS
 
 1. Open the [macFUSE project's SSHFS page](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS).
 2. Download and run the latest package for macOS.
@@ -152,7 +167,7 @@ Start without arguments if you do not want real values stored in shell history:
 claudefws
 ```
 
-Enter the SSH alias and the allowed remote project's absolute path when prompted. After SSHFS mounts the project, the agent starts with that mount as its working directory. `codexfws` takes the same arguments.
+Enter the SSH alias and the allowed remote project's absolute path when prompted. The agent starts in an empty local control directory and reaches the project through `afws-run`, so nothing is mounted unless you ask for a view. `codexfws` takes the same arguments and brings up that view on every launch.
 
 With `claudefws`, the first launch in a new mount point shows the Claude Code workspace trust prompt, because the directory has not been opened before. Confirm it once per mount point.
 
@@ -160,7 +175,7 @@ With `claudefws`, the first launch in a new mount point shows the Claude Code wo
 
 Exiting the agent releases the mount, unless another session is still working inside it, of either agent. The shared SSH connection to the host is closed at the same time, once no session is left on that host. The registry record for the finished session is removed too, and stale records are pruned whenever `afws-peers` or `claudefws` runs.
 
-While a session is running, the launcher reuses any existing SSHFS mount that already covers the requested host and path, because it looks at the system `mount` table rather than at its own records.
+While a session is running, a launcher that is mounting a view reuses any existing mount that already covers the requested host and path, because it looks at the system `mount` table rather than at its own records. It refuses to mount onto a path something is already mounted on, because that would stack rather than replace.
 
 An interactive session also has a detached watchdog: if its launcher is killed
 or crashes, cleanup runs after any surviving agent process exits. A background

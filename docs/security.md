@@ -14,7 +14,7 @@ Repository examples use reserved invalid domains and descriptive placeholders on
 
 ## Runtime boundaries
 
-`claudefws` starts Claude Code in the mounted project directory with the `auto` permission mode, and `codexfws` starts Codex CLI there with the `workspace-write` sandbox and `on-request` approvals. It scopes the workspace to the selected project directory and refuses to mount the remote filesystem root.
+`claudefws` starts Claude Code with the `auto` permission mode, and `codexfws` starts Codex CLI with the `workspace-write` sandbox and `on-request` approvals. Both start in an empty local control directory and reach the selected project through `afws-run`, which starts in that directory; a view, where one is mounted, is scoped to the same project and the remote filesystem root is refused.
 
 The `auto` mode approves operations it classifies as safe without asking, so the threshold for a side effect is lower than in `manual` mode, where every operation is confirmed. That is a deliberate default for remote work, where a session runs many read-only remote commands. Choose a stricter mode per launch when the work warrants it:
 
@@ -98,16 +98,19 @@ that, and both are yours to set:
   the mount is scoped to. The mount is a convenience boundary, not a security
   boundary, as long as that is true.
 
-A launcher says so when it notices: a workspace containing `.ssh`, `.claude` or
-`.codex` is reported as looking like a home directory, naming the settings file
-it pulls in as project settings. It is a warning, not a refusal, because your
-account's permissions still apply either way; `AFWS_ALLOW_HOME_MOUNT=1` silences
-it. And `afws-doctor HOST` reports an agent installed on the workstation when a
+Nothing warns about this now. The launchers stopped inspecting the workspace
+when they stopped mounting the project into one — with the agent reaching the
+tree through `afws-run`, there is no local directory to examine before the
+session starts. Naming the project directory rather than the home is therefore
+yours to get right; with `--view`, a `.claude/settings.json` in a home
+directory still becomes this session's project settings.
+
+`afws-doctor HOST` reports an agent installed on the workstation when a
 shared connection is already open, because two installations mean two diverging
 sets of permission rules and two versions.
 
-**It does not reduce what the model sees.** A file read through the mount goes
-to the model exactly as it would if the agent ran on the workstation. If some
+**It does not reduce what the model sees.** A file the agent reads goes to the
+model exactly as it would if the agent ran on the workstation. If some
 data must not leave the machine, the answer is not to mount it.
 
 The boundary that actually holds is on the workstation side: a separate SSH key

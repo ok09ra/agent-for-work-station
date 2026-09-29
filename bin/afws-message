@@ -15,6 +15,7 @@ done
 typeset -f afws_read_record >/dev/null || afws_die "cannot find lib/afws-common.zsh; run ./scripts/install.sh"
 
 readonly PEERS="${SCRIPT_DIR}/afws-peers"
+readonly CLAUDE_INBOX="${SCRIPT_DIR}/afws-claude-inbox"
 target_name=""
 broadcast=0
 same_only=0
@@ -26,7 +27,7 @@ usage() {
   print -r -- "  afws-message --to SESSION_NAME --message TEXT"
   print -r -- "  afws-message --all [--same | --host SSH_HOST] --message TEXT"
   print -r -- ""
-  print -r -- "Queues a message for a live Codex session. --all sends to every live"
+  print -r -- "Queues a message for one live Codex or Claude session. --all sends to every live"
   print -r -- "Codex session in the chosen scope, excluding this session. A queued"
   print -r -- "message is not proof that the recipient has completed the request."
 }
@@ -62,7 +63,6 @@ else
   afws_validate_session_name "$target_name"
 fi
 [[ -z "$filter_host" ]] || afws_validate_host "$filter_host"
-command -v codex >/dev/null 2>&1 || afws_die "codex command not found"
 [[ -x "$PEERS" ]] || afws_die "afws-peers is not installed next to afws-message"
 
 listing="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-message.XXXXXX")" || exit 1
@@ -97,9 +97,20 @@ while (( index < 512 )); do
     [[ "$peer_agent" == codex ]] || continue
   fi
 
-  if [[ "$peer_agent" != codex ]]; then
-    afws_die "${peer_name} is a Claude session; external Codex queue cannot address it"
+  if [[ "$peer_agent" == claude ]]; then
+    (( broadcast )) && continue
+    [[ -x "$CLAUDE_INBOX" ]] || afws_die "afws-claude-inbox is not installed next to afws-message"
+    if "$CLAUDE_INBOX" enqueue "$peer_name" "$wrapped" >/dev/null; then
+      print -r -- "Queued for ${peer_name}."
+      sent=$(( sent + 1 ))
+      break
+    fi
+    failed=$(( failed + 1 ))
+    break
+  elif [[ "$peer_agent" != codex ]]; then
+    afws_die "${peer_name} has an unsupported agent type: ${peer_agent}"
   fi
+  command -v codex >/dev/null 2>&1 || afws_die "codex command not found"
   if [[ -z "$peer_thread" ]]; then
     if (( broadcast )); then
       print -u2 -r -- "Skipped ${peer_name}: no Codex thread ID yet (start its first turn and trust the hooks)."

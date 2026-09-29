@@ -1,0 +1,82 @@
+#!/bin/zsh
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-claude-inbox"
+readonly SCRIPT_DIR="${0:A:h}"
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+typeset -f afws_read_record >/dev/null || afws_die "cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-claude-inbox enqueue SESSION_NAME MESSAGE"
+  print -r -- "  afws-claude-inbox poll"
+  print -r -- ""
+  print -r -- "Internal durable delivery adapter used by afws-message and claudefws hooks."
+}
+
+queue_for() {
+  afws_validate_session_name "$1"
+  print -r -- "${AFWS_STATE_DIR}/claude-inbox/$1"
+}
+
+command_name="${1-}"
+case "$command_name" in
+  -h|--help) usage; exit 0 ;;
+  enqueue)
+    (( $# == 3 )) || afws_die "enqueue needs SESSION_NAME and MESSAGE"
+    target_name="$2"
+    body="$3"
+    [[ -n "$body" && ${#body} -le 10000 ]] ||
+      afws_die "message must contain 1 to 10000 characters"
+    target_record="${AFWS_SESSION_DIR}/${target_name}.conf"
+    [[ -r "$target_record" ]] || afws_die "unknown Claude session: ${target_name}"
+    afws_read_record "$target_record" || afws_die "invalid session record: ${target_name}"
+    [[ "$afws_record_agent" == claude ]] || afws_die "${target_name} is not a Claude session"
+    queue="$(queue_for "$target_name")"
+    mkdir -p "$queue"
+    chmod 700 "$AFWS_STATE_DIR" "${AFWS_STATE_DIR}/claude-inbox" "$queue" 2>/dev/null || true
+    temporary="$(umask 077; mktemp "${queue}/message.XXXXXX")" || exit 1
+    trap 'rm -f "$temporary"' EXIT
+    print -rn -- "$body" > "$temporary"
+    mv "$temporary" "${temporary}.msg"
+    trap - EXIT
+    print -r -- "Queued for ${target_name}."
+    ;;
+  poll)
+    (( $# == 1 )) || afws_die "poll takes no arguments"
+    [[ -n "${AFWS_SESSION_NAME-}" ]] || afws_die "poll requires an active work-station session"
+    record="${AFWS_SESSION_DIR}/${AFWS_SESSION_NAME}.conf"
+    [[ -r "$record" ]] || afws_die "current session record is missing"
+    afws_read_record "$record" || afws_die "current session record is invalid"
+    [[ "$afws_record_agent" == claude &&
+       "$afws_record_instance_id" == "${AFWS_INSTANCE_ID-}" ]] ||
+      afws_die "current session is not the registered Claude instance"
+    expected_hash="$(print -rn -- "${AFWS_SESSION_TOKEN-}" | shasum -a 256 | awk '{print $1}')"
+    [[ -n "${AFWS_SESSION_TOKEN-}" && "$expected_hash" == "$afws_record_token_hash" ]] ||
+      afws_die "current Claude session token is invalid"
+    queue="$(queue_for "$AFWS_SESSION_NAME")"
+    [[ -d "$queue" ]] || exit 0
+    delivered=0
+    for message_file in "$queue"/*.msg(Nom); do
+      (( delivered < 20 )) || break
+      claimed="${message_file}.claim.$$"
+      mv "$message_file" "$claimed" 2>/dev/null || continue
+      if [[ -s "$claimed" ]]; then
+        (( delivered == 0 )) || print -r -- ""
+        /bin/cat "$claimed"
+        print -r -- ""
+      fi
+      rm -f "$claimed"
+      delivered=$(( delivered + 1 ))
+    done
+    ;;
+  *) usage >&2; exit 2 ;;
+esac

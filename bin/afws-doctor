@@ -51,8 +51,16 @@ check_command sshfs "install the signed SSHFS package linked from the macFUSE pr
 check_command rclone "install rclone; codexfws uses its NFS mount for Finder/VS Code"
 check_command diskutil "diskutil is included with macOS; failed mounts may need a forced detach"
 check_command plutil "plutil is included with macOS; Claude session status needs it"
+check_command python3 "install Python 3; afws-org uses its standard-library SQLite driver"
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -c 'import sqlite3,sys; raise SystemExit(sys.version_info < (3,10))' 2>/dev/null; then
+    pass "python3 is new enough for afws-org and includes SQLite"
+  else
+    fail "afws-org requires Python 3.10 or newer with sqlite3"
+  fi
+fi
 
-for command_name in afws-run afws-push afws-peers afws-lock afws-remount afws-umount; do
+for command_name in afws-run afws-push afws-peers afws-message afws-org afws-lock afws-remount afws-umount afws-lab; do
   check_command "$command_name" "run this repository's installer and start a new login shell"
 done
 
@@ -73,6 +81,8 @@ if command -v claude >/dev/null 2>&1; then
     fail "claude agents --json failed; sign in with 'claude auth login' and retry"
   fi
   check_command claudefws "run this repository's installer and start a new login shell"
+  check_command afws-claude-inbox "run this repository's installer and start a new login shell"
+  check_command afws-claude-hook "run this repository's installer and start a new login shell"
 else
   note "claude is not installed; claudefws will not work"
 fi
@@ -121,6 +131,81 @@ if (( library_found )); then
     fail "AFWS_STATE_DIR is too deep for a shared-connection socket: ${socket_probe}"
   else
     pass "shared-connection socket paths fit in a Unix socket"
+  fi
+fi
+
+# Two things go wrong quietly enough that the first sign of either is a person
+# noticing that a directory listing has become slow. Neither shows up in the
+# checks above, because each one leaves a mount that is present and a process
+# that is running.
+if (( library_found )); then
+  # A filesystem mounted on a path that already carries one does not replace
+  # it: it stacks. The newest layer answers and the older is unreachable, so
+  # when the top process dies its corpse answers ENXIO for every path while a
+  # healthy mount sits underneath. Unmounting one layer uncovers the next,
+  # which is why a repair can look like it worked and fail again hours later.
+  # Read the mount table the way the library does, so this check can be
+  # exercised without mounting anything. The accepted spellings are the same
+  # two afws_validate_environment allows; anything else is not run.
+  case "${AFWS_MOUNT_COMMAND-mount}" in
+    mount|cat\ *) doctor_mount_command="${AFWS_MOUNT_COMMAND-mount}" ;;
+    *) doctor_mount_command=mount ;;
+  esac
+
+  typeset -A layers_at
+  stacked=""
+  while IFS= read -r mount_line; do
+    mount_path="${mount_line#* on }"
+    mount_path="${mount_path%% \(*}"
+    [[ "$mount_path" == "${AFWS_MOUNT_BASE}"/* ]] || continue
+    layers_at[$mount_path]=$(( ${layers_at[$mount_path]:-0} + 1 ))
+  done < <(${=doctor_mount_command})
+  for mount_path in ${(k)layers_at}; do
+    (( layers_at[$mount_path] > 1 )) || continue
+    stacked+="       ${mount_path} — ${layers_at[$mount_path]} layers"$'\n'
+  done
+  if [[ -n "$stacked" ]]; then
+    fail "filesystems are stacked on the same path; the top one hides the rest:
+${stacked%$'\n'}
+       See them with: afws-umount --list
+       Release every layer, not just the top one, before mounting again."
+  else
+    pass "no mount is stacked on top of another"
+  fi
+
+  # The reverse of the orphan check above: a mount helper that holds a path to
+  # a shared connection which is gone. ssh does not complain -- it connects on
+  # its own and leaves the path empty -- so the process keeps paying a full
+  # handshake per operation, or fails outright, with nothing said about why.
+  unanchored=""
+  # No IFS= here: the pid has to split off from the command line.
+  while read -r process_pid process_command; do
+    case "$process_command" in
+      *sshfs*|*rclone*) ;;
+      *) continue ;;
+    esac
+    socket_reference=""
+    case "$process_command" in
+      *ControlPath=*)
+        socket_reference="${process_command#*ControlPath=}"
+        socket_reference="${socket_reference%% *}"
+        ;;
+      *" -S "*)
+        socket_reference="${process_command#* -S }"
+        socket_reference="${socket_reference%% *}"
+        ;;
+    esac
+    [[ -n "$socket_reference" && "$socket_reference" != -* ]] || continue
+    [[ -S "$socket_reference" ]] && continue
+    unanchored+="       pid ${process_pid} → ${socket_reference}"$'\n'
+  done < <(ps -axo pid=,command= 2>/dev/null)
+  if [[ -n "$unanchored" ]]; then
+    fail "a mount helper is holding a shared connection that no longer exists:
+${unanchored%$'\n'}
+       Every operation it makes pays a full handshake, or fails outright.
+       Recreate the mount with afws-remount so it picks up a live connection."
+  else
+    pass "no mount helper references a shared connection that is gone"
   fi
 fi
 
