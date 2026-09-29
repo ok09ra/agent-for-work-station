@@ -288,6 +288,7 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_SHELL_MARKER` | 値を設定すると、ローカル実行への印付けを止めます |
 | `AFWS_ADD_DIR` | セッションが追加で読めるローカルディレクトリ。`:`区切り（`claudefws`のみ） |
 | `AFWS_REMOTE_ASSUME_YES` | `afws-remote on`と`pair`の端末確認を省きます。自分のスクリプト用であり、agentセッションが確認を回避するためのものではありません |
+| `AFWS_CODEX_TIGHTEN` | 値を設定すると、サンドボックス内のCodexコマンドに`~/.ssh`・`~/.codex`・`~/.claude`・work-stationレジストリを読ませません。それ以外の読み取りは開いたままで、`afws-run`はサンドボックス外へ昇格するため影響を受けません（`codexfws`のみ）|
 | `AFWS_CODEX_AUTO_REVIEW` | 値を設定すると、Codexの承認要求をセッション内で判断させず、Codex自身の審査agentに回します（`codexfws`のみ） |
 | `AFWS_KEEP_CONTROL_MASTER` | 値を設定すると、最後のセッション終了後も共有接続を開いたままにします |
 | `AFWS_CONTROL_PERSIST` | 共有SSH接続が無通信で維持される秒数（既定: 600、`AFWS_KEEP_CONTROL_MASTER`指定時は28800） |

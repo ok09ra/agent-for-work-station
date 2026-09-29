@@ -64,6 +64,12 @@ usage() {
   print -r -- "  AFWS_KEEP_MOUNT          Leave the mount in place when the session ends"
   print -r -- "  AFWS_NO_TERMINAL_TITLE   Do not set the interactive terminal tab title"
   print -r -- "  AFWS_ADD_DIR             Legacy colon-separated form of --allow-local-files"
+  print -r -- "  AFWS_CODEX_TIGHTEN       Deny sandboxed commands the credentials and agent"
+  print -r -- "                           configuration they never need to read: ~/.ssh,"
+  print -r -- "                           ~/.codex, ~/.claude and the work-station registry."
+  print -r -- "                           Reading the rest of the machine stays open. Applies"
+  print -r -- "                           to sandboxed commands only; afws-run escalates out"
+  print -r -- "                           of the sandbox and is unaffected."
   print -r -- "  AFWS_CODEX_AUTO_REVIEW   Route approval requests to Codex's own reviewing"
   print -r -- "                           agent instead of deciding them in-session. Off by"
   print -r -- "                           default: a managed Codex configuration can refuse"
@@ -211,6 +217,43 @@ if (( ! dry_run )); then
   chmod 700 "$AFWS_CONTROL_WORKSPACE_DIR" "$afws_local_workspace" 2>/dev/null || true
 fi
 
+# An explicit permission profile replaces workspace-write's filesystem rules
+# rather than adding to them, so everything the session legitimately writes has
+# to be named -- including the temporary directories, which workspace-write
+# grants implicitly and a profile does not. Reads stay open except for the
+# credentials and agent configuration: an agent that cannot look around guesses,
+# but nothing it does needs this Mac's private keys.
+typeset -a permission_arguments
+permission_arguments=()
+if [[ -n "${AFWS_CODEX_TIGHTEN-}" ]]; then
+  permission_profile="$(python3 -c '
+import json, os, sys
+workspace, home, temporary = sys.argv[1:4]
+extra = [item for item in sys.argv[4:] if item]
+rules = {":root": "read", workspace: "write", "/tmp": "write"}
+if temporary:
+    rules[temporary.rstrip("/")] = "write"
+for directory in extra:
+    rules[directory] = "write"
+# Denied after the writes above so a nested workspace still wins: the more
+# specific path decides, which is what puts the control workspace back inside a
+# denied registry.
+for denied in (".ssh", ".codex", ".claude", ".afws"):
+    rules.setdefault(os.path.join(home, denied), "deny")
+rules[workspace] = "write"
+# -c parses its value as TOML, so this has to be an inline table, not JSON:
+# the difference is the "=" and it fails as a bare string otherwise.
+body = ", ".join(f"{json.dumps(path)} = {json.dumps(mode)}" for path, mode in rules.items())
+print("permissions.afws.filesystem={" + body + "}")
+' "$afws_local_workspace" "$HOME" "${TMPDIR-}" "${extra_directories[@]}")" ||
+    afws_die "could not build the Codex permission profile"
+  permission_arguments=(-c "$permission_profile" -c 'default_permissions="afws"')
+  if (( ! dry_run )) && command -v codex >/dev/null 2>&1; then
+    codex debug prompt-input "${permission_arguments[@]}" >/dev/null 2>&1 ||
+      afws_die "this Codex installation will not accept the tightened permission profile; unset AFWS_CODEX_TIGHTEN"
+  fi
+fi
+
 # --- session instructions -------------------------------------------------
 # The shared remote-first rules describe the view, so say plainly whether this
 # session has one. Without this the rules would send Codex looking for a mount
@@ -270,9 +313,9 @@ afws_print_session_header "Codex CLI for Work Station" "$PEERS" "$dry_run" \
 if (( dry_run )); then
   print -r -- "Would start Codex with:"
   if (( resume_mode )); then
-    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}}${reviewer_arguments:+ -c ${reviewer_arguments[2]}} --config developer_instructions=<session instructions> resume --all"
+    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}}${permission_arguments:+ -c <tightened permission profile>}${reviewer_arguments:+ -c ${reviewer_arguments[2]}} --config developer_instructions=<session instructions> resume --all"
   else
-    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}}${reviewer_arguments:+ -c ${reviewer_arguments[2]}} --config developer_instructions=<session instructions>"
+    print -r -- "  codex --no-alt-screen -C ${(q)afws_local_workspace} --sandbox workspace-write --ask-for-approval on-request${extra_arguments:+ -c ${extra_arguments[2]}}${permission_arguments:+ -c <tightened permission profile>}${reviewer_arguments:+ -c ${reviewer_arguments[2]}} --config developer_instructions=<session instructions>"
   fi
   if [[ -z "$afws_visibility_workspace" ]]; then
     print -r -- "Nothing will be mounted: the project is reached through afws-run"
@@ -309,6 +352,7 @@ afws_run_tracked_agent "$$" codex \
   --sandbox workspace-write \
   --ask-for-approval on-request \
   "${extra_arguments[@]}" \
+  "${permission_arguments[@]}" \
   "${reviewer_arguments[@]}" \
   "${hook_arguments[@]}" \
   --config "developer_instructions=${developer_instructions}" \

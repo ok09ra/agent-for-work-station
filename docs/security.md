@@ -102,6 +102,17 @@ escalation with a granular `approval_policy`: it would refuse every project
 operation. Treat Codex's sandbox as protecting the Mac from what Codex runs
 locally, not as containing the session's actual work.
 
+`AFWS_CODEX_TIGHTEN` narrows what is left. Under `workspace-write` a sandboxed
+command already cannot write outside the workspace -- `~/.afws` and the shell
+startup files are refused -- but it can *read* anything the user can, measured:
+`~/.ssh/id_rsa`, `~/.codex/auth.json`, `~/.claude/settings.json` and the
+work-station registry are all readable. The variable replaces those rules with a
+permission profile that denies exactly those four and leaves the rest of the
+machine readable, because an agent that cannot look around guesses instead. It
+is opt-in: an explicit profile has to name everything the session still writes,
+including the temporary directories that `workspace-write` grants implicitly,
+and it constrains sandboxed commands only.
+
 **It does not by itself limit what the agent can reach.** Two things decide
 that, and both are yours to set:
 

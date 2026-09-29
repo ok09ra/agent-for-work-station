@@ -411,6 +411,7 @@ afws-lock acquire gpu0 --host SSH_CONFIG_HOST --dry-run
 | `AFWS_NO_SHELL_MARKER` | Set to any value to stop labelling locally-run shell commands |
 | `AFWS_ADD_DIR` | Extra local directories the session may read, colon-separated (`claudefws` only) |
 | `AFWS_REMOTE_ASSUME_YES` | Skip the terminal confirmation `afws-remote on` and `pair` require. For your own scripts, not for getting an agent session past the check |
+| `AFWS_CODEX_TIGHTEN` | Set to any value to deny sandboxed Codex commands `~/.ssh`, `~/.codex`, `~/.claude` and the work-station registry. Reading the rest of the machine stays open, and `afws-run` escalates out of the sandbox so it is unaffected (`codexfws` only) |
 | `AFWS_CODEX_AUTO_REVIEW` | Set to any value to route Codex approval requests to its own reviewing agent instead of deciding them in-session (`codexfws` only) |
 | `AFWS_KEEP_CONTROL_MASTER` | Set to any value to keep the shared connection open after the last session exits |
 | `AFWS_CONTROL_PERSIST` | Seconds a shared SSH connection survives without use (default: 600, or 28800 with `AFWS_KEEP_CONTROL_MASTER`) |

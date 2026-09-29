@@ -755,6 +755,39 @@ codex_overridden="$(AFWS_VISIBILITY_MOUNT=1 "$CODEX_LAUNCHER" --dry-run --no-vie
 # managed configuration can refuse the policy outright.
 [[ "$codex_plan" != *"approvals_reviewer"* ]] || \
   fail "codexfws planned the reviewing agent without being asked for it"
+# Nothing a session does needs this Mac's private keys or either agent's stored
+# credentials, and an explicit profile has to name everything it still writes:
+# workspace-write grants the temporary directories implicitly and a profile
+# does not, so leaving them out would break ordinary commands.
+[[ "$codex_plan" != *"tightened permission profile"* ]] || \
+  fail "codexfws tightened the sandbox without being asked to"
+codex_tight_plan="$(AFWS_CODEX_TIGHTEN=1 "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
+[[ "$codex_tight_plan" == *"tightened permission profile"* ]] || \
+  fail "AFWS_CODEX_TIGHTEN did not reach the launch"
+codex_profile_source="${SANDBOX}/codex-profile.py"
+python3 - "$CODEX_LAUNCHER" "$codex_profile_source" <<'EXTRACT_CODEX_PROFILE'
+import sys
+launcher, destination = sys.argv[1:3]
+text = open(launcher, encoding="utf-8").read()
+opener = "permission_profile=\"$(python3 -c '"
+start = text.index(opener) + len(opener)
+# The block ends where the quoted program closes and its arguments begin.
+open(destination, "w", encoding="utf-8").write(text[start:text.index("\n' \"", start)])
+EXTRACT_CODEX_PROFILE
+[[ -s "$codex_profile_source" ]] || fail "could not find the permission profile the launcher builds"
+codex_profile="$(python3 "$codex_profile_source" /ws /home /var/tmpdir /extra)"
+python3 -c '
+import sys, tomllib
+emitted = sys.argv[1]
+assert emitted.startswith("permissions.afws.filesystem="), emitted
+rules = tomllib.loads("x = " + emitted.split("=", 1)[1])["x"]
+assert rules[":root"] == "read", rules
+for writable in ("/ws", "/tmp", "/var/tmpdir", "/extra"):
+    assert rules[writable] == "write", (writable, rules)
+for denied in ("/home/.ssh", "/home/.codex", "/home/.claude", "/home/.afws"):
+    assert rules[denied] == "deny", (denied, rules)
+' "$codex_profile" || fail "the tightened profile is not what the sandbox expects (${codex_profile})"
+
 codex_reviewed_plan="$(AFWS_CODEX_AUTO_REVIEW=1 "$CODEX_LAUNCHER" --dry-run example-workstation /remote/project)"
 [[ "$codex_reviewed_plan" == *'approvals_reviewer="auto_review"'* ]] || \
   fail "AFWS_CODEX_AUTO_REVIEW did not route approvals to the reviewing agent"
