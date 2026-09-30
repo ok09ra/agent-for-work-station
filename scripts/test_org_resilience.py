@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +20,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ORG = ROOT / "bin" / "afws-org"
+# The claim-token generator is checked directly: its only defect was invisible
+# from the outside until a token happened to start with "-".
+_spec = importlib.util.spec_from_file_location(
+    "afws_orchestrator", ROOT / "lib" / "afws-orchestrator.py")
+orchestrator = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(orchestrator)
 HOST = "test-host"
 REMOTE = "/srv/resilience"
 
@@ -134,6 +142,23 @@ class OrganizationResilienceTest(unittest.TestCase):
             ).fetchone()[0]
         return next(line.split(": ", 1)[1] for line in payload.splitlines()
                     if line.startswith("claim_token: "))
+
+    def test_a_claim_token_that_looks_like_an_option_is_still_a_token(self) -> None:
+        # token_urlsafe puts "-" first in one token in sixty-four, and argparse
+        # read that as an option: the assignment could not be claimed at all.
+        # Tokens are no longer issued that way, and one that already was is
+        # still accepted.
+        assignment = self.assign("lead", "worker", "dashed token work")
+        self.run_as("lead", "dispatch", assignment)
+        token = "-Zx1" + secrets.token_urlsafe(24).lstrip("-")
+        with self.db() as database:
+            database.execute("UPDATE assignments SET claim_hash=? WHERE assignment_id=?",
+                             (hashlib.sha256(token.encode()).hexdigest(), assignment))
+        self.run_as("worker", "claim", assignment, token)
+        self.assertEqual(self.assignment(assignment)["state"], "acknowledged")
+
+        for _ in range(256):
+            self.assertFalse(orchestrator.new_claim_token().startswith("-"))
 
     def test_rbac_claim_replay_and_state_machine(self) -> None:
         self.run_as("worker", "add-team", "illegal", "worker", ok=False)

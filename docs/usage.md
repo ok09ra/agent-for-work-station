@@ -343,6 +343,19 @@ about contents, and the answer is a listing from the remote tools. For anything
 that has to be *rendered* — a figure, a notebook, formatted Markdown — the
 answer is `afws-lab` below, which needs no mount at all.
 
+## When the commands are updated while sessions are running
+
+An agent's session instructions are fixed when it starts, so a rule added to a
+launcher normally reaches only the sessions started afterwards. The lifecycle
+hook is the exception: it is read from disk at every event, so a running
+session's hook is already the new one. When `AFWS_GUIDANCE_VERSION` in
+`lib/afws-common.zsh` is raised, each session that started before it is handed
+the changed rules once, at the start of its next turn, and is then marked as
+having them — so it is interrupted once, not on every prompt. Sessions started
+afterwards carry the rules in their own instructions and are never told again.
+Nothing has to be restarted, and installing an update never interrupts a turn
+in progress.
+
 ## Reading the project: JupyterLab
 
 A view is for looking at file names; `afws-lab` is for reading content. It runs

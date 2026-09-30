@@ -30,6 +30,14 @@ fi
 # being expanded to this Mac's home directory here.
 : ${AFWS_REMOTE_LOCK_DIR:="~/.afws-locks"}
 
+# A session's instructions are fixed when its agent starts, so a rule added to
+# the launchers reaches only the sessions started afterwards. Sessions already
+# running are told once, through their lifecycle hook, which is read from disk
+# on every event and therefore is already the new one. Raise this when a change
+# to the shared rules is worth interrupting a running session for; the sessions
+# that launched with it recorded the number and are not told again.
+AFWS_GUIDANCE_VERSION=1
+
 # Derived from AFWS_STATE_DIR rather than set directly.
 AFWS_SESSION_DIR="${AFWS_STATE_DIR}/sessions"
 AFWS_SESSION_META_DIR="${AFWS_STATE_DIR}/session-meta"
@@ -1026,6 +1034,29 @@ afws_visibility_rules() {
 - To show something that has to be rendered -- a figure, an image, a notebook, formatted Markdown -- use 'afws-lab', which runs JupyterLab on the workstation rooted at the project itself, so every path under the project is already reachable in it and no mount is involved. 'afws-lab status' says whether one is already running, 'afws-lab' starts or repairs it, and 'afws-lab open' opens it for the user. Never tell the user that a remote file cannot be displayed because nothing is mounted."
 }
 
+# What a session that started before the current rules is missing, printed once
+# and then marked as delivered. Hooks call this: they are read from disk at
+# every event, so they are the one part of a running session that is already
+# new. Keep it short -- it arrives in the middle of somebody's work.
+# afws_pending_guidance SESSION_NAME [MOUNT_POINT]
+afws_pending_guidance() {
+  local name="$1" mount_point="${2-}" seen=""
+
+  [[ -n "$name" ]] || return 0
+  seen="$(afws_read_session_meta "$name" guidance 2>/dev/null)" || seen=""
+  [[ "$seen" == "$AFWS_GUIDANCE_VERSION" ]] && return 0
+  # Marked before it is printed: a hook that fails after this point costs one
+  # delivery, while a hook that marks nothing would repeat on every prompt.
+  afws_write_session_meta "$name" guidance "$AFWS_GUIDANCE_VERSION" 2>/dev/null || return 0
+
+  print -r -- "[AFWS session instructions updated]
+The work-station commands were updated after this session started, so these
+rules were not in its launch instructions. They apply from now on, and a
+session started from now on receives them at launch instead.
+
+$(afws_visibility_rules "$mount_point")"
+}
+
 # These coordination rules apply to both launchers; each adds its own messaging
 # path in its session instructions.
 afws_shared_session_rules() {
@@ -1267,6 +1298,10 @@ afws_write_session_record() {
     print -r -- "started_epoch=$(date +%s)"
   } > "$record"
   )
+
+  # This session's instructions were built from the current rules, so its hook
+  # has nothing to add. Only a session that started before them lacks the mark.
+  afws_write_session_meta "$afws_session_name" guidance "$AFWS_GUIDANCE_VERSION" 2>/dev/null || true
 }
 
 # A view can now be mounted after the launch that did not ask for one, and the
@@ -1311,7 +1346,7 @@ afws_session_meta_file() {
   local name="$1" field="$2"
   afws_validate_session_name "$name"
   case "$field" in
-    thread|activity|prompt|state|peer_turn|worktree|config_changed) ;;
+    thread|activity|prompt|state|peer_turn|worktree|config_changed|guidance) ;;
     *) afws_die "invalid session metadata field" ;;
   esac
   print -r -- "${AFWS_SESSION_META_DIR}/${name}.${field}"
@@ -1341,7 +1376,7 @@ afws_read_session_meta() {
 afws_remove_session_meta() {
   local name="$1" field
   afws_validate_session_name "$name"
-  for field in thread activity prompt state peer_turn; do
+  for field in thread activity prompt state peer_turn guidance; do
     rm -f "${AFWS_SESSION_META_DIR}/${name}.${field}" 2>/dev/null || true
   done
 }

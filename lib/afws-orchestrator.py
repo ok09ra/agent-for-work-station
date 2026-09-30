@@ -570,9 +570,55 @@ def cancel_active(db: sqlite3.Connection, actor_id: str, instance_id: str, allow
         release_assignment_locks(row)
 
 
+def new_claim_token() -> str:
+    """A claim token the recipient can pass back on a command line.
+
+    token_urlsafe draws from an alphabet that includes "-", so one token in
+    sixty-four begins with one, and argparse reads that as an option rather
+    than as the token: the claim fails with "the following arguments are
+    required: claim_token" and the assignment cannot be taken up at all.
+    Rejecting that first character costs nothing and is not the only defence;
+    protect_trailing_value below covers tokens issued before this existed.
+    """
+    while True:
+        token = secrets.token_urlsafe(32)
+        if not token.startswith("-"):
+            return token
+
+
+def protect_trailing_value(argv: list[str], parser: argparse.ArgumentParser) -> list[str]:
+    """Let the last argument be a value even when it looks like an option.
+
+    A claim token, a result, or a reason can begin with "-" without being an
+    option, and argparse cannot tell. It can be told, with "--", but only
+    someone who already knows that the value starts with "-" would think to
+    type it. So insert it here, and only for the last argument on the line:
+    anything earlier may be followed by real options, which "--" would swallow.
+    """
+    if len(argv) < 2 or "--" in argv:
+        return argv
+    last = argv[-1]
+    if len(last) < 2 or not last.startswith("-"):
+        return argv
+    choices: dict = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            choices = action.choices
+            break
+    sub_parser = choices.get(argv[0])
+    if sub_parser is None:
+        return argv
+    for action in sub_parser._actions:
+        for option in action.option_strings:
+            # An abbreviation argparse would accept is still an option.
+            if option.startswith(last) or last.startswith(option + "="):
+                return argv
+    return argv[:-1] + ["--", last]
+
+
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(protect_trailing_value(sys.argv[1:], parser))
     if not args.command:
         args = parser.parse_args(["show"])
     read_only = args.command in {"show", "validate", "events", "version", "guard", "scope"}
@@ -1097,7 +1143,7 @@ def assign_to(db: sqlite3.Connection, actor: dict[str, str], member: sqlite3.Row
     for lock_name in locks:
         validate_name(lock_name, "lock")
     task_id, assignment_id = str(uuid.uuid4()), str(uuid.uuid4())
-    claim_token = secrets.token_urlsafe(32)
+    claim_token = new_claim_token()
     stamp = timestamp()
     db.execute("BEGIN IMMEDIATE")
     try:

@@ -228,8 +228,10 @@ for a local application. The answer is a listing or a read through `afws-run`
 and the remote filesystem tools. When something has to be rendered — a figure,
 a notebook, formatted Markdown — `afws-lab` runs JupyterLab on the workstation,
 rooted at the project, and needs no mount at all. Both launchers now say all of
-this in their session instructions; a session started before this change was
-installed will not have it.
+this in their session instructions, and a session that started before the
+change is told once by its lifecycle hook, at the start of its next turn — the
+hook is read from disk at every event, so it is already the new one. Nothing
+has to be restarted.
 
 ## The agent tries to run tests locally
 

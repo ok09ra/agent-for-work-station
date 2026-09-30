@@ -51,6 +51,8 @@ unset AFWS_SESSION_NAME AFWS_SSH_HOST AFWS_REMOTE_DIR AFWS_CONTROL_PATH \
   AFWS_CONTROL_PERSIST AFWS_PROBE_TIMEOUT_SECONDS 2>/dev/null || true
 unset SSH_ASKPASS 2>/dev/null || true
 
+readonly AFWS_GUIDANCE_VERSION_FOR_TEST="$(zsh -c "source ${LIBRARY}; print -r -- \$AFWS_GUIDANCE_VERSION")"
+
 fail() {
   print -u2 -r -- "test.sh: $*"
   exit 1
@@ -2123,6 +2125,57 @@ claude_stop_output="$(print -r -- '{"hook_event_name":"Stop","session_id":"claud
   AFWS_SESSION_TOKEN=fws-review-token AFWS_SSH_HOST=alpha \
   AFWS_REMOTE_DIR=/remote/project "$CLAUDE_HOOK")" || fail "Claude Stop hook failed"
 [[ "$claude_stop_output" == '{}' ]] || fail "idle Claude Stop hook attempted to continue"
+
+# A rule added to the launchers reaches only sessions started afterwards. The
+# lifecycle hook is read from disk at every event, so it is the one part of a
+# running session that is already new: it delivers the change once, and a
+# session that launched with the rule already recorded is not interrupted.
+# These use records of their own: delivery marks session metadata, and the
+# sessions above are still being examined by later checks.
+write_record fws-guidance claude "$$" alpha /remote/project 1000000004
+write_record cx-guidance codex "$$" alpha /remote/project 1000000005
+guidance_prompt='{"hook_event_name":"UserPromptSubmit","session_id":"guidance-session-id","prompt":"carry on"}'
+claude_guidance_hook() {
+  print -r -- "$1" | AFWS_SESSION_NAME=fws-guidance \
+    AFWS_INSTANCE_ID=fws-guidance-instance AFWS_SESSION_TOKEN=fws-guidance-token \
+    AFWS_SSH_HOST=alpha AFWS_REMOTE_DIR=/remote/project "$CLAUDE_HOOK"
+}
+
+guidance_first="$(claude_guidance_hook "$guidance_prompt")" || fail "Claude prompt hook failed"
+[[ "$guidance_first" == *"[AFWS session instructions updated]"* ]] || \
+  fail "a session started before the current rules was not told about them"
+[[ "$guidance_first" == *"afws-view"* && "$guidance_first" == *"afws-lab"* ]] || \
+  fail "the delivered guidance left out the commands it exists to name"
+guidance_second="$(claude_guidance_hook "$guidance_prompt")" || fail "Claude prompt hook failed twice"
+[[ "$guidance_second" != *"[AFWS session instructions updated]"* ]] || \
+  fail "the same guidance was delivered to the same session twice"
+
+# Stop is not a place to hand a session new context: that asks it to keep
+# going. The guidance waits for the start of a turn.
+rm -f "${AFWS_STATE_DIR}/session-meta/fws-guidance.guidance"
+guidance_stop="$(claude_guidance_hook '{"hook_event_name":"Stop","session_id":"guidance-session-id","stop_hook_active":false}')" || \
+  fail "Claude Stop hook failed"
+[[ "$guidance_stop" == '{}' ]] || fail "the guidance was delivered on Stop and continued the turn"
+
+# A Codex session takes the same delivery, in the shape Codex reads.
+codex_guidance_prompt='{"hook_event_name":"UserPromptSubmit","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","prompt":"carry on"}'
+codex_guidance="$(print -r -- "$codex_guidance_prompt" |
+  AFWS_SESSION_NAME=cx-guidance "$CODEX_HOOK")" || fail "Codex prompt hook failed"
+[[ "$codex_guidance" == *'"additionalContext"'* && \
+   "$codex_guidance" == *"[AFWS session instructions updated]"* ]] || \
+  fail "a running Codex session was not told about the current rules"
+print -rn -- "$codex_guidance" | python3 -c 'import json,sys; json.load(sys.stdin)' || \
+  fail "the Codex hook emitted something Codex cannot parse"
+codex_guidance_again="$(print -r -- "$codex_guidance_prompt" |
+  AFWS_SESSION_NAME=cx-guidance "$CODEX_HOOK")" || fail "Codex prompt hook failed twice"
+[[ -z "$codex_guidance_again" ]] || fail "the Codex guidance was delivered twice"
+
+# A session that launched with the rules in its own instructions is left alone.
+print -r -- "$AFWS_GUIDANCE_VERSION_FOR_TEST" > "${AFWS_STATE_DIR}/session-meta/fws-guidance.guidance"
+guidance_current="$(claude_guidance_hook "$guidance_prompt")" || fail "Claude prompt hook failed"
+[[ "$guidance_current" != *"[AFWS session instructions updated]"* ]] || \
+  fail "a session launched with the current rules was interrupted by them anyway"
+rm -f "${AFWS_STATE_DIR}/sessions/fws-guidance.conf" "${AFWS_STATE_DIR}/sessions/cx-guidance.conf"
 
 : > "$AFWS_TEST_QUEUE_LOG"
 broadcast_result="$(PATH="${STUB_BIN}:$PATH" AFWS_SESSION_NAME=cx-sender \

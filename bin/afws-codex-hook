@@ -68,6 +68,24 @@ afws_scope_drift() {
   return 1
 }
 
+# A rule added to the launcher cannot reach a session that is already running.
+# This hook can: Codex reads it from disk at every event, so it is the one part
+# of an old session that is already new. Codex takes hook context in the same
+# shape Claude Code does, and ignores it on an event that cannot carry it, so
+# it is emitted only at the start of a turn and only until it is delivered.
+emit_pending_guidance() {
+  local guidance=""
+  guidance="$(afws_pending_guidance "$AFWS_SESSION_NAME" "$afws_record_mount_point" 2>/dev/null || true)"
+  [[ -n "$guidance" ]] || return 0
+  print -rn -- "$guidance" | python3 -c '
+import json, sys
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": sys.stdin.read(),
+}}, ensure_ascii=False))
+'
+}
+
 case "$event_name" in
   SessionStart)
     rm -f "$(afws_session_meta_file "$AFWS_SESSION_NAME" peer_turn)"
@@ -94,6 +112,7 @@ case "$event_name" in
           "$activity" != "[AFWS resume after peer message]"* ]]; then
       afws_write_session_meta "$AFWS_SESSION_NAME" prompt "$activity"
     fi
+    emit_pending_guidance
     ;;
   Stop)
     stop_hook_active="$(plutil -extract stop_hook_active raw -o - -- "$input_file" 2>/dev/null)" || stop_hook_active="false"

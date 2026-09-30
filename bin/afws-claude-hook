@@ -72,6 +72,21 @@ afws_scope_drift() {
   return 1
 }
 
+# A rule added to the launcher cannot reach a session that is already running;
+# this hook can, because it is read from disk at every event. It is delivered
+# where ordinary context belongs, at the start of a turn -- never on Stop,
+# where returning context asks the session to keep going.
+turn_context() {
+  local guidance="" rest=""
+  guidance="$(afws_pending_guidance "$AFWS_SESSION_NAME" "$afws_record_mount_point" 2>/dev/null || true)"
+  rest="$(collect_context)"
+  if [[ -n "$guidance" && -n "$rest" ]]; then
+    print -rn -- "${guidance}"$'\n\n'"${rest}"
+  else
+    print -rn -- "${guidance}${rest}"
+  fi
+}
+
 collect_context() {
   local peer_context="" organization_inbox="" loop_context="" combined=""
   [[ -x "$INBOX" ]] && peer_context="$($INBOX poll 2>/dev/null || true)"
@@ -94,7 +109,7 @@ collect_context() {
 case "$event_name" in
   SessionStart)
     afws_write_session_meta "$AFWS_SESSION_NAME" state idle
-    collect_context
+    turn_context
     ;;
   UserPromptSubmit)
     afws_write_session_meta "$AFWS_SESSION_NAME" state busy
@@ -104,7 +119,7 @@ case "$event_name" in
     activity="${activity//$'\t'/ }"
     activity="${activity[1,160]}"
     [[ -z "$activity" ]] || afws_write_session_meta "$AFWS_SESSION_NAME" prompt "$activity"
-    collect_context
+    turn_context
     ;;
   Stop)
     stop_hook_active="$(plutil -extract stop_hook_active raw -o - -- "$input_file" 2>/dev/null)" || stop_hook_active="false"
