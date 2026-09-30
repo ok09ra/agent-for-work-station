@@ -27,7 +27,7 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ## What happens at startup
 
 1. It opens one shared, authenticated SSH connection to the host, prompting here if the host asks for a password or a key passphrase.
-2. `codexfws` brings up a Finder/VS Code rclone NFS view, reusing a healthy one that is already there. `claudefws` mounts nothing unless given `--view`.
+2. `codexfws` brings up a Finder/VS Code rclone NFS view, reusing a healthy one that is already there. `claudefws` mounts nothing unless given `--view`. Either way `afws-view` can mount, inspect or release that view later, from inside the running session.
 3. Both agents start in an empty local control directory and treat the remote project as authoritative.
 4. It picks an unused session name of the form `fws-HOST-PROJECT-N` for Claude
    or `cx-HOST-PROJECT-N` for Codex.
@@ -314,6 +314,35 @@ is refused unless the user explicitly approves interrupting all sessions with
 To keep a view after the session ends, for example because you are about to
 start another session on it, set `AFWS_KEEP_MOUNT=1` for that launch.
 
+## The Finder/VS Code view, during a session
+
+Whether a session launched with a view is not a decision it has to live with.
+`afws-view` mounts one, says what is there, and releases it again:
+
+```zsh
+afws-view                   # mount it, or reuse and repair the one already there
+afws-view --force           # replace it even if it looks healthy
+afws-view status            # path, whether it answers, how many sessions use it
+afws-view path              # just the path, for another command
+afws-view open              # open it in Finder
+afws-view open --app "Visual Studio Code"
+afws-view stop              # release it, if this is the last session using it
+afws-view -n                # print what would change, change nothing
+```
+
+Inside a session it takes the session's own host and directory; outside one,
+name them as `afws-view SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY`. A view
+mounted this way is recorded in the session registry, so it is shared with
+other sessions on the same project and released by the last one out, exactly
+as a view mounted at launch is. It is still not the agent's data path: the file
+tools are denied it by name in a Claude session whether it is mounted or not.
+
+This is why an agent never needs to answer "restart the session with `--view`".
+It also never needs Finder to answer "show me that directory": that question is
+about contents, and the answer is a listing from the remote tools. For anything
+that has to be *rendered* — a figure, a notebook, formatted Markdown — the
+answer is `afws-lab` below, which needs no mount at all.
+
 ## Reading the project: JupyterLab
 
 A view is for looking at file names; `afws-lab` is for reading content. It runs
@@ -383,6 +412,7 @@ Use dry-run mode to print the planned operation without mounting anything, writi
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+afws-view --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 afws-remount --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 

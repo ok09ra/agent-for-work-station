@@ -8,9 +8,9 @@
 | --- | --- | --- |
 | remote-first（プロジェクトへは`afws-run`経由） | あり | あり |
 | 共有SSH接続・終了時の解放 | あり | あり |
-| Finder/VS Codeビュー | `--view`で任意 | 毎回作る |
+| Finder/VS Codeビュー | `--view`で任意、セッション中は`afws-view` | 毎回作る |
 | `afws-lab`（ワークステーション上のJupyterLab） | あり | あり |
-| `afws-run`・`afws-lock`・`afws-remount`・`afws-umount` | あり | あり |
+| `afws-run`・`afws-lock`・`afws-view`・`afws-remount`・`afws-umount` | あり | あり |
 | `afws-peers`にホストとディレクトリが並ぶ | あり | あり |
 | エージェント自身が知っているセッション名 | あり（`--name`） | あり（ランチャーの指示で共有） |
 | `afws-peers`の状態列 | CLI由来の`busy`/`idle`/`waiting` | フック由来の`busy`/`idle` |

@@ -19,6 +19,7 @@ readonly CODEX_HOOK="${REPOSITORY_ROOT}/bin/afws-codex-hook"
 readonly ISOLATE="${REPOSITORY_ROOT}/bin/afws-isolate"
 readonly LOCK="${REPOSITORY_ROOT}/bin/afws-lock"
 readonly REMOUNT="${REPOSITORY_ROOT}/bin/afws-remount"
+readonly VIEW="${REPOSITORY_ROOT}/bin/afws-view"
 readonly UMOUNT="${REPOSITORY_ROOT}/bin/afws-umount"
 readonly SHELL_WRAPPER="${REPOSITORY_ROOT}/bin/afws-shell"
 
@@ -340,7 +341,7 @@ prefix="${SANDBOX}/prefix"
 AFWS_INSTALL_DIR="${prefix}/bin" "${REPOSITORY_ROOT}/scripts/install.sh" --no-shell-config >/dev/null ||
   fail "the installer failed"
 
-for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-org afws-remote afws-codex-hook afws-claude-hook afws-claude-inbox afws-isolate afws-lock afws-remount afws-umount afws-shell afws-lab afws-doctor; do
+for command_name in claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-org afws-remote afws-codex-hook afws-claude-hook afws-claude-inbox afws-isolate afws-lock afws-remount afws-view afws-umount afws-shell afws-lab afws-doctor; do
   [[ -x "${prefix}/bin/${command_name}" ]] || fail "the installer did not place ${command_name}"
 done
 [[ -f "${prefix}/lib/afws-common.zsh" ]] || fail "the installer did not place the shared library"
@@ -1478,6 +1479,90 @@ expect_rejected "afws-remount without a target outside a session" \
   env -u AFWS_SSH_HOST -u AFWS_REMOTE_DIR "$REMOUNT" --dry-run
 expect_rejected "a relative afws-remount directory" \
   "$REMOUNT" --dry-run example-workstation relative
+
+# --- afws-view ------------------------------------------------------------
+# The view used to be a launch-time decision: a session started without one
+# could only tell the user to restart. It is mountable, reportable and
+# releasable from inside a running session now, and the session registry has to
+# learn about a view mounted that way or nothing would ever release it.
+
+: > "$FAKE_MOUNTS"
+view_plan="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$VIEW" --dry-run example-workstation /remote/project)"
+[[ "$view_plan" == *"Would mount a Finder/VS Code view of example-workstation:/remote/project"* ]] || \
+  fail "afws-view did not plan a view for a named project"
+[[ "$view_plan" == *"on ${FAKE_ROOT}"* ]] || \
+  fail "afws-view planned the view somewhere other than the mount base"
+
+view_from_session="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  AFWS_SSH_HOST=example-workstation AFWS_REMOTE_DIR=/remote/project \
+  AFWS_SESSION_NAME=view-session-1 "$VIEW" --dry-run)"
+[[ "$view_from_session" == *"Would mount a Finder/VS Code view"* ]] || \
+  fail "afws-view did not use the current session target"
+[[ "$view_from_session" == *"Would record the view in the session view-session-1"* ]] || \
+  fail "afws-view would not record the view in the session registry"
+
+view_missing="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$VIEW" status example-workstation /remote/project)"
+[[ "$view_missing" == *"State: not mounted"* ]] || \
+  fail "afws-view status did not report a missing view"
+[[ "$view_missing" == *"afws-lab"* ]] || \
+  fail "afws-view status did not offer the way to display a remote file without a mount"
+AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" "$VIEW" path example-workstation /remote/project \
+  >/dev/null 2>&1 && fail "afws-view path printed a path for a view that is not mounted"
+
+print -r -- "example-workstation:/remote/project on ${FAKE_ROOT} (nfs)" > "$FAKE_MOUNTS"
+write_record view-user-1 codex "$$" example-workstation /remote/project \
+  "$(date +%s)" "$FAKE_ROOT" "$FAKE_ROOT"
+expect_rejected "taking a shared view away from other live sessions" \
+  env AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$VIEW" stop --dry-run example-workstation /remote/project
+view_shared_stop="$(AFWS_MOUNT_COMMAND="cat ${FAKE_MOUNTS}" \
+  "$VIEW" stop --force-shared --dry-run example-workstation /remote/project)"
+[[ "$view_shared_stop" == *"Would unmount ${FAKE_ROOT}"* ]] || \
+  fail "afws-view stop --force-shared did not acknowledge a shared release"
+rm -f "${AFWS_STATE_DIR}/sessions/view-user-1.conf"
+
+expect_rejected "afws-view without a target outside a session" \
+  env -u AFWS_SSH_HOST -u AFWS_REMOTE_DIR "$VIEW" --dry-run
+expect_rejected "a relative afws-view directory" \
+  "$VIEW" --dry-run example-workstation relative
+expect_rejected "afws-view --force-shared on a start" \
+  "$VIEW" start --force-shared --dry-run example-workstation /remote/project
+
+# A view mounted mid-session has to reach the record the release path reads,
+# or the last session out would leave it behind.
+write_record view-record-owner claude "$$" example-workstation /remote/project \
+  "$(date +%s)" "${AFWS_STATE_DIR}/control/example-workstation/remote/project" ""
+zsh -c "source ${(q)LIBRARY}; afws_set_session_record_field view-record-owner mount_point ${(q)FAKE_ROOT}" || \
+  fail "the session record would not take a mount point"
+grep -Fqx "mount_point=${FAKE_ROOT}" "${AFWS_STATE_DIR}/sessions/view-record-owner.conf" || \
+  fail "a view mounted mid-session was not recorded against the session"
+[[ "$("$PEERS" --users-of-mount "$FAKE_ROOT")" == 1 ]] || \
+  fail "a session that mounted a view mid-session is not counted as using it"
+rm -f "${AFWS_STATE_DIR}/sessions/view-record-owner.conf"
+: > "$FAKE_MOUNTS"
+
+# The rules both launchers give their agent have to say that the view is
+# mountable from inside the session, that a request to see a directory is a
+# request for its contents, and that rendering happens in JupyterLab. Getting
+# this wrong is what sent a session to Finder and to "restart with --view".
+view_rules_unmounted="$(zsh -c "source ${(q)LIBRARY}; afws_visibility_rules")"
+[[ "$view_rules_unmounted" == *"run 'afws-view'"* ]] || \
+  fail "a session with no view is not told it can mount one"
+[[ "$view_rules_unmounted" == *"Never tell the user to restart the session with --view"* ]] || \
+  fail "a session with no view may still send the user back to the launcher"
+for rules in "$view_rules_unmounted" \
+  "$(zsh -c "source ${(q)LIBRARY}; afws_visibility_rules ${(q)FAKE_ROOT}")"; do
+  [[ "$rules" == *"Do not run 'open'"* ]] || \
+    fail "the visibility rules do not rule out showing a directory in Finder"
+  [[ "$rules" == *"afws-lab"* ]] || \
+    fail "the visibility rules do not name the way to display a rendered remote file"
+done
+for launcher in "$CLAUDE_LAUNCHER" "$CODEX_LAUNCHER"; do
+  grep -Fq "start the session with --view" "$launcher" && \
+    fail "${launcher:t} still tells the user to restart for a view"
+done
 
 # --- afws-run -------------------------------------------------------------
 

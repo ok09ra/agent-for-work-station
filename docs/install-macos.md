@@ -17,7 +17,8 @@ This setup does not modify software or shell configuration on the remote host.
 
 Neither agent needs a mount to reach the project, so this is only for looking
 at the tree in Finder or VS Code. `codexfws` mounts that view on every launch
-and `claudefws` does so with `--view`.
+and `claudefws` does so with `--view`. Either agent can also mount it later
+with `afws-view`, so a session never has to be restarted for one.
 
 ```zsh
 rclone version

@@ -999,11 +999,31 @@ afws_remote_first_operating_rules() {
 - Ordinary local shell and file tools are only for the empty control workspace and the local directories explicitly listed for this session. Do not copy or synchronize the remote project into the control workspace.
 - Local afws-peers, afws-status, afws-message, and afws-org are allowed for coordination through this Mac's work-station registry; they do not inspect or edit the remote project.
 - The Finder/VS Code view omits native remote symlinks because rclone SFTP cannot represent them faithfully. Use afws-run to inspect or operate through those paths.
-- If the Finder/VS Code view is unavailable, continue project work through afws-run; the view is not ${agent}'s data path. Use afws-remount to recreate the view when convenient.
+- If the Finder/VS Code view is unavailable, continue project work through afws-run; the view is not ${agent}'s data path. Use afws-view to mount or repair the view when convenient; it never needs a session restart.
 - Do not invoke ssh, scp, sftp, or rsync directly to bypass the helpers.
 - Do not install or update packages, alter shell startup files, or modify the remote system or user environment without explicit user approval.
 - Show the remote command and only its relevant stdout and stderr to the user; keep large logs and listings out of context unless needed.
 - Ask before destructive, expensive, or long-running operations."
+}
+
+# How a session shows the user something, and what the local view is for. Both
+# launchers share this because getting it wrong looks the same in either agent:
+# a session that has no mount decides the user must restart with --view, or
+# reaches for Finder when it was only asked what is in a directory. Neither is
+# necessary. The view can be mounted from inside a running session, and a
+# remote file is displayed by reading it or by JupyterLab, which runs on the
+# workstation and never needed a mount at all.
+# afws_visibility_rules [MOUNT_POINT]
+afws_visibility_rules() {
+  local mount_point="${1-}"
+
+  if [[ -n "$mount_point" ]]; then
+    print -r -- "- A Finder/VS Code view of the project is mounted at ${mount_point} for the user's own applications. It is not this session's data path: read and edit the project through the remote tools, whatever is mounted. 'afws-view status' reports it; 'afws-view' repairs it in place."
+  else
+    print -r -- "- No part of the project is mounted on this Mac, and that is not a dead end. If the user wants to open the project in a local application, run 'afws-view' to mount the Finder/VS Code view now, in this session, and give them the path it prints. Never tell the user to restart the session with --view, and do not describe the view as unavailable. A view mounted this way is still not this session's data path."
+  fi
+  print -r -- "- When the user asks to see a directory, a file, or a figure, they are asking for its contents. List or read it with the remote tools and show what is there. Do not run 'open', do not reveal anything in Finder, and do not start VS Code unless the user named that application.
+- To show something that has to be rendered -- a figure, an image, a notebook, formatted Markdown -- use 'afws-lab', which runs JupyterLab on the workstation rooted at the project itself, so every path under the project is already reachable in it and no mount is involved. 'afws-lab status' says whether one is already running, 'afws-lab' starts or repairs it, and 'afws-lab open' opens it for the user. Never tell the user that a remote file cannot be displayed because nothing is mounted."
 }
 
 # These coordination rules apply to both launchers; each adds its own messaging
@@ -1249,6 +1269,36 @@ afws_write_session_record() {
   )
 }
 
+# A view can now be mounted after the launch that did not ask for one, and the
+# release path reads this record rather than the launcher's memory, so the
+# mount point has to land here for the session to be counted as a user of the
+# view and for the last session out to unmount it. One bounded, newline-free
+# value replaces one line; a key the record does not carry is appended.
+# afws_set_session_record_field SESSION_NAME KEY VALUE
+afws_set_session_record_field() {
+  local name="$1" key="$2" value="$3"
+  local record="${AFWS_SESSION_DIR}/${name}.conf" temporary line replaced=0
+
+  [[ "$value" == *$'\n'* ]] && return 1
+  [[ -f "$record" ]] || return 1
+  temporary="${record}.${$}.tmp"
+  (
+    umask 077
+    {
+      while IFS= read -r line; do
+        if [[ "$line" == "${key}="* ]]; then
+          print -r -- "${key}=${value}"
+          replaced=1
+        else
+          print -r -- "$line"
+        fi
+      done < "$record"
+      (( replaced )) || print -r -- "${key}=${value}"
+    } > "$temporary"
+  ) || { rm -f "$temporary" 2>/dev/null; return 1 }
+  mv -f "$temporary" "$record" || { rm -f "$temporary" 2>/dev/null; return 1 }
+}
+
 afws_remove_session_record() {
   rm -f "${AFWS_SESSION_DIR}/${afws_session_name}.conf" 2>/dev/null || true
   afws_remove_session_meta "$afws_session_name"
@@ -1401,6 +1451,10 @@ afws_release_session() {
      [[ "$afws_record_session_name" == "$afws_session_name" &&
         "$afws_record_pid" == "$$" ]]; then
     tracked_agent_pid="$afws_record_agent_pid"
+    # afws-view can mount a view for a session that launched without one, and
+    # it records that in this file. The record is therefore the authority on
+    # what this session is using, not the value the launcher started with.
+    [[ -n "$afws_record_mount_point" ]] && afws_mount_point="$afws_record_mount_point"
   fi
   case "$tracked_agent_pid" in
     ''|*[!0-9]*|0) ;;

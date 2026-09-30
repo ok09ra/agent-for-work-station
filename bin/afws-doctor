@@ -60,7 +60,7 @@ if command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
-for command_name in afws-run afws-push afws-peers afws-message afws-org afws-lock afws-remount afws-umount afws-lab; do
+for command_name in afws-run afws-push afws-peers afws-message afws-org afws-lock afws-remount afws-view afws-umount afws-lab; do
   check_command "$command_name" "run this repository's installer and start a new login shell"
 done
 

@@ -27,7 +27,7 @@ codexfws --resume SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ## 起動時の動作
 
 1. 接続先への認証済みSSH接続を1本だけ開きます。パスワードや鍵のパスフレーズを求められる場合は、ここで入力します。
-2. `codexfws`はFinder/VS Code用rclone NFSビューを作ります（正常なものが既にあれば再利用）。`claudefws`は`--view`が無ければ何もマウントしません。
+2. `codexfws`はFinder/VS Code用rclone NFSビューを作ります（正常なものが既にあれば再利用）。`claudefws`は`--view`が無ければ何もマウントしません。どちらの場合も、実行中のセッションの中から`afws-view`でマウント・確認・解放できます。
 3. どちらのエージェントも空のローカル制御ディレクトリで起動し、リモートプロジェクトを正本として扱います。
 4. Claudeなら`fws-HOST-PROJECT-N`、Codexなら`cx-HOST-PROJECT-N`形式の未使用のセッション名を決めます。
 5. `~/.afws/sessions/`へセッションを登録し、他のセッションから担当範囲が見えるようにします。
@@ -218,6 +218,25 @@ afws-remount SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 
 セッション終了後もビューを残したい場合（続けて別のセッションを起動するときなど）は、その起動時に`AFWS_KEEP_MOUNT=1`を指定します。
 
+## セッションの途中でFinder/VS Codeビューを扱う
+
+ビューの有無は起動時に決め切る話ではありません。`afws-view`がマウント、状態の報告、解放を行います。
+
+```zsh
+afws-view                   # マウントする（既にあれば再利用・修復）
+afws-view --force           # 正常に見えても作り直す
+afws-view status            # パス、応答の有無、他に使っているセッション数
+afws-view path              # パスだけを出力（他のコマンドへ渡す用）
+afws-view open              # Finderで開く
+afws-view open --app "Visual Studio Code"
+afws-view stop              # 最後の利用者であれば解放する
+afws-view -n                # 変更せず、何が起きるかだけ表示
+```
+
+セッション内では、そのセッションのホストとリモートディレクトリを対象にします。セッション外では`afws-view SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY`と指定します。こうして作ったビューはセッションレジストリに記録されるので、同じプロジェクトの他セッションと共有され、最後の1つが終了した時点で解放されます。起動時に作ったビューと同じ扱いです。それでもエージェントのデータ経路ではありません。Claudeセッションでは、マウントの有無にかかわらずファイルツールへこのパスを名指しで拒否します。
+
+そのため、エージェントが「`--view`を付けて起動し直してください」と答える必要はありません。「このディレクトリ見せて」に対してFinderを開く必要もありません。それは中身についての質問であり、答えはリモートツールでの一覧です。図・ノートブック・整形されたMarkdownのように*描画*が要るものは、次の`afws-lab`が答えで、マウントは一切要りません。
+
 ## プロジェクトを読む：JupyterLab
 
 ビューはファイル名を眺めるためのもので、中身を読むためのものが`afws-lab`です。ワークステーション上の専用`tmux`セッションでJupyterLabを動かし、ローカルのポートへ転送します。
@@ -260,6 +279,7 @@ dry-runモードでは、マウント、レジストリへの書き込み、エ�
 
 ```zsh
 claudefws --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
+afws-view --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 afws-remount --dry-run SSH_CONFIG_HOST REMOTE_ABSOLUTE_DIRECTORY
 ```
 

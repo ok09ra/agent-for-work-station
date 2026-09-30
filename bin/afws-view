@@ -1,0 +1,293 @@
+#!/bin/zsh
+
+# The Finder/VS Code view is a convenience, not a data path, so no launcher
+# mounts one unless it is asked to. That used to mean a session which discovered
+# halfway through that the user wanted to open the project locally had nothing
+# to offer but "restart with --view". The mount never depended on the launch:
+# it needs the SSH host, the remote directory and rclone, all of which a running
+# session already has. This command mounts, reports, and releases it on demand,
+# and records it in the session registry so the view is shared and released
+# exactly as one created at launch is.
+
+set -eu
+
+readonly AFWS_PROGRAM="afws-view"
+readonly SCRIPT_DIR="${0:A:h}"
+
+for afws_library in \
+  "${SCRIPT_DIR}/../lib/afws-common.zsh" \
+  "${HOME}/.local/lib/afws-common.zsh"; do
+  if [[ -r "$afws_library" ]]; then
+    source "$afws_library"
+    break
+  fi
+done
+
+if ! typeset -f afws_die >/dev/null; then
+  print -u2 -r -- "${AFWS_PROGRAM}: cannot find lib/afws-common.zsh; run ./scripts/install.sh"
+  exit 2
+fi
+
+readonly PEERS="${SCRIPT_DIR}/afws-peers"
+
+action=start
+dry_run=0
+force=0
+force_shared=0
+open_application=""
+ssh_host=""
+remote_dir=""
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  afws-view [start] [--force] [-n|--dry-run] [HOST REMOTE_DIRECTORY]"
+  print -r -- "  afws-view status [HOST REMOTE_DIRECTORY]"
+  print -r -- "  afws-view path [HOST REMOTE_DIRECTORY]"
+  print -r -- "  afws-view open [--app APPLICATION]"
+  print -r -- "  afws-view stop [--force-shared] [-n|--dry-run]"
+  print -r -- ""
+  print -r -- "Mounts an rclone NFS view of the remote project on this Mac so the user can"
+  print -r -- "open it in Finder, VS Code, or any other local application. It is not the"
+  print -r -- "session's data path: the project is still read, edited and run through"
+  print -r -- "afws-run and the remote filesystem tools, which see the real tree, native"
+  print -r -- "symlinks included."
+  print -r -- ""
+  print -r -- "Inside claudefws or codexfws the target is this session's host and remote"
+  print -r -- "directory; outside one, name them. A session started without --view can"
+  print -r -- "mount the view this way at any time, and no restart is needed."
+  print -r -- ""
+  print -r -- "start reuses a healthy view and repairs an unhealthy one. It is idempotent:"
+  print -r -- "one view serves every session on the same host and remote directory, and it"
+  print -r -- "is released when the last of them exits."
+  print -r -- ""
+  print -r -- "Options:"
+  print -r -- "  --force         Replace the view even if it looks healthy (start)."
+  print -r -- "  --force-shared  Unmount even while other live sessions use it (stop)."
+  print -r -- "  --app NAME      Open with this application instead of the default (open)."
+  print -r -- "  -n, --dry-run   Print what would change, change nothing."
+  print -r -- ""
+  print -r -- "To display a remote figure, notebook, or formatted Markdown, afws-lab runs"
+  print -r -- "JupyterLab on the workstation and needs no mount at all."
+}
+
+(( $# > 0 )) || set -- start
+case "${1-}" in
+  -h|--help) usage; exit 0 ;;
+  start|status|path|open|stop) action="$1"; shift ;;
+esac
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    --force) force=1; shift ;;
+    --force-shared) force_shared=1; shift ;;
+    --app)
+      (( $# >= 2 )) || afws_die "--app requires an application name"
+      open_application="$2"
+      shift 2
+      ;;
+    -*) afws_die "unknown option: $1" ;;
+    *)
+      if [[ -z "$ssh_host" ]]; then
+        ssh_host="$1"
+      elif [[ -z "$remote_dir" ]]; then
+        remote_dir="$1"
+      else
+        afws_die "unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if (( force )) && [[ "$action" != start ]]; then
+  afws_die "--force applies to start"
+fi
+if (( force_shared )) && [[ "$action" != stop ]]; then
+  afws_die "--force-shared applies to stop"
+fi
+if [[ -n "$open_application" && "$action" != open ]]; then
+  afws_die "--app applies to open"
+fi
+
+# The view is keyed by host and remote directory, exactly as the mount record
+# and the JupyterLab record are, so a target named on the command line reaches
+# the same view a session on that project would.
+if [[ -z "$ssh_host" && -z "$remote_dir" ]]; then
+  ssh_host="${AFWS_SSH_HOST-}"
+  remote_dir="${AFWS_REMOTE_DIR-}"
+  [[ -n "$ssh_host" && -n "$remote_dir" ]] || {
+    print -u2 -r -- "${AFWS_PROGRAM}: name the SSH host and remote directory, or run this inside a session"
+    usage >&2
+    exit 2
+  }
+elif [[ -z "$ssh_host" || -z "$remote_dir" ]]; then
+  usage >&2
+  exit 2
+fi
+
+afws_validate_host "$ssh_host"
+remote_dir="$(afws_normalize_remote_dir "$remote_dir")"
+
+view_mount_point="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+
+# How many live sessions other than this one are recorded against the view.
+view_other_users() {
+  local users=0
+  [[ -x "$PEERS" ]] || {
+    print -r -- 0
+    return 0
+  }
+  users="$("$PEERS" --users-of-mount "$view_mount_point" 2>/dev/null)" || users=0
+  case "$users" in
+    ''|*[!0-9]*) users=0 ;;
+  esac
+  print -r -- "$users"
+}
+
+# A mount created for this session has to be visible to the release path, which
+# reads the registry record rather than the launcher's memory. Without this the
+# view would outlive every session that used it.
+record_view_in_session() {
+  local mount_point="$1"
+
+  [[ -n "${AFWS_SESSION_NAME-}" ]] || return 0
+  if ! afws_set_session_record_field "$AFWS_SESSION_NAME" mount_point "$mount_point"; then
+    print -u2 -r -- "${AFWS_PROGRAM}: could not record the view in the session registry"
+    print -u2 -r -- "  the view works, but nothing will unmount it when this session ends"
+    print -u2 -r -- "  release it by hand with: afws-view stop"
+    return 0
+  fi
+}
+
+# The other half of the same bookkeeping: this session is no longer a user of a
+# view it has just released.
+forget_view_in_session() {
+  [[ -n "${AFWS_SESSION_NAME-}" ]] || return 0
+  afws_set_session_record_field "$AFWS_SESSION_NAME" mount_point "" 2>/dev/null || true
+}
+
+# rclone must be able to reach the host on its own after this command exits, so
+# it is handed the session's shared connection when there is a live one and
+# opens its own otherwise.
+resolve_connection() {
+  if [[ -n "${AFWS_CONTROL_PATH-}" && -S "${AFWS_CONTROL_PATH}" ]]; then
+    afws_control_socket_path="$AFWS_CONTROL_PATH"
+  else
+    afws_open_session_connection "$ssh_host" "$dry_run"
+  fi
+}
+
+view_is_healthy() {
+  afws_visibility_mount_is_healthy "$ssh_host" "$remote_dir" "$view_mount_point" \
+    "${afws_control_socket_path-}"
+}
+
+case "$action" in
+  status|path)
+    if [[ "$action" == path ]]; then
+      # One line, so the path can be handed straight to another command.
+      afws_mount_is_present "$view_mount_point" || exit 1
+      print -r -- "$view_mount_point"
+      exit 0
+    fi
+    print -r -- "Project: ${ssh_host}:${remote_dir}"
+    print -r -- "View path: ${view_mount_point}"
+    if ! afws_mount_is_present "$view_mount_point"; then
+      print -r -- "State: not mounted"
+      print -r -- "Mount it with: afws-view"
+      print -r -- "To display a remote figure or notebook instead, no mount is needed: afws-lab"
+      exit 0
+    fi
+    resolve_connection
+    if view_is_healthy; then
+      print -r -- "State: mounted and answering"
+    else
+      print -r -- "State: mounted but not answering; repair it with afws-view --force"
+    fi
+    print -r -- "Other live sessions using it: $(view_other_users)"
+    print -r -- "Native remote symlinks are omitted from this view; afws-run sees them."
+    exit 0
+    ;;
+
+  open)
+    afws_mount_is_present "$view_mount_point" ||
+      afws_die "nothing is mounted at ${view_mount_point}; run afws-view first"
+    command -v open >/dev/null 2>&1 || afws_die "the open command is not available"
+    if [[ -n "$open_application" ]]; then
+      open -a "$open_application" "$view_mount_point"
+    else
+      open "$view_mount_point"
+    fi
+    print -r -- "Opened ${view_mount_point}"
+    exit 0
+    ;;
+
+  stop)
+    if ! afws_mount_is_present "$view_mount_point"; then
+      print -r -- "Nothing is mounted at ${view_mount_point}"
+      forget_view_in_session
+      exit 0
+    fi
+    users="$(view_other_users)"
+    if (( users > 0 && ! force_shared )); then
+      afws_die "${users} other live session(s) use this view: ${view_mount_point}
+It is released automatically when the last of them exits. To take it away from
+them now, the user has to say so: retry with --force-shared."
+    fi
+    if (( dry_run )); then
+      print -r -- "Would unmount ${view_mount_point}"
+      exit 0
+    fi
+    # This process must not hold the mount busy itself.
+    cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+    afws_release_managed_mount "$view_mount_point" ||
+      afws_die "could not unmount ${view_mount_point}
+Close anything using it and retry, or: diskutil unmount force ${(q)view_mount_point}"
+    forget_view_in_session
+    print -r -- "Unmounted ${view_mount_point}"
+    exit 0
+    ;;
+esac
+
+# --- start ----------------------------------------------------------------
+
+if (( ! dry_run )); then
+  for dependency in ssh rclone diskutil; do
+    command -v "$dependency" >/dev/null 2>&1 ||
+      afws_die "required command not found: ${dependency}; run afws-doctor"
+  done
+fi
+
+if (( dry_run )); then
+  resolve_connection
+  print -r -- "Would mount a Finder/VS Code view of ${ssh_host}:${remote_dir}"
+  print -r -- "  on ${view_mount_point} with rclone NFS (remote symlinks omitted)"
+  (( force )) && print -r -- "  replacing whatever is mounted there now"
+  [[ -n "${afws_control_socket_path-}" ]] &&
+    print -r -- "  over a shared SSH connection at ${afws_control_socket_path}"
+  [[ -n "${AFWS_SESSION_NAME-}" ]] &&
+    print -r -- "Would record the view in the session ${AFWS_SESSION_NAME}"
+  exit 0
+fi
+
+resolve_connection
+
+if (( force )) && afws_mount_is_present "$view_mount_point"; then
+  users="$(view_other_users)"
+  (( users > 0 )) &&
+    afws_die "${users} other live session(s) use this view; ask them before replacing it, or repair it with afws-remount --force-shared"
+  cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+  afws_release_managed_mount "$view_mount_point" ||
+    diskutil unmount force "$view_mount_point" >/dev/null 2>&1 ||
+    afws_die "could not detach ${view_mount_point}"
+fi
+
+afws_establish_visibility_mount "$ssh_host" "$remote_dir" "${afws_control_socket_path-}" \
+  0 "view-$(afws_sanitize_component "$ssh_host")-$(date +%s)" "$PEERS" || exit 1
+
+record_view_in_session "$afws_mount_point"
+
+print -r -- "Finder/VS Code view is ready: ${afws_mount_point}"
+print -r -- "The project is still read and edited remotely; this view is for local applications."

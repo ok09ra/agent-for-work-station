@@ -13,7 +13,7 @@ configure_shell=1
 
 readonly COMMANDS=(claudefws codexfws afws-run afws-push afws-peers afws-message afws-status afws-org
   afws-codex-hook afws-claude-hook afws-claude-inbox afws-remote afws-isolate afws-lock
-  afws-remount afws-umount afws-shell afws-lab afws-doctor)
+  afws-remount afws-view afws-umount afws-shell afws-lab afws-doctor)
 
 usage() {
   print -r -- "Usage: ./scripts/install.sh [--no-shell-config]"

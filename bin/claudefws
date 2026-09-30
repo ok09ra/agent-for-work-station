@@ -50,6 +50,9 @@ usage() {
   print -r -- ""
   print -r -- "With no arguments, claudefws prompts for the SSH host and remote directory."
   print -r -- ""
+  print -r -- "A session that did not ask for the view can mount one later with afws-view;"
+  print -r -- "nothing about the view requires deciding at launch."
+  print -r -- ""
   print -r -- "The remote directory is the project, and Claude reaches it through afws-run"
   print -r -- "rather than through a mount, so its symlinks, permissions and large trees"
   print -r -- "stay as they are on the workstation."
@@ -125,7 +128,7 @@ if (( ! dry_run )); then
   done
 
   for helper in afws-run afws-peers afws-message afws-org afws-claude-inbox afws-claude-hook \
-    afws-isolate afws-lock afws-remount afws-umount; do
+    afws-isolate afws-lock afws-remount afws-view afws-umount; do
     [[ -x "${SCRIPT_DIR}/${helper}" ]] ||
       afws_die "${helper} is not installed next to claudefws"
   done
@@ -180,11 +183,10 @@ view_description=""
   view_description="
 Finder/VS Code view: ${afws_visibility_workspace}"
 
-if [[ -n "$afws_visibility_workspace" ]]; then
-  view_rules="- A Finder/VS Code view of the project is mounted at ${afws_visibility_workspace} for the user to open in local applications. It is not this session's data path and the file tools are denied it. Read and edit the project through afws-run."
-else
-  view_rules="- No part of the project is mounted on this Mac. If the user wants to open it in a local application, tell them to start the session with --view; do not mount anything yourself."
-fi
+# Whether the view exists yet or is mounted later with afws-view, the file tools
+# are denied it by name, so the rules can say so in both cases.
+view_rules="$(afws_visibility_rules "$afws_visibility_workspace")
+- The file tools are denied the view path by name, mounted or not. It is the user's window on the project, never this session's."
 
 system_prompt="This is a remote-first agent-for-work-station session.
 Session name: ${afws_session_name}
@@ -261,17 +263,18 @@ print(json.dumps({
 fi
 
 # The view is for the user's own applications, so the file tools are denied it
-# by name rather than only by instruction. Without a view there is nothing to
-# deny: the project is not on this Mac at all.
+# by name rather than only by instruction. The path is denied whether or not
+# anything is mounted there yet: afws-view can mount one mid-session, and a deny
+# list cannot be extended after the launch. The path is derived the same way
+# afws-view derives it, so there is one answer to where the view lives.
 typeset -a deny_arguments
-deny_arguments=()
-if [[ -n "$afws_visibility_workspace" ]]; then
-  deny_arguments=(--disallowedTools
-    "Read(${afws_visibility_workspace}/**)"
-    "Edit(${afws_visibility_workspace}/**)"
-    "Write(${afws_visibility_workspace}/**)"
-    "Glob(${afws_visibility_workspace}/**)")
-fi
+deny_arguments=(--disallowedTools)
+afws_denied_view_path="${AFWS_MOUNT_BASE}/${ssh_host}${remote_dir}"
+deny_arguments+=(
+  "Read(${afws_denied_view_path}/**)"
+  "Edit(${afws_denied_view_path}/**)"
+  "Write(${afws_denied_view_path}/**)"
+  "Glob(${afws_denied_view_path}/**)")
 
 # Remote-first takes the project off this Mac, and Claude's file tools with
 # it: Read, Edit, Glob and Grep have nothing local left to work on. afws-run
@@ -337,14 +340,13 @@ if (( dry_run )); then
   else
     print -r -- "  claude --permission-mode ${PERMISSION_MODE} --name ${afws_session_name}${add_dir_arguments:+ --add-dir ${extra_directories}}${deny_arguments:+ --disallowedTools <view paths>}${mcp_arguments:+ --mcp-config <remote filesystem>} --append-system-prompt <session instructions>"
   fi
-  if (( want_view )); then
-    print -r -- "Would deny the file tools the Finder/VS Code view; the project is reached through afws-run."
-  else
+  print -r -- "Would deny the file tools ${afws_denied_view_path}, mounted or not; the project is reached through afws-run."
+  if (( ! want_view )); then
     print -r -- "Nothing will be mounted: the project is reached through afws-run"
     if [[ -n "$afws_control_socket_path" ]]; then
       print -r -- "  over a shared SSH connection at ${afws_control_socket_path}"
     fi
-    print -r -- "Add --view for a Finder/VS Code view of it."
+    print -r -- "Add --view for a Finder/VS Code view of it, or run afws-view inside the session."
   fi
   print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${afws_session_name}.conf"
   if [[ -z "${AFWS_NO_AGENT_TEAMS-}" ]]; then

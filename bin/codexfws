@@ -53,6 +53,9 @@ usage() {
   print -r -- ""
   print -r -- "With no arguments, codexfws prompts for the SSH host and remote directory."
   print -r -- ""
+  print -r -- "A session that did not ask for the view can mount one later with afws-view;"
+  print -r -- "nothing about the view requires deciding at launch."
+  print -r -- ""
   print -r -- "Environment:"
   print -r -- "  AFWS_MOUNT_BASE          Mount root (default: HOME/afws-mounts)"
   print -r -- "  AFWS_STATE_DIR           Registry root (default: HOME/.afws)"
@@ -181,7 +184,7 @@ if (( ! dry_run )); then
   done
 
   for helper in afws-run afws-push afws-peers afws-message afws-status afws-org afws-isolate \
-    afws-codex-hook afws-remote afws-lock afws-remount afws-umount; do
+    afws-codex-hook afws-remote afws-lock afws-remount afws-view afws-umount; do
     [[ -x "${SCRIPT_DIR}/${helper}" ]] ||
       afws_die "${helper} is not installed next to codexfws"
   done
@@ -259,12 +262,11 @@ fi
 # session has one. Without this the rules would send Codex looking for a mount
 # that was never made.
 view_description=""
-view_rules="- No part of the project is mounted on this Mac. If the user wants to open it in a local application, tell them to start the session with --view; do not mount anything yourself."
 if [[ -n "$afws_visibility_workspace" ]]; then
   view_description="
 Finder/VS Code view: ${afws_visibility_workspace}"
-  view_rules="- The Finder/VS Code view at ${afws_visibility_workspace} is for the user's own applications. It is not this session's data path; read and edit the project through afws-run."
 fi
+view_rules="$(afws_visibility_rules "$afws_visibility_workspace")"
 
 developer_instructions="This is a remote-first agent-for-work-station session.
 Session name: ${afws_session_name}
@@ -322,7 +324,7 @@ if (( dry_run )); then
     if [[ -n "$afws_control_socket_path" ]]; then
       print -r -- "  over a shared SSH connection at ${afws_control_socket_path}"
     fi
-    print -r -- "Add --view for a Finder/VS Code view of it."
+    print -r -- "Add --view for a Finder/VS Code view of it, or run afws-view inside the session."
   fi
   print -r -- "Would record the session as ${AFWS_SESSION_DIR}/${afws_session_name}.conf"
   print -r -- "Would attach SessionStart, UserPromptSubmit, Stop, and Interrupt hooks."

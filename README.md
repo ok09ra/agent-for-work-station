@@ -15,6 +15,9 @@ edit, Git command, and execution through `afws-run`, so the project's symlinks,
 permissions and large directories stay exactly as they are on the workstation.
 `claudefws` mounts nothing by default and takes `--view` when you want an rclone
 NFS view for Finder and VS Code; `codexfws` still brings that view up every time.
+Either way the decision is not final: `afws-view` mounts, reports and releases
+that view from inside a running session, so a session that started without one
+never has to be restarted to get it.
 `afws-lab` runs JupyterLab on the workstation itself when you want to read
 figures, notebooks and rendered Markdown. Neither a view nor a lab is a data
 path, so neither can break a session by failing.
@@ -234,8 +237,20 @@ than working:
 ```zsh
 claudefws --view my-workstation /remote/path/to/project
 claudefws --no-view my-workstation /remote/path/to/project   # also the default
+afws-view           # mount it now, from inside a session that started without it
+afws-view status    # where it is, whether it answers, who else is using it
+afws-view stop      # release it again
 afws-remount        # repair that view if it stops responding
 ```
+
+The view is not a launch-time commitment. `afws-view` needs only the SSH host,
+the remote directory and `rclone`, all of which a running session already has,
+and it records the view in the session registry, so the same sharing and the
+same automatic release apply as to one mounted at launch. An agent asked
+mid-session to open the project locally runs it rather than telling you to
+start again. To *display* a remote figure, notebook or rendered Markdown, no
+mount is involved at all: `afws-lab` runs JupyterLab on the workstation, rooted
+at the project.
 
 **Give Claude structured file tools without a mount.** `lib/afws-fs-mcp.py` is an
 MCP server that runs on this Mac and reaches the project over the session's
@@ -346,6 +361,7 @@ afws-isolate run --backend host --guide /path/to/job/instructions.md --input /pa
 | `afws-status` | Set this Codex session's short activity label |
 | `afws-remote` | Enable, disable, inspect, or pair Codex Remote Control on this Mac |
 | `afws-lock` | Claim an exclusive remote resource so two sessions do not collide |
+| `afws-view` | Mount, inspect, or release the Finder/VS Code view of the project, at any time |
 | `afws-remount` | Repair a disconnected Finder/VS Code view, or an older SSHFS mount, in place |
 | `afws-umount` | Release a mount or connection left behind |
 | `afws-doctor` | Check the prerequisites |

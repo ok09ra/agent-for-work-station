@@ -12,9 +12,9 @@ project through a mount.
 | --- | --- | --- |
 | Remote-first: the project is reached through `afws-run` | yes | yes |
 | Shared SSH connection, release on exit | yes | yes |
-| Finder/VS Code view | opt-in, `--view` | yes, on every launch |
+| Finder/VS Code view | opt-in, `--view`, or `afws-view` mid-session | yes, on every launch |
 | `afws-lab` (JupyterLab on the workstation) | yes | yes |
-| `afws-run`, `afws-lock`, `afws-remount`, `afws-umount` | yes | yes |
+| `afws-run`, `afws-lock`, `afws-view`, `afws-remount`, `afws-umount` | yes | yes |
 | Listed in `afws-peers` with its host and directory | yes | yes |
 | Session name the agent itself knows | yes, via `--name` | yes, via launcher instructions |
 | Status column in `afws-peers` | native `busy` / `idle` / `waiting` | hook-derived `busy` / `idle` |

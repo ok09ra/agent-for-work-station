@@ -9,7 +9,7 @@ claudefws my-workstation /remote/path/to/project   # Claude Code
 codexfws  my-workstation /remote/path/to/project   # Codex CLI
 ```
 
-どちらのエージェントもリモート側を正本とし、プロジェクトの読み取り・編集・Git・実行をすべて`afws-run`経由で行います。プロジェクトのsymlink、パーミッション、巨大なディレクトリがワークステーション上のまま扱われます。`claudefws`は既定で何もマウントせず、Finder/VS Code用のrclone NFSビューが要るときだけ`--view`を付けます（`codexfws`は従来どおり毎回ビューを作ります）。図・ノートブック・整形されたMarkdownを読みたいときは`afws-lab`がワークステーション上でJupyterLabを動かします。ビューもLabもデータ経路ではないので、壊れてもセッションは止まりません。ホストごとに認証済みのSSH接続を1本だけ開いて再利用し、それが死んだ場合は次に必要とした側が張り直します。
+どちらのエージェントもリモート側を正本とし、プロジェクトの読み取り・編集・Git・実行をすべて`afws-run`経由で行います。プロジェクトのsymlink、パーミッション、巨大なディレクトリがワークステーション上のまま扱われます。`claudefws`は既定で何もマウントせず、Finder/VS Code用のrclone NFSビューが要るときだけ`--view`を付けます（`codexfws`は従来どおり毎回ビューを作ります）。これは起動時に決め切る必要のない選択です。`afws-view`が実行中のセッションの中からビューをマウント・確認・解放するので、`--view`無しで始めたセッションを取り直す必要はありません。図・ノートブック・整形されたMarkdownを読みたいときは`afws-lab`がワークステーション上でJupyterLabを動かします。ビューもLabもデータ経路ではないので、壊れてもセッションは止まりません。ホストごとに認証済みのSSH接続を1本だけ開いて再利用し、それが死んだ場合は次に必要とした側が張り直します。
 
 クライアントはmacOSのみ。実際のホスト名、アドレス、ユーザー名、パスはこのリポジトリに保存しません。
 
@@ -159,8 +159,13 @@ afws-lab stop
 ```zsh
 claudefws --view my-workstation /remote/path/to/project
 claudefws --no-view my-workstation /remote/path/to/project   # 既定と同じ
+afws-view           # --view無しで始めたセッションの中から、今マウントする
+afws-view status    # 場所、応答の有無、他に使っているセッション数
+afws-view stop      # 解放する
 afws-remount        # そのビューが応答しなくなったら修復する
 ```
+
+ビューは起動時に確定する約束ではありません。`afws-view`が必要とするのはSSHホスト、リモートディレクトリ、`rclone`だけで、実行中のセッションはすべて持っています。作ったビューはセッションレジストリに記録されるので、共有も自動解放も起動時に作ったものと同じに扱われます。セッションの途中で「ローカルのアプリで開きたい」と言われたエージェントは、起動し直しを求めるのではなくこれを実行します。図・ノートブック・整形されたMarkdownを*表示*するだけならマウントは一切要りません。`afws-lab`がプロジェクトを起点にワークステーション上でJupyterLabを動かします。
 
 **マウント無しでClaudeに構造化されたファイルツールを渡す。** `lib/afws-fs-mcp.py`はMac側で動くMCPサーバで、セッションの共有SSH接続を通してプロジェクトに届きます。`read_file`、`write_file`、`edit_file`、`list_directory`、`glob`、`grep`、`stat`を提供します。すべてのパスはリモートプロジェクト内に閉じ込められ、その検査は解決後にリモート側で行うので、symlinkで外へ出ることもできません。自動では組み込まれないので、使いたいときにClaude Codeへ指定します。
 
@@ -243,6 +248,7 @@ afws-isolate run --backend host --guide /path/to/job/instructions.md --input /pa
 | `afws-message` | 稼働中のClaudeまたはCodexへメッセージをキュー投入（一斉送信はCodexのみ） |
 | `afws-status` | このCodexセッションの短い作業ラベルを設定 |
 | `afws-lock` | リモートの排他資源を確保し、複数セッションの衝突を防ぐ |
+| `afws-view` | プロジェクトのFinder/VS Codeビューを、いつでもマウント・確認・解放する |
 | `afws-remount` | 切断されたFinder/VS Codeビュー、または旧来のSSHFSマウントを同じ場所へ張り直す |
 | `afws-umount` | 残されたマウントや接続を解放する |
 | `afws-doctor` | 前提条件を確認する |

@@ -215,6 +215,22 @@ afws-run SSH_CONFIG_HOST --cwd REMOTE_ABSOLUTE_DIRECTORY -- \
   zsh -lc 'YOUR_ZSH_CODE'
 ```
 
+## The agent says to restart the session with `--view`, or opens Finder
+
+Neither is necessary, and both are worth correcting.
+
+A view can be mounted from inside a running session: `afws-view` mounts it,
+`afws-view status` reports it, `afws-view stop` releases it. Whether the launch
+carried `--view` decides nothing after the fact.
+
+And a request to *see* a directory or a file is a request for its contents, not
+for a local application. The answer is a listing or a read through `afws-run`
+and the remote filesystem tools. When something has to be rendered — a figure,
+a notebook, formatted Markdown — `afws-lab` runs JupyterLab on the workstation,
+rooted at the project, and needs no mount at all. Both launchers now say all of
+this in their session instructions; a session started before this change was
+installed will not have it.
+
 ## The agent tries to run tests locally
 
 Confirm that the session was started through `claudefws` or `codexfws`. A plain `claude` or `codex` launch does not receive the remote-execution instructions. Exit it and restart through the launcher with the target project selected.
