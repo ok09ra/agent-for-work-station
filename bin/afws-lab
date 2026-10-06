@@ -573,18 +573,23 @@ lab_cancel_forward() {
 
 # --- HTTP ------------------------------------------------------------------
 
-# /api/status is served without authentication, so this says whether a server
-# is answering without the token having to travel anywhere.
+# /api/status needs the token like every other endpoint -- Jupyter Server
+# answers 403 without one -- so the token is sent in a header rather than the
+# URL. It travels only through the forward to this Mac, and a header keeps it
+# out of the server's access log, which the URL form would write it into.
 lab_http_ok() {
-  local local_port="$1" base_url="${2:-/}"
+  local local_port="$1" base_url="${2:-/}" token="${3-}"
 
   case "$local_port" in
     ''|*[!0-9]*|0) return 1 ;;
   esac
-  python3 - "http://127.0.0.1:${local_port}${base_url%/}/api/status" <<'PY' >/dev/null 2>&1
+  python3 - "http://127.0.0.1:${local_port}${base_url%/}/api/status" "$token" <<'PY' >/dev/null 2>&1
 import sys, urllib.request
+request = urllib.request.Request(sys.argv[1])
+if len(sys.argv) > 2 and sys.argv[2]:
+    request.add_header("Authorization", "token " + sys.argv[2])
 try:
-    with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=5) as response:
         sys.exit(0 if response.status == 200 else 1)
 except Exception:
     sys.exit(1)
@@ -773,13 +778,13 @@ local failure only; retry with: afws-lab start"
   # A port that accepts a connection is not the same as a server that answers.
   # A forward left over from a previous server accepts and then fails, and only
   # an actual request tells the two apart.
-  if ! lab_http_ok "$local_port" "$lab_remote_base_url"; then
+  if ! lab_http_ok "$local_port" "$lab_remote_base_url" "$lab_remote_token"; then
     lab_cancel_forward "$local_port" "$lab_remote_port"
     local_port="$(lab_pick_local_port)"
     lab_add_forward "$local_port" "$lab_remote_port" ||
       afws_die "could not replace the forward to ${lab_ssh_host}
 JupyterLab is still running on the workstation and was not stopped."
-    lab_http_ok "$local_port" "$lab_remote_base_url" ||
+    lab_http_ok "$local_port" "$lab_remote_base_url" "$lab_remote_token" ||
       afws_die "the forward is open but JupyterLab did not answer on it
 The server is running on ${lab_ssh_host} (pid ${lab_remote_pid}, port
 ${lab_remote_port}) and was not stopped. Read its output with:
@@ -978,7 +983,7 @@ do_status() {
     print -r -- "  [FAIL] ssh forward    127.0.0.1:${local_port} is not accepting connections"
   fi
 
-  if (( forward_ok )) && lab_http_ok "$local_port" "$lab_remote_base_url"; then
+  if (( forward_ok )) && lab_http_ok "$local_port" "$lab_remote_base_url" "$lab_remote_token"; then
     http_ok=1
     print -r -- "  [OK]   http           JupyterLab answered on 127.0.0.1:${local_port}"
   elif (( forward_ok )); then
@@ -1025,7 +1030,7 @@ Start one with: afws-lab start"
   [[ "$lab_remote_state" == running ]] ||
     afws_die "JupyterLab is not answering on ${lab_ssh_host}
 Check which layer is broken with: afws-lab status"
-  lab_http_ok "$local_port" "$lab_remote_base_url" ||
+  lab_http_ok "$local_port" "$lab_remote_base_url" "$lab_remote_token" ||
     afws_die "the forward on this Mac is not carrying JupyterLab
 Rebuild it without restarting the server: afws-lab start"
 
