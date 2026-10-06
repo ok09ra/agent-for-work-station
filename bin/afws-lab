@@ -297,6 +297,14 @@ lab_ssh_script() {
   outfile="$(umask 077; mktemp "${TMPDIR:-/tmp}/afws-lab-out.XXXXXX")" ||
     afws_die "could not create a temporary file for the remote probe"
 
+  # lab_ssh_script_invoke resolves the connection options itself, but it runs
+  # as a background job, so what it learns about the connection stays in that
+  # subshell. Resolving them here too is what lets the report below see them:
+  # this is the first remote call do_start makes, and without it the report
+  # reads a variable nothing in this shell has set.
+  lab_ensure_control_dir
+  afws_control_ssh_options "$lab_ssh_host"
+
   set +e
   afws_run_with_timeout "$AFWS_LAB_PROBE_TIMEOUT_SECONDS" \
     lab_ssh_script_invoke > "$outfile" 2>/dev/null
